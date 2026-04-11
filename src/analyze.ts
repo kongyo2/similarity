@@ -10,11 +10,8 @@ import {
   DEFAULT_OVERLAP_SIZE_TOLERANCE,
   DEFAULT_THRESHOLD,
 } from "./defaults.js";
-import { analyzeClasses } from "./analyzers/classes.js";
-import { analyzeFunctions } from "./analyzers/functions.js";
-import { analyzeOverlap } from "./analyzers/overlap.js";
-import { analyzeTypes } from "./analyzers/types.js";
-import type { AnalyzeProjectOptions, AnalyzeReport, AnalyzerMode, LoadedFile, SimilarityPair } from "./types.js";
+import { analyzeWithWasm } from "./engine/wasm.js";
+import type { AnalyzeProjectOptions, AnalyzeReport, AnalyzerMode, LoadedFile } from "./types.js";
 import { collectTypeScriptFiles } from "./utils/files.js";
 
 function uniqueModes(modes: AnalyzerMode[] | undefined): AnalyzerMode[] {
@@ -92,17 +89,7 @@ async function loadFiles(filePaths: string[]): Promise<{ files: LoadedFile[]; wa
   return { files: loaded.filter((entry): entry is LoadedFile => entry !== null), warnings };
 }
 
-function initializeByMode(): Record<AnalyzerMode, SimilarityPair[]> {
-  return {
-    functions: [],
-    types: [],
-    classes: [],
-    overlap: [],
-  };
-}
-
 export async function analyzeProject(input: AnalyzeProjectOptions): Promise<AnalyzeReport> {
-  const startTime = Date.now();
   const options = resolveAnalyzeOptions(input);
   const warnings: string[] = [];
 
@@ -117,74 +104,25 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
   const { files, warnings: readWarnings } = await loadFiles(collected.files);
   warnings.push(...readWarnings);
 
-  const byMode = initializeByMode();
-
-  if (options.modes.includes("functions")) {
-    byMode.functions = analyzeFunctions(
-      files,
-      {
-        threshold: options.threshold,
-        minLines: options.minLines,
-        sizePenalty: options.sizePenalty,
-        sameFileOnly: options.sameFileOnly,
-        crossFileOnly: options.crossFileOnly,
-      },
-      warnings,
-    );
-  }
-
-  if (options.modes.includes("types")) {
-    byMode.types = analyzeTypes(
-      files,
-      {
-        threshold: options.threshold,
-        sameFileOnly: options.sameFileOnly,
-        crossFileOnly: options.crossFileOnly,
-        typesOnly: options.typesOnly,
-        allowCrossKind: options.allowCrossKind,
-        includeTypeLiterals: options.includeTypeLiterals,
-      },
-      warnings,
-    );
-  }
-
-  if (options.modes.includes("classes")) {
-    byMode.classes = analyzeClasses(
-      files,
-      {
-        threshold: options.threshold,
-        sameFileOnly: options.sameFileOnly,
-        crossFileOnly: options.crossFileOnly,
-      },
-      warnings,
-    );
-  }
-
-  if (options.modes.includes("overlap")) {
-    byMode.overlap = analyzeOverlap(files, {
-      threshold: options.threshold,
-      minWindow: options.overlapMinWindow,
-      maxWindow: options.overlapMaxWindow,
-      sizeTolerance: options.overlapSizeTolerance,
-      sameFileOnly: options.sameFileOnly,
-      crossFileOnly: options.crossFileOnly,
-    });
-  }
-
-  const results = [...byMode.functions, ...byMode.types, ...byMode.classes, ...byMode.overlap].sort(
-    (left, right) => right.similarity - left.similarity,
-  );
+  const wasmReport = (await analyzeWithWasm({
+    files,
+    modes: options.modes,
+    threshold: options.threshold,
+    minLines: options.minLines,
+    sizePenalty: options.sizePenalty,
+    sameFileOnly: options.sameFileOnly,
+    crossFileOnly: options.crossFileOnly,
+    typesOnly: options.typesOnly,
+    allowCrossKind: options.allowCrossKind,
+    includeTypeLiterals: options.includeTypeLiterals,
+    overlapMinWindow: options.overlapMinWindow,
+    overlapMaxWindow: options.overlapMaxWindow,
+    overlapSizeTolerance: options.overlapSizeTolerance,
+  })) as AnalyzeReport;
 
   return {
-    analyzedFiles: files.map((file) => file.filePath),
+    ...wasmReport,
     skippedFiles: collected.skipped,
-    warnings: warnings.map((message) => ({ message })),
-    results,
-    byMode,
-    stats: {
-      fileCount: files.length,
-      pairCount: results.length,
-      elapsedMs: Date.now() - startTime,
-    },
+    warnings: [...(wasmReport.warnings ?? []), ...warnings.map((message) => ({ message }))],
   };
 }
