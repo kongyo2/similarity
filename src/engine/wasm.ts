@@ -20,18 +20,18 @@ let wasmModulePromise: Promise<WasmModule> | null = null;
 async function loadWasmModule(): Promise<WasmModule> {
   if (!wasmModulePromise) {
     const candidatePaths = [
-      new URL('../wasm/similarity_wasm.js', import.meta.url),
-      new URL('../../native/similarity-wasm/pkg/similarity_wasm.js', import.meta.url),
+      new URL('./wasm/similarity_wasm.js', import.meta.url),
+      new URL('../native/similarity-wasm/pkg/similarity_wasm.js', import.meta.url),
     ];
 
     wasmModulePromise = (async () => {
       for (const wasmModulePath of candidatePaths) {
         try {
           await access(wasmModulePath);
-          return (await import(wasmModulePath.href)) as WasmModule;
         } catch {
-          // Try the next candidate path.
+          continue;
         }
+        return (await import(wasmModulePath.href)) as WasmModule;
       }
 
       throw new Error(
