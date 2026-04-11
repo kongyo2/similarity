@@ -2,8 +2,10 @@
 
 TypeScript-only similarity analyzer
 
+Private edition of [mizchi/similarity](https://github.com/mizchi/similarity).
+
 ## Quick Start
 
 ```bash
-npx @kongyo2/similarity-ts src --threshold 0.8
+npx @kongyo2/similarity-ts .
 ```
