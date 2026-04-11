@@ -43,11 +43,15 @@ pub struct AnalyzeOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AnalyzeWarning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AnalyzeStats {
     pub file_count: usize,
     pub pair_count: usize,
@@ -143,15 +147,36 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
                     })
                     .collect();
             }
-            Err(err) => warnings.push(AnalyzeWarning { message: err }),
+            Err(err) => warnings.push(AnalyzeWarning {
+                file_path: None,
+                message: err,
+            }),
         }
     }
 
     if input.modes.iter().any(|m| m == "types") {
-        let file_types = extract_types_from_files(&files);
-        let mut all_types = Vec::new();
-        for values in file_types.values() {
-            all_types.extend(values.clone());
+        let mut all_types: Vec<_> = extract_types_from_files(&files)
+            .into_values()
+            .flatten()
+            .collect();
+
+        if input.include_type_literals.unwrap_or(false) {
+            all_types.extend(
+                extract_type_literals_from_files(&files)
+                    .into_values()
+                    .flatten()
+                    .map(|literal| similarity_core::TypeDefinition {
+                        name: literal.name,
+                        kind: TypeKind::TypeLiteral,
+                        properties: literal.properties,
+                        generics: vec![],
+                        extends: vec![],
+                        start_line: literal.start_line,
+                        end_line: literal.end_line,
+                        file_path: literal.file_path,
+                        has_ignore_directive: false,
+                    }),
+            );
         }
 
         let mut options = TypeComparisonOptions::default();
@@ -186,14 +211,22 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
                     start_line: pair.type1.start_line,
                     end_line: pair.type1.end_line,
                     symbol_name: pair.type1.name,
-                    kind: "type".to_string(),
+                    kind: match pair.type1.kind {
+                        TypeKind::Interface => "interface".to_string(),
+                        TypeKind::TypeAlias => "type".to_string(),
+                        TypeKind::TypeLiteral => "typeLiteral".to_string(),
+                    },
                 },
                 right: AnalyzerLocation {
                     file_path: pair.type2.file_path,
                     start_line: pair.type2.start_line,
                     end_line: pair.type2.end_line,
                     symbol_name: pair.type2.name,
-                    kind: "type".to_string(),
+                    kind: match pair.type2.kind {
+                        TypeKind::Interface => "interface".to_string(),
+                        TypeKind::TypeAlias => "type".to_string(),
+                        TypeKind::TypeLiteral => "typeLiteral".to_string(),
+                    },
                 },
                 details: Some(serde_json::json!({
                     "structuralSimilarity": pair.result.structural_similarity,
@@ -202,12 +235,6 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
             })
             .collect();
 
-        if input.include_type_literals.unwrap_or(false) {
-            let literal_count: usize = extract_type_literals_from_files(&files).values().map(Vec::len).sum();
-            warnings.push(AnalyzeWarning {
-                message: format!("type literal extraction enabled: {} literals parsed", literal_count),
-            });
-        }
     }
 
     if input.modes.iter().any(|m| m == "classes") {
@@ -290,6 +317,7 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
                     .collect();
             }
             Err(err) => warnings.push(AnalyzeWarning {
+                file_path: None,
                 message: format!("overlap detection failed: {err}"),
             }),
         }

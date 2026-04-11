@@ -90,6 +90,7 @@ async function loadFiles(filePaths: string[]): Promise<{ files: LoadedFile[]; wa
 }
 
 export async function analyzeProject(input: AnalyzeProjectOptions): Promise<AnalyzeReport> {
+  const startTime = Date.now();
   const options = resolveAnalyzeOptions(input);
   const warnings: string[] = [];
 
@@ -124,5 +125,9 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
     ...wasmReport,
     skippedFiles: collected.skipped,
     warnings: [...(wasmReport.warnings ?? []), ...warnings.map((message) => ({ message }))],
+    stats: {
+      ...wasmReport.stats,
+      elapsedMs: Date.now() - startTime,
+    },
   };
 }
