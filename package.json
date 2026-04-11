@@ -34,7 +34,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run clean && npm run build && npm run typecheck",
-    "metrics:baseline": "tsx scripts/baseline-metrics.ts > docs/baseline-metrics.md",
+    "metrics:baseline": "mkdir -p docs && tsx scripts/baseline-metrics.ts > docs/baseline-metrics.md",
     "build:wasm": "node scripts/build-wasm.mjs"
   },
   "keywords": [

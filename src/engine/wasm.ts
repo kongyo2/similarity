@@ -1,4 +1,3 @@
-import path from 'node:path';
 import type { LoadedFile } from '../types.js';
 
 interface WasmAnalyzeInput {
@@ -19,9 +18,13 @@ let wasmModulePromise: Promise<WasmModule> | null = null;
 
 async function loadWasmModule(): Promise<WasmModule> {
   if (!wasmModulePromise) {
-    const wasmModulePath = path.resolve(process.cwd(), 'native/similarity-wasm/pkg/similarity_wasm.js');
-    wasmModulePromise = import(wasmModulePath) as Promise<WasmModule>;
+    const wasmModulePath = new URL('../../native/similarity-wasm/pkg/similarity_wasm.js', import.meta.url).href;
+    wasmModulePromise = (import(wasmModulePath) as Promise<WasmModule>).catch((error: unknown) => {
+      wasmModulePromise = null;
+      throw error;
+    });
   }
+
   return wasmModulePromise;
 }
 
