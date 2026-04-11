@@ -27,3 +27,26 @@ jobs:
 
       - name: Type check
         run: npm run typecheck
+
+  npm-publish-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      - name: Verify npm publish dry run
+        run: npm publish --dry-run --access public
+        env:
+          CC_wasm32_unknown_unknown: clang
