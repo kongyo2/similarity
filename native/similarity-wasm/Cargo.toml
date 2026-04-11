@@ -1,0 +1,12 @@
+[package]
+name = "similarity-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json = "1"
+wasm-bindgen = "0.2"
+similarity-core-ts = { path = "../similarity-core-ts" }
