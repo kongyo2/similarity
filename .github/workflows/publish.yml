@@ -23,6 +23,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install wasi-libc
+        run: sudo apt-get update && sudo apt-get install -y wasi-libc
+
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
 
@@ -36,3 +39,4 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           CC_wasm32_unknown_unknown: clang
+          CFLAGS_wasm32_unknown_unknown: --sysroot=/usr -isystem /usr/include/wasm32-wasi
