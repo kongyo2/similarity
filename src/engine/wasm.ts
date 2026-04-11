@@ -5,11 +5,19 @@ interface WasmAnalyzeInput {
   files: LoadedFile[];
   modes: string[];
   threshold: number;
+  minLines: number;
+  sizePenalty: boolean;
+  sameFileOnly: boolean;
+  crossFileOnly: boolean;
+  typesOnly: 'interface' | 'type' | 'all';
+  allowCrossKind: boolean;
+  includeTypeLiterals: boolean;
+  overlapMinWindow: number;
+  overlapMaxWindow: number;
+  overlapSizeTolerance: number;
 }
 
-interface WasmAnalyzeOutput {
-  warnings?: string[];
-}
+type WasmAnalyzeOutput = unknown;
 
 type WasmModule = {
   analyze_project: (inputJson: string) => string;
