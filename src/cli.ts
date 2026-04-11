@@ -26,6 +26,7 @@ interface ParsedCliOptions {
   modes: string;
   threshold: number;
   minLines: number;
+  minTokens: number;
   noSizePenalty: boolean;
   sameFileOnly: boolean;
   crossFileOnly: boolean;
@@ -81,6 +82,7 @@ function buildProgram(): Command {
     )
     .option("-t, --threshold <number>", "Similarity threshold (0-1)", String(DEFAULT_THRESHOLD))
     .option("--min-lines <number>", "Minimum function line count", String(DEFAULT_MIN_LINES))
+    .option("--min-tokens <number>", "Minimum function token count", "0")
     .option("--no-size-penalty", "Disable line-count size penalty for function mode", false)
     .option("--same-file-only", "Only compare symbols from the same file", false)
     .option("--cross-file-only", "Only compare symbols across different files", false)
@@ -120,6 +122,7 @@ function parseNumber(value: string, field: string): number {
 function normalizeOptions(rawOptions: ParsedCliOptions) {
   const threshold = parseNumber(String(rawOptions.threshold), "threshold");
   const minLines = Math.max(1, parseInt(String(rawOptions.minLines), 10));
+  const minTokens = Math.max(0, parseInt(String(rawOptions.minTokens), 10));
   const overlapMinWindow = Math.max(1, parseInt(String(rawOptions.overlapMinWindow), 10));
   const overlapMaxWindow = Math.max(1, parseInt(String(rawOptions.overlapMaxWindow), 10));
   const overlapSizeTolerance = parseNumber(String(rawOptions.overlapSizeTolerance), "overlap-size-tolerance");
@@ -138,6 +141,7 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
     modes: parseModes(rawOptions.modes),
     threshold,
     minLines,
+    minTokens,
     noSizePenalty: rawOptions.noSizePenalty,
     sameFileOnly: rawOptions.sameFileOnly,
     crossFileOnly: rawOptions.crossFileOnly,
@@ -172,6 +176,7 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
       modes: options.modes,
       threshold: options.threshold,
       minLines: options.minLines,
+      minTokens: options.minTokens,
       noSizePenalty: options.noSizePenalty,
       sameFileOnly: options.sameFileOnly,
       crossFileOnly: options.crossFileOnly,

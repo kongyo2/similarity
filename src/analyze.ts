@@ -28,6 +28,7 @@ export interface ResolvedAnalyzeOptions {
   modes: AnalyzerMode[];
   threshold: number;
   minLines: number;
+  minTokens: number;
   sizePenalty: boolean;
   sameFileOnly: boolean;
   crossFileOnly: boolean;
@@ -59,6 +60,7 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
     modes: uniqueModes(input.modes),
     threshold,
     minLines: Math.max(1, input.minLines ?? DEFAULT_MIN_LINES),
+    minTokens: Math.max(0, input.minTokens ?? 0),
     sizePenalty: !input.noSizePenalty,
     sameFileOnly: Boolean(input.sameFileOnly),
     crossFileOnly: Boolean(input.crossFileOnly),
@@ -125,6 +127,7 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
       {
         threshold: options.threshold,
         minLines: options.minLines,
+        minTokens: options.minTokens,
         sizePenalty: options.sizePenalty,
         sameFileOnly: options.sameFileOnly,
         crossFileOnly: options.crossFileOnly,

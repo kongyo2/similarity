@@ -74,4 +74,23 @@ describe("runCli", () => {
     expect(logs).toHaveLength(0);
     expect(errors[0]).toContain("Cannot use both --same-file-only and --cross-file-only");
   });
+
+  it("accepts --min-tokens option", async () => {
+    await withTempProject(async (projectDir) => {
+      await createCliFixture(projectDir);
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [path.join(projectDir, "src"), "--modes", "functions", "--min-lines", "1", "--min-tokens", "1"],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      expect(logs).toHaveLength(1);
+    });
+  });
 });

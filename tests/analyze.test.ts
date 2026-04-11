@@ -144,4 +144,64 @@ describe("analyzeProject", () => {
       ).toBe(true);
     });
   });
+
+  it("filters nested function parent-child comparisons", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.mkdir(path.join(projectDir, "src"), { recursive: true });
+      await fs.writeFile(
+        path.join(projectDir, "src", "nested.ts"),
+        `
+export function wrapper(values: number[]): number {
+  function inner(items: number[]): number {
+    let sum = 0;
+    for (const item of items) {
+      sum += item;
+    }
+    return sum;
+  }
+
+  return inner(values);
+}
+`,
+        "utf8",
+      );
+
+      const report = await analyzeProject({
+        cwd: projectDir,
+        paths: ["src"],
+        modes: ["functions"],
+        threshold: 0.2,
+        minLines: 1,
+      });
+
+      const nestedPair = report.byMode.functions.find((pair) =>
+        pair.left.filePath === pair.right.filePath &&
+        new Set([pair.left.symbolName, pair.right.symbolName]).has("wrapper") &&
+        new Set([pair.left.symbolName, pair.right.symbolName]).has("inner")
+      );
+      expect(nestedPair).toBeUndefined();
+    });
+  });
+
+  it("supports minTokens filtering", async () => {
+    await withTempProject(async (projectDir) => {
+      await createFixtureProject(projectDir);
+      const relaxed = await analyzeProject({
+        cwd: projectDir,
+        paths: ["src"],
+        modes: ["functions"],
+        threshold: 0.6,
+      });
+      const strict = await analyzeProject({
+        cwd: projectDir,
+        paths: ["src"],
+        modes: ["functions"],
+        threshold: 0.6,
+        minTokens: 200,
+      });
+
+      expect(relaxed.byMode.functions.length).toBeGreaterThan(0);
+      expect(strict.byMode.functions.length).toBe(0);
+    });
+  });
 });

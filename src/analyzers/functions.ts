@@ -10,13 +10,18 @@ interface FunctionCandidate {
   startLine: number;
   endLine: number;
   lineCount: number;
+  tokenCount: number;
+  nodeStart: number;
+  nodeEnd: number;
   tokens: string[];
+  structureTokens: string[];
   tokenSet: Set<string>;
 }
 
 export interface AnalyzeFunctionsOptions {
   threshold: number;
   minLines: number;
+  minTokens: number;
   sizePenalty: boolean;
   sameFileOnly: boolean;
   crossFileOnly: boolean;
@@ -94,6 +99,7 @@ function extractFunctionsFromFile(file: LoadedFile, warnings: string[]): Functio
       const lineCount = Math.max(1, endLine - startLine + 1);
       const bodyText = body.getText(sourceFile);
       const tokens = tokenizeNormalized(bodyText);
+      const structureTokens = extractStructureTokens(body);
       if (tokens.length > 0) {
         candidates.push({
           filePath: file.filePath,
@@ -102,8 +108,12 @@ function extractFunctionsFromFile(file: LoadedFile, warnings: string[]): Functio
           startLine,
           endLine,
           lineCount,
+          tokenCount: tokens.length,
+          nodeStart: body.getStart(sourceFile),
+          nodeEnd: body.getEnd(),
           tokenSet: new Set(tokens),
           tokens,
+          structureTokens,
         });
       }
     }
@@ -115,12 +125,57 @@ function extractFunctionsFromFile(file: LoadedFile, warnings: string[]): Functio
   return candidates;
 }
 
+function extractStructureTokens(node: ts.Node): string[] {
+  const tokens: string[] = [];
+  const visit = (current: ts.Node): void => {
+    if (ts.isIdentifier(current) || ts.isPrivateIdentifier(current)) {
+      tokens.push("Identifier");
+      return;
+    }
+    if (
+      ts.isStringLiteral(current) ||
+      ts.isNoSubstitutionTemplateLiteral(current) ||
+      ts.isTemplateExpression(current)
+    ) {
+      tokens.push("StringLiteral");
+      return;
+    }
+    if (ts.isNumericLiteral(current) || current.kind === ts.SyntaxKind.BigIntLiteral) {
+      tokens.push("NumericLiteral");
+      return;
+    }
+    if (current.kind === ts.SyntaxKind.TrueKeyword || current.kind === ts.SyntaxKind.FalseKeyword) {
+      tokens.push("BooleanLiteral");
+      return;
+    }
+
+    const kindName = ts.SyntaxKind[current.kind] ?? String(current.kind);
+    tokens.push(kindName);
+    ts.forEachChild(current, visit);
+  };
+  ts.forEachChild(node, visit);
+  return tokens;
+}
+
+function isParentChildRelationship(left: FunctionCandidate, right: FunctionCandidate): boolean {
+  if (left.filePath !== right.filePath) {
+    return false;
+  }
+  return (
+    (left.nodeStart <= right.nodeStart && left.nodeEnd >= right.nodeEnd) ||
+    (right.nodeStart <= left.nodeStart && right.nodeEnd >= left.nodeEnd)
+  );
+}
+
 function compareFunctionCandidates(left: FunctionCandidate, right: FunctionCandidate, sizePenalty: boolean): number {
   const leftText = left.tokens.join(" ");
   const rightText = right.tokens.join(" ");
+  const leftStructureText = left.structureTokens.join(" ");
+  const rightStructureText = right.structureTokens.join(" ");
+  const structureScore = normalizedLevenshtein(leftStructureText, rightStructureText);
   const sequenceScore = normalizedLevenshtein(leftText, rightText);
   const tokenScore = jaccardSimilarity(left.tokenSet, right.tokenSet);
-  const combined = sequenceScore * 0.7 + tokenScore * 0.3;
+  const combined = structureScore * 0.5 + sequenceScore * 0.35 + tokenScore * 0.15;
   return withSizePenalty(combined, left.lineCount, right.lineCount, sizePenalty);
 }
 
@@ -140,6 +195,9 @@ export function analyzeFunctions(
     if (left.lineCount < options.minLines) {
       continue;
     }
+    if (left.tokenCount < options.minTokens) {
+      continue;
+    }
     for (let j = i + 1; j < candidates.length; j += 1) {
       const right = candidates[j];
       if (!right) {
@@ -148,11 +206,17 @@ export function analyzeFunctions(
       if (right.lineCount < options.minLines) {
         continue;
       }
+      if (right.tokenCount < options.minTokens) {
+        continue;
+      }
       const sameFile = left.filePath === right.filePath;
       if (options.sameFileOnly && !sameFile) {
         continue;
       }
       if (options.crossFileOnly && sameFile) {
+        continue;
+      }
+      if (isParentChildRelationship(left, right)) {
         continue;
       }
 
@@ -181,6 +245,8 @@ export function analyzeFunctions(
         details: {
           leftLines: left.lineCount,
           rightLines: right.lineCount,
+          leftTokens: left.tokenCount,
+          rightTokens: right.tokenCount,
         },
       });
     }

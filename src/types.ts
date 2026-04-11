@@ -27,6 +27,7 @@ export interface AnalyzeProjectOptions {
   modes?: AnalyzerMode[];
   threshold?: number;
   minLines?: number;
+  minTokens?: number;
   noSizePenalty?: boolean;
   sameFileOnly?: boolean;
   crossFileOnly?: boolean;
