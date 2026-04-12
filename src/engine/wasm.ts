@@ -27,10 +27,14 @@ let wasmModulePromise: Promise<WasmModule> | null = null;
 
 async function loadWasmModule(): Promise<WasmModule> {
   if (!wasmModulePromise) {
+    // Resolve candidates in priority order:
+    // 1. Production: dist/cli.js ↔ dist/wasm/similarity_wasm.js (packaged together)
+    // 2. Production: dist/index.js ↔ dist/wasm/similarity_wasm.js (library import)
+    // 3. Dev/test: src/engine/wasm.ts ↔ dist/wasm/similarity_wasm.js (built once via `npm run build:wasm`)
     const candidatePaths = [
       new URL('./wasm/similarity_wasm.js', import.meta.url),
-      new URL('../../native/similarity-wasm/pkg/similarity_wasm.js', import.meta.url),
-      new URL('../native/similarity-wasm/pkg/similarity_wasm.js', import.meta.url),
+      new URL('../wasm/similarity_wasm.js', import.meta.url),
+      new URL('../../dist/wasm/similarity_wasm.js', import.meta.url),
     ];
 
     wasmModulePromise = (async () => {

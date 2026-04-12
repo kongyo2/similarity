@@ -91,7 +91,9 @@ fn should_compare(same_file: bool, same_file_only: bool, cross_file_only: bool) 
 }
 
 pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
-    let started = std::time::Instant::now();
+    // Note: elapsed_ms is always set to 0 here because std::time::Instant is
+    // unsupported on wasm32-unknown-unknown. The JavaScript caller measures
+    // the wall-clock elapsed time and overwrites this field before returning.
     let files: Vec<(String, String)> = input
         .files
         .iter()
@@ -339,7 +341,7 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
         stats: AnalyzeStats {
             file_count: files.len(),
             pair_count: results.len(),
-            elapsed_ms: started.elapsed().as_millis(),
+            elapsed_ms: 0,
         },
     }
 }

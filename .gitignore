@@ -2,3 +2,6 @@ node_modules/
 dist/
 coverage/
 *.log
+
+# Rust build artifacts
+native/**/target/

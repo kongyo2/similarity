@@ -20,8 +20,15 @@ async function createFixtureProject(projectDir: string) {
     `
 export function calculateSum(values: number[]): number {
   let total = 0;
+  let count = 0;
   for (const value of values) {
-    total += value;
+    if (value > 0) {
+      total += value;
+      count += 1;
+    }
+  }
+  if (count === 0) {
+    return 0;
   }
   return total;
 }
@@ -33,8 +40,15 @@ export function calculateSum(values: number[]): number {
     `
 export function computeTotal(numbers: number[]): number {
   let total = 0;
+  let count = 0;
   for (const item of numbers) {
-    total += item;
+    if (item > 0) {
+      total += item;
+      count += 1;
+    }
+  }
+  if (count === 0) {
+    return 0;
   }
   return total;
 }
@@ -88,10 +102,10 @@ export function overlapA(items: string[]): string[] {
   return output;
 }
 
-export function overlapB(values: string[]): string[] {
+export function overlapB(items: string[]): string[] {
   const output: string[] = [];
-  for (const value of values) {
-    output.push(value.trim().toLowerCase());
+  for (const item of items) {
+    output.push(item.trim().toLowerCase());
   }
   return output;
 }
