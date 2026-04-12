@@ -20,8 +20,15 @@ async function createFixtureProject(projectDir: string) {
     `
 export function calculateSum(values: number[]): number {
   let total = 0;
+  let count = 0;
   for (const value of values) {
-    total += value;
+    if (value > 0) {
+      total += value;
+      count += 1;
+    }
+  }
+  if (count === 0) {
+    return 0;
   }
   return total;
 }
@@ -33,8 +40,15 @@ export function calculateSum(values: number[]): number {
     `
 export function computeTotal(numbers: number[]): number {
   let total = 0;
+  let count = 0;
   for (const item of numbers) {
-    total += item;
+    if (item > 0) {
+      total += item;
+      count += 1;
+    }
+  }
+  if (count === 0) {
+    return 0;
   }
   return total;
 }
@@ -88,10 +102,10 @@ export function overlapA(items: string[]): string[] {
   return output;
 }
 
-export function overlapB(values: string[]): string[] {
+export function overlapB(items: string[]): string[] {
   const output: string[] = [];
-  for (const value of values) {
-    output.push(value.trim().toLowerCase());
+  for (const item of items) {
+    output.push(item.trim().toLowerCase());
   }
   return output;
 }
@@ -141,6 +155,60 @@ describe("analyzeProject", () => {
       expect(report.byMode.functions.length).toBeGreaterThan(0);
       expect(
         report.byMode.functions.every((pair) => pair.left.filePath !== pair.right.filePath),
+      ).toBe(true);
+    });
+  });
+
+  it("supports same-file-only constraints", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.mkdir(path.join(projectDir, "src"), { recursive: true });
+      await fs.writeFile(
+        path.join(projectDir, "src", "duplicates.ts"),
+        `
+export function alpha(values: number[]): number {
+  let total = 0;
+  let count = 0;
+  for (const value of values) {
+    if (value > 0) {
+      total += value;
+      count += 1;
+    }
+  }
+  if (count === 0) {
+    return 0;
+  }
+  return total;
+}
+
+export function beta(numbers: number[]): number {
+  let total = 0;
+  let count = 0;
+  for (const item of numbers) {
+    if (item > 0) {
+      total += item;
+      count += 1;
+    }
+  }
+  if (count === 0) {
+    return 0;
+  }
+  return total;
+}
+`,
+        "utf8",
+      );
+
+      const report = await analyzeProject({
+        cwd: projectDir,
+        paths: ["src"],
+        modes: ["functions"],
+        threshold: 0.6,
+        sameFileOnly: true,
+      });
+
+      expect(report.byMode.functions.length).toBeGreaterThan(0);
+      expect(
+        report.byMode.functions.every((pair) => pair.left.filePath === pair.right.filePath),
       ).toBe(true);
     });
   });
