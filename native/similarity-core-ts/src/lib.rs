@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use similarity_core::{
     extract_type_literals_from_files, extract_types_from_files, find_overlaps_across_files,
-    find_similar_classes_across_files, find_similar_functions_across_files, find_similar_types,
-    OverlapOptions, TSEDOptions, TypeComparisonOptions, TypeKind,
+    find_similar_classes_across_files, find_similar_functions_across_files,
+    find_similar_functions_in_file, find_similar_types, OverlapOptions, TSEDOptions,
+    TypeComparisonOptions, TypeKind,
 };
 use std::collections::HashMap;
 
@@ -120,40 +121,87 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
             options.size_penalty = size_penalty;
         }
 
-        match find_similar_functions_across_files(&files, input.threshold, &options) {
-            Ok(pairs) => {
-                by_mode.functions = pairs
-                    .into_iter()
-                    .filter(|(left_file, res, right_file)| {
-                        should_compare(left_file == right_file, same_file_only, cross_file_only)
-                            && res.similarity >= input.threshold
-                    })
-                    .map(|(left_file, res, right_file)| SimilarityPair {
-                        mode: "functions".to_string(),
-                        similarity: res.similarity,
-                        left: AnalyzerLocation {
-                            file_path: left_file,
-                            start_line: res.func1.start_line as usize,
-                            end_line: res.func1.end_line as usize,
-                            symbol_name: res.func1.name,
-                            kind: format!("{:?}", res.func1.function_type).to_lowercase(),
-                        },
-                        right: AnalyzerLocation {
-                            file_path: right_file,
-                            start_line: res.func2.start_line as usize,
-                            end_line: res.func2.end_line as usize,
-                            symbol_name: res.func2.name,
-                            kind: format!("{:?}", res.func2.function_type).to_lowercase(),
-                        },
-                        details: Some(serde_json::json!({ "impact": res.impact })),
-                    })
-                    .collect();
+        let mut function_pairs: Vec<SimilarityPair> = Vec::new();
+
+        // Cross-file pairs. `find_similar_functions_across_files` intentionally
+        // skips same-file pairs, so we only consult it when cross-file results
+        // are still in scope.
+        if !same_file_only {
+            match find_similar_functions_across_files(&files, input.threshold, &options) {
+                Ok(pairs) => {
+                    for (left_file, res, right_file) in pairs {
+                        if res.similarity < input.threshold {
+                            continue;
+                        }
+                        function_pairs.push(SimilarityPair {
+                            mode: "functions".to_string(),
+                            similarity: res.similarity,
+                            left: AnalyzerLocation {
+                                file_path: left_file,
+                                start_line: res.func1.start_line as usize,
+                                end_line: res.func1.end_line as usize,
+                                symbol_name: res.func1.name,
+                                kind: format!("{:?}", res.func1.function_type).to_lowercase(),
+                            },
+                            right: AnalyzerLocation {
+                                file_path: right_file,
+                                start_line: res.func2.start_line as usize,
+                                end_line: res.func2.end_line as usize,
+                                symbol_name: res.func2.name,
+                                kind: format!("{:?}", res.func2.function_type).to_lowercase(),
+                            },
+                            details: Some(serde_json::json!({ "impact": res.impact })),
+                        });
+                    }
+                }
+                Err(err) => warnings.push(AnalyzeWarning {
+                    file_path: None,
+                    message: err,
+                }),
             }
-            Err(err) => warnings.push(AnalyzeWarning {
-                file_path: None,
-                message: err,
-            }),
         }
+
+        // Same-file pairs. The cross-file helper above skips these entirely,
+        // so we have to walk each file explicitly whenever same-file results
+        // are in scope.
+        if !cross_file_only {
+            for (filename, source) in &files {
+                match find_similar_functions_in_file(filename, source, input.threshold, &options) {
+                    Ok(pairs) => {
+                        for res in pairs {
+                            if res.similarity < input.threshold {
+                                continue;
+                            }
+                            function_pairs.push(SimilarityPair {
+                                mode: "functions".to_string(),
+                                similarity: res.similarity,
+                                left: AnalyzerLocation {
+                                    file_path: filename.clone(),
+                                    start_line: res.func1.start_line as usize,
+                                    end_line: res.func1.end_line as usize,
+                                    symbol_name: res.func1.name,
+                                    kind: format!("{:?}", res.func1.function_type).to_lowercase(),
+                                },
+                                right: AnalyzerLocation {
+                                    file_path: filename.clone(),
+                                    start_line: res.func2.start_line as usize,
+                                    end_line: res.func2.end_line as usize,
+                                    symbol_name: res.func2.name,
+                                    kind: format!("{:?}", res.func2.function_type).to_lowercase(),
+                                },
+                                details: Some(serde_json::json!({ "impact": res.impact })),
+                            });
+                        }
+                    }
+                    Err(err) => warnings.push(AnalyzeWarning {
+                        file_path: Some(filename.clone()),
+                        message: err,
+                    }),
+                }
+            }
+        }
+
+        by_mode.functions = function_pairs;
     }
 
     if input.modes.iter().any(|m| m == "types") {
