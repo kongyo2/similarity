@@ -201,6 +201,10 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
             }
         }
 
+        // Cross-file and per-file scans each produce sorted output on their
+        // own, but after merging we have to re-sort so callers observing
+        // `byMode.functions` directly still see highest-similarity first.
+        function_pairs.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
         by_mode.functions = function_pairs;
     }
 
