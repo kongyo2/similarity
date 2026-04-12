@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -207,7 +208,16 @@ const isMainModule = (() => {
     return false;
   }
   const currentFile = fileURLToPath(import.meta.url);
-  return path.resolve(currentFile) === path.resolve(process.argv[1]);
+  // `process.argv[1]` may point to a symlink (e.g. `node_modules/.bin/similarity-ts`
+  // when invoked through `npx`), while `import.meta.url` always resolves to the
+  // real file path. Resolve the symlink so the comparison still succeeds.
+  let resolvedArgv: string;
+  try {
+    resolvedArgv = realpathSync(process.argv[1]);
+  } catch {
+    resolvedArgv = process.argv[1];
+  }
+  return path.resolve(currentFile) === path.resolve(resolvedArgv);
 })();
 
 if (isMainModule) {
