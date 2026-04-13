@@ -225,17 +225,13 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
     }
 
     const warnings = report.warnings ?? [];
-    if (report.stats.fileCount === 0 && warnings.length > 0) {
+    if (warnings.length > 0) {
       for (const warning of warnings) {
         io.error(warning.filePath ? `${warning.filePath}: ${warning.message}` : warning.message);
       }
-      return 1;
-    }
-    if (options.failOnWarnings && warnings.length > 0) {
-      for (const warning of warnings) {
-        io.error(warning.filePath ? `${warning.filePath}: ${warning.message}` : warning.message);
+      if (report.stats.fileCount === 0 || options.failOnWarnings) {
+        return 1;
       }
-      return 1;
     }
     return 0;
   } catch (error) {

@@ -118,7 +118,10 @@ export async function collectTypeScriptFiles(options: CollectFilesOptions): Prom
         skipped.push(absoluteTarget);
         continue;
       }
-      if (isIgnoredByRoot(absoluteTarget)) {
+      // Apply the parent directory's .gitignore so explicit file targets are
+      // filtered the same way as files discovered by directory scans.
+      const isIgnoredByTarget = await getTargetMatcher(path.dirname(absoluteTarget));
+      if (isIgnoredByRoot(absoluteTarget) || isIgnoredByTarget(absoluteTarget)) {
         skipped.push(absoluteTarget);
         continue;
       }

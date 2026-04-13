@@ -249,4 +249,76 @@ describe("runCli", () => {
       expect(parsed.skippedFiles.some((file) => file.endsWith("ignored.ts"))).toBe(true);
     });
   });
+
+  it("applies target .gitignore to explicitly passed file paths", async () => {
+    await withTempProject(async (projectDir) => {
+      const projectSubdir = path.join(projectDir, "app");
+      await fs.mkdir(projectSubdir, { recursive: true });
+      await fs.writeFile(
+        path.join(projectSubdir, ".gitignore"),
+        "ignored.ts\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectSubdir, "ignored.ts"),
+        "export const i = 1;\n",
+        "utf8",
+      );
+
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [path.join(projectSubdir, "ignored.ts"), "--format", "json"],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+      // Explicitly invoked file matches the local .gitignore and must be
+      // skipped rather than analyzed; the run is otherwise warning-free so
+      // the exit code stays 0 (mirroring "pointed at an empty directory").
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      expect(logs).toHaveLength(1);
+      const parsed = JSON.parse(logs[0]) as {
+        analyzedFiles: string[];
+        skippedFiles: string[];
+        stats: { fileCount: number };
+      };
+      expect(parsed.stats.fileCount).toBe(0);
+      expect(parsed.analyzedFiles).toHaveLength(0);
+      expect(parsed.skippedFiles.some((file) => file.endsWith("ignored.ts"))).toBe(true);
+    });
+  });
+
+  it("reports warnings to stderr even when the exit code is zero", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.mkdir(path.join(projectDir, "src"), { recursive: true });
+      await fs.writeFile(
+        path.join(projectDir, "src", "ok.ts"),
+        "export const ok = 1;\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectDir, "src", "broken.ts"),
+        "this is not valid typescript ###\n",
+        "utf8",
+      );
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [path.join(projectDir, "src"), "--format", "json"],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+      // Without --fail-on-warnings the run is still successful because at
+      // least one file was analyzed, but parse warnings must still surface
+      // on stderr for visibility.
+      expect(exitCode).toBe(0);
+      expect(logs).toHaveLength(1);
+      expect(errors.some((message) => message.includes("Parse errors"))).toBe(true);
+    });
+  });
 });
