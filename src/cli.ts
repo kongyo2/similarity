@@ -27,7 +27,7 @@ interface ParsedCliOptions {
   modes: string;
   threshold: number;
   minLines: number;
-  noSizePenalty: boolean;
+  sizePenalty: boolean;
   sameFileOnly: boolean;
   crossFileOnly: boolean;
   extensions: string;
@@ -83,7 +83,7 @@ function buildProgram(): Command {
     )
     .option("-t, --threshold <number>", "Similarity threshold (0-1)", String(DEFAULT_THRESHOLD))
     .option("--min-lines <number>", "Minimum function line count", String(DEFAULT_MIN_LINES))
-    .option("--no-size-penalty", "Disable line-count size penalty for function mode", false)
+    .option("--no-size-penalty", "Disable line-count size penalty for function mode")
     .option("--same-file-only", "Only compare symbols from the same file", false)
     .option("--cross-file-only", "Only compare symbols across different files", false)
     .option(
@@ -161,11 +161,16 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
     throw new Error("Cannot use both --same-file-only and --cross-file-only");
   }
 
+  // Commander's `--no-<name>` convention stores the parsed value on the
+  // positive key (`sizePenalty`) rather than `noSizePenalty`, and defaults
+  // to `true` unless the flag is passed. Translate back to the library's
+  // `noSizePenalty` flag.
+  const sizePenalty = rawOptions.sizePenalty ?? true;
   return {
     modes: parseModes(rawOptions.modes),
     threshold,
     minLines,
-    noSizePenalty: rawOptions.noSizePenalty,
+    noSizePenalty: !sizePenalty,
     sameFileOnly: rawOptions.sameFileOnly,
     crossFileOnly: rawOptions.crossFileOnly,
     extensions: parseExtensions(rawOptions.extensions),

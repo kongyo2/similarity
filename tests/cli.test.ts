@@ -291,6 +291,132 @@ describe("runCli", () => {
     });
   });
 
+  it("accepts --no-size-penalty without affecting other flag parsing", async () => {
+    await withTempProject(async (projectDir) => {
+      // Regression: previously the `--no-size-penalty` option had a
+      // `false` default registered on Commander, which suppressed the
+      // negation behavior and silently ignored the flag.
+      await createCliFixture(projectDir);
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [
+          path.join(projectDir, "src"),
+          "--no-size-penalty",
+          "--modes",
+          "functions",
+          "--format",
+          "json",
+        ],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      expect(logs).toHaveLength(1);
+      const parsed = JSON.parse(logs[0]) as {
+        stats: { fileCount: number };
+      };
+      expect(parsed.stats.fileCount).toBeGreaterThan(0);
+    });
+  });
+
+  it("walks ancestor .gitignore files above the scan target", async () => {
+    await withTempProject(async (projectDir) => {
+      // Simulate running `similarity-ts /abs/path/to/repo/app/src` from
+      // outside the project. The `.git` marker in `app/` lets our walker
+      // identify the enclosing repo root so that `app/.gitignore` applies to
+      // files discovered under `app/src`.
+      await fs.mkdir(path.join(projectDir, "app", "src"), { recursive: true });
+      await fs.mkdir(path.join(projectDir, "app", ".git"), { recursive: true });
+      await fs.writeFile(
+        path.join(projectDir, "app", ".gitignore"),
+        "src/ignored.ts\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectDir, "app", "src", "kept.ts"),
+        "export const a = 1;\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectDir, "app", "src", "ignored.ts"),
+        "export const b = 2;\n",
+        "utf8",
+      );
+
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [path.join(projectDir, "app", "src"), "--format", "json"],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      const parsed = JSON.parse(logs[0]) as {
+        analyzedFiles: string[];
+        skippedFiles: string[];
+      };
+      expect(parsed.analyzedFiles).toHaveLength(1);
+      expect(parsed.analyzedFiles[0].endsWith("kept.ts")).toBe(true);
+      expect(parsed.skippedFiles.some((file) => file.endsWith("ignored.ts"))).toBe(true);
+    });
+  });
+
+  it("walks nested .gitignore files discovered under the scan target", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.mkdir(path.join(projectDir, "app", "sub"), { recursive: true });
+      await fs.writeFile(
+        path.join(projectDir, "app", "sub", ".gitignore"),
+        "nested_ignored.ts\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectDir, "app", "top.ts"),
+        "export const a = 1;\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectDir, "app", "sub", "nested_kept.ts"),
+        "export const b = 2;\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectDir, "app", "sub", "nested_ignored.ts"),
+        "export const c = 3;\n",
+        "utf8",
+      );
+
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [path.join(projectDir, "app"), "--format", "json"],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      const parsed = JSON.parse(logs[0]) as {
+        analyzedFiles: string[];
+        skippedFiles: string[];
+      };
+      const analyzedNames = parsed.analyzedFiles
+        .map((file) => path.basename(file))
+        .sort();
+      expect(analyzedNames).toEqual(["nested_kept.ts", "top.ts"]);
+      expect(
+        parsed.skippedFiles.some((file) => file.endsWith("nested_ignored.ts")),
+      ).toBe(true);
+    });
+  });
+
   it("reports warnings to stderr even when the exit code is zero", async () => {
     await withTempProject(async (projectDir) => {
       await fs.mkdir(path.join(projectDir, "src"), { recursive: true });
