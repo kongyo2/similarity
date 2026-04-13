@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { analyzeProject } from "../src/index.js";
+import { analyzeProject, resolveAnalyzeOptions } from "../src/index.js";
 
 async function withTempProject(run: (projectDir: string) => Promise<void>) {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "similarity-ts-"));
@@ -156,6 +156,74 @@ describe("analyzeProject", () => {
       expect(
         report.byMode.functions.every((pair) => pair.left.filePath !== pair.right.filePath),
       ).toBe(true);
+    });
+  });
+
+  it("rejects non-integer numeric options via resolveAnalyzeOptions", () => {
+    expect(() =>
+      resolveAnalyzeOptions({ paths: ["."], minLines: Number.NaN }),
+    ).toThrow("minLines must be a positive integer");
+    expect(() =>
+      resolveAnalyzeOptions({ paths: ["."], overlapMinWindow: 1.5 }),
+    ).toThrow("overlapMinWindow must be a positive integer");
+  });
+
+  it("rejects overlapMinWindow greater than overlapMaxWindow", () => {
+    expect(() =>
+      resolveAnalyzeOptions({
+        paths: ["."],
+        overlapMinWindow: 30,
+        overlapMaxWindow: 5,
+      }),
+    ).toThrow("overlapMinWindow must be less than or equal to overlapMaxWindow");
+  });
+
+  it("discovers files with a single extension filter", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.mkdir(path.join(projectDir, "src"), { recursive: true });
+      await fs.writeFile(
+        path.join(projectDir, "src", "only.ts"),
+        "export const only = 1;\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectDir, "src", "other.tsx"),
+        "export const other = 2;\n",
+        "utf8",
+      );
+      const report = await analyzeProject({
+        cwd: projectDir,
+        paths: ["src"],
+        extensions: ["ts"],
+      });
+      expect(report.stats.fileCount).toBe(1);
+      expect(report.analyzedFiles[0]?.endsWith("only.ts")).toBe(true);
+    });
+  });
+
+  it("honors a .gitignore located in the target directory", async () => {
+    await withTempProject(async (projectDir) => {
+      const targetDir = path.join(projectDir, "app");
+      await fs.mkdir(targetDir, { recursive: true });
+      await fs.writeFile(path.join(targetDir, ".gitignore"), "ignored.ts\n", "utf8");
+      await fs.writeFile(
+        path.join(targetDir, "kept.ts"),
+        "export const a = 1;\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(targetDir, "ignored.ts"),
+        "export const b = 2;\n",
+        "utf8",
+      );
+
+      const report = await analyzeProject({
+        cwd: projectDir,
+        paths: ["app"],
+      });
+      expect(report.stats.fileCount).toBe(1);
+      expect(report.analyzedFiles[0]?.endsWith("kept.ts")).toBe(true);
+      expect(report.skippedFiles.some((file) => file.endsWith("ignored.ts"))).toBe(true);
     });
   });
 

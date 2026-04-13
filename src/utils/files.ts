@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import fg from "fast-glob";
-import ignore from "ignore";
+import ignore, { type Ignore } from "ignore";
 import { DEFAULT_EXCLUDES } from "../defaults.js";
 import { toPosixPath } from "./path.js";
 
@@ -18,8 +18,10 @@ export interface CollectFilesResult {
   warnings: string[];
 }
 
-async function loadRootGitIgnore(cwd: string): Promise<string> {
-  const gitIgnorePath = path.join(cwd, ".gitignore");
+type IgnoreFn = (absolutePath: string) => boolean;
+
+async function loadGitIgnore(dir: string): Promise<string> {
+  const gitIgnorePath = path.join(dir, ".gitignore");
   try {
     return await fs.readFile(gitIgnorePath, "utf8");
   } catch {
@@ -27,7 +29,11 @@ async function loadRootGitIgnore(cwd: string): Promise<string> {
   }
 }
 
-function createIgnoreMatcher(cwd: string, gitIgnoreContent: string, extraExclude: string[]) {
+function createRootIgnoreMatcher(
+  cwd: string,
+  gitIgnoreContent: string,
+  extraExclude: string[],
+): IgnoreFn {
   const matcher = ignore();
   if (gitIgnoreContent.trim().length > 0) {
     matcher.add(gitIgnoreContent);
@@ -46,15 +52,51 @@ function createIgnoreMatcher(cwd: string, gitIgnoreContent: string, extraExclude
   };
 }
 
-function toExtensionPattern(extensions: string[]): string {
-  return extensions.map((ext) => ext.replace(/^\./, "").toLowerCase()).join(",");
+function createTargetIgnoreMatcher(baseDir: string, gitIgnoreContent: string): IgnoreFn {
+  if (gitIgnoreContent.trim().length === 0) {
+    return () => false;
+  }
+  const matcher: Ignore = ignore().add(gitIgnoreContent);
+  return (absolutePath: string): boolean => {
+    const relative = toPosixPath(path.relative(baseDir, absolutePath));
+    if (!relative || relative.startsWith("..")) {
+      return false;
+    }
+    return matcher.ignores(relative);
+  };
+}
+
+function buildDirectoryGlobs(extensions: string[]): string[] {
+  const unique = [
+    ...new Set(
+      extensions
+        .map((ext) => ext.replace(/^\./, "").toLowerCase())
+        .filter((ext) => ext.length > 0),
+    ),
+  ];
+  // Emit one pattern per extension instead of a brace expression, because
+  // `**/*.{ts}` (single-item brace) is treated literally by fast-glob/picomatch
+  // and silently matches nothing.
+  return unique.map((ext) => `**/*.${ext}`);
 }
 
 export async function collectTypeScriptFiles(options: CollectFilesOptions): Promise<CollectFilesResult> {
   const { cwd, paths, extensions, exclude } = options;
-  const extPattern = toExtensionPattern(extensions);
-  const gitIgnoreContent = await loadRootGitIgnore(cwd);
-  const isIgnored = createIgnoreMatcher(cwd, gitIgnoreContent, exclude);
+  const globPatterns = buildDirectoryGlobs(extensions);
+  const rootGitIgnoreContent = await loadGitIgnore(cwd);
+  const isIgnoredByRoot = createRootIgnoreMatcher(cwd, rootGitIgnoreContent, exclude);
+
+  const targetMatcherCache = new Map<string, IgnoreFn>();
+  async function getTargetMatcher(targetDir: string): Promise<IgnoreFn> {
+    const cached = targetMatcherCache.get(targetDir);
+    if (cached) {
+      return cached;
+    }
+    const content = targetDir === cwd ? "" : await loadGitIgnore(targetDir);
+    const matcher = createTargetIgnoreMatcher(targetDir, content);
+    targetMatcherCache.set(targetDir, matcher);
+    return matcher;
+  }
 
   const discovered = new Set<string>();
   const skipped: string[] = [];
@@ -76,7 +118,7 @@ export async function collectTypeScriptFiles(options: CollectFilesOptions): Prom
         skipped.push(absoluteTarget);
         continue;
       }
-      if (isIgnored(absoluteTarget)) {
+      if (isIgnoredByRoot(absoluteTarget)) {
         skipped.push(absoluteTarget);
         continue;
       }
@@ -89,18 +131,22 @@ export async function collectTypeScriptFiles(options: CollectFilesOptions): Prom
       continue;
     }
 
-    const matches = await fg(`**/*.{${extPattern}}`, {
-      cwd: absoluteTarget,
-      absolute: true,
-      onlyFiles: true,
-      followSymbolicLinks: false,
-      suppressErrors: true,
-      dot: false,
-    });
+    const matches = globPatterns.length === 0
+      ? []
+      : await fg(globPatterns, {
+          cwd: absoluteTarget,
+          absolute: true,
+          onlyFiles: true,
+          followSymbolicLinks: false,
+          suppressErrors: true,
+          dot: false,
+        });
+
+    const isIgnoredByTarget = await getTargetMatcher(absoluteTarget);
 
     for (const file of matches) {
       const resolved = path.resolve(file);
-      if (isIgnored(resolved)) {
+      if (isIgnoredByRoot(resolved) || isIgnoredByTarget(resolved)) {
         skipped.push(resolved);
         continue;
       }
