@@ -38,6 +38,21 @@ export interface ResolvedAnalyzeOptions {
   overlapSizeTolerance: number;
 }
 
+function requirePositiveInteger(
+  value: number | undefined,
+  fallback: number,
+  field: string,
+): number {
+  const resolved = value ?? fallback;
+  if (!Number.isFinite(resolved) || !Number.isInteger(resolved)) {
+    throw new Error(`${field} must be a positive integer`);
+  }
+  if (resolved < 1) {
+    throw new Error(`${field} must be greater than or equal to 1`);
+  }
+  return resolved;
+}
+
 export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAnalyzeOptions {
   if (!input.paths || input.paths.length === 0) {
     throw new Error("At least one path is required");
@@ -46,8 +61,30 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
     throw new Error("Cannot use both sameFileOnly and crossFileOnly");
   }
   const threshold = input.threshold ?? DEFAULT_THRESHOLD;
-  if (threshold < 0 || threshold > 1) {
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
     throw new Error("threshold must be between 0 and 1");
+  }
+  const overlapSizeTolerance = input.overlapSizeTolerance ?? DEFAULT_OVERLAP_SIZE_TOLERANCE;
+  if (
+    !Number.isFinite(overlapSizeTolerance) ||
+    overlapSizeTolerance < 0 ||
+    overlapSizeTolerance > 1
+  ) {
+    throw new Error("overlapSizeTolerance must be between 0 and 1");
+  }
+  const minLines = requirePositiveInteger(input.minLines, DEFAULT_MIN_LINES, "minLines");
+  const overlapMinWindow = requirePositiveInteger(
+    input.overlapMinWindow,
+    DEFAULT_OVERLAP_MIN_WINDOW,
+    "overlapMinWindow",
+  );
+  const overlapMaxWindow = requirePositiveInteger(
+    input.overlapMaxWindow,
+    DEFAULT_OVERLAP_MAX_WINDOW,
+    "overlapMaxWindow",
+  );
+  if (overlapMinWindow > overlapMaxWindow) {
+    throw new Error("overlapMinWindow must be less than or equal to overlapMaxWindow");
   }
 
   return {
@@ -55,7 +92,7 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
     paths: input.paths,
     modes: uniqueModes(input.modes),
     threshold,
-    minLines: Math.max(1, input.minLines ?? DEFAULT_MIN_LINES),
+    minLines,
     sizePenalty: !input.noSizePenalty,
     sameFileOnly: Boolean(input.sameFileOnly),
     crossFileOnly: Boolean(input.crossFileOnly),
@@ -64,9 +101,9 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
     typesOnly: input.typesOnly ?? "all",
     allowCrossKind: Boolean(input.allowCrossKind),
     includeTypeLiterals: Boolean(input.includeTypeLiterals),
-    overlapMinWindow: Math.max(1, input.overlapMinWindow ?? DEFAULT_OVERLAP_MIN_WINDOW),
-    overlapMaxWindow: Math.max(1, input.overlapMaxWindow ?? DEFAULT_OVERLAP_MAX_WINDOW),
-    overlapSizeTolerance: input.overlapSizeTolerance ?? DEFAULT_OVERLAP_SIZE_TOLERANCE,
+    overlapMinWindow,
+    overlapMaxWindow,
+    overlapSizeTolerance,
   };
 }
 

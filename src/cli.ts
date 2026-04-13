@@ -27,7 +27,7 @@ interface ParsedCliOptions {
   modes: string;
   threshold: number;
   minLines: number;
-  noSizePenalty: boolean;
+  sizePenalty: boolean;
   sameFileOnly: boolean;
   crossFileOnly: boolean;
   extensions: string;
@@ -40,6 +40,7 @@ interface ParsedCliOptions {
   overlapSizeTolerance: number;
   format: "pretty" | "json";
   output?: string;
+  failOnWarnings: boolean;
 }
 
 const modeSchema = z.enum(["functions", "types", "classes", "overlap"]);
@@ -82,7 +83,7 @@ function buildProgram(): Command {
     )
     .option("-t, --threshold <number>", "Similarity threshold (0-1)", String(DEFAULT_THRESHOLD))
     .option("--min-lines <number>", "Minimum function line count", String(DEFAULT_MIN_LINES))
-    .option("--no-size-penalty", "Disable line-count size penalty for function mode", false)
+    .option("--no-size-penalty", "Disable line-count size penalty for function mode")
     .option("--same-file-only", "Only compare symbols from the same file", false)
     .option("--cross-file-only", "Only compare symbols across different files", false)
     .option(
@@ -106,6 +107,11 @@ function buildProgram(): Command {
     )
     .addOption(new Option("--format <format>", "Output format").choices(["pretty", "json"]).default("pretty"))
     .option("--output <path>", "Write report to file")
+    .option(
+      "--fail-on-warnings",
+      "Exit with a non-zero code when the analysis emits any warning",
+      false,
+    )
     .showHelpAfterError(true);
   return program;
 }
@@ -118,11 +124,26 @@ function parseNumber(value: string, field: string): number {
   return parsed;
 }
 
+function parseInteger(value: unknown, field: string, minimum = 1): number {
+  const raw = String(value).trim();
+  if (raw.length === 0) {
+    throw new Error(`${field} must be an integer`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+    throw new Error(`${field} must be an integer`);
+  }
+  if (parsed < minimum) {
+    throw new Error(`${field} must be greater than or equal to ${minimum}`);
+  }
+  return parsed;
+}
+
 function normalizeOptions(rawOptions: ParsedCliOptions) {
   const threshold = parseNumber(String(rawOptions.threshold), "threshold");
-  const minLines = Math.max(1, parseInt(String(rawOptions.minLines), 10));
-  const overlapMinWindow = Math.max(1, parseInt(String(rawOptions.overlapMinWindow), 10));
-  const overlapMaxWindow = Math.max(1, parseInt(String(rawOptions.overlapMaxWindow), 10));
+  const minLines = parseInteger(rawOptions.minLines, "min-lines");
+  const overlapMinWindow = parseInteger(rawOptions.overlapMinWindow, "overlap-min-window");
+  const overlapMaxWindow = parseInteger(rawOptions.overlapMaxWindow, "overlap-max-window");
   const overlapSizeTolerance = parseNumber(String(rawOptions.overlapSizeTolerance), "overlap-size-tolerance");
 
   if (threshold < 0 || threshold > 1) {
@@ -131,15 +152,25 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
   if (overlapSizeTolerance < 0 || overlapSizeTolerance > 1) {
     throw new Error("overlap-size-tolerance must be between 0 and 1");
   }
+  if (overlapMinWindow > overlapMaxWindow) {
+    throw new Error(
+      "overlap-min-window must be less than or equal to overlap-max-window",
+    );
+  }
   if (rawOptions.sameFileOnly && rawOptions.crossFileOnly) {
     throw new Error("Cannot use both --same-file-only and --cross-file-only");
   }
 
+  // Commander's `--no-<name>` convention stores the parsed value on the
+  // positive key (`sizePenalty`) rather than `noSizePenalty`, and defaults
+  // to `true` unless the flag is passed. Translate back to the library's
+  // `noSizePenalty` flag.
+  const sizePenalty = rawOptions.sizePenalty ?? true;
   return {
     modes: parseModes(rawOptions.modes),
     threshold,
     minLines,
-    noSizePenalty: rawOptions.noSizePenalty,
+    noSizePenalty: !sizePenalty,
     sameFileOnly: rawOptions.sameFileOnly,
     crossFileOnly: rawOptions.crossFileOnly,
     extensions: parseExtensions(rawOptions.extensions),
@@ -152,6 +183,7 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
     overlapSizeTolerance,
     format: rawOptions.format,
     output: rawOptions.output,
+    failOnWarnings: Boolean(rawOptions.failOnWarnings),
   };
 }
 
@@ -195,6 +227,16 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
       io.log(`Report written: ${options.output}`);
     } else {
       io.log(rendered);
+    }
+
+    const warnings = report.warnings ?? [];
+    if (warnings.length > 0) {
+      for (const warning of warnings) {
+        io.error(warning.filePath ? `${warning.filePath}: ${warning.message}` : warning.message);
+      }
+      if (report.stats.fileCount === 0 || options.failOnWarnings) {
+        return 1;
+      }
     }
     return 0;
   } catch (error) {
