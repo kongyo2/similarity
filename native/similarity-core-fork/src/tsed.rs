@@ -66,20 +66,6 @@ pub fn calculate_tsed(tree1: &Rc<TreeNode>, tree2: &Rc<TreeNode>, options: &TSED
         tsed_similarity
     };
 
-    // For very small trees, even small differences should matter more
-    let tsed_similarity = if options.size_penalty {
-        if max_size < 10.0 && distance > 0.0 {
-            tsed_similarity * 0.8 // Reduce similarity for small trees with any differences
-        } else if max_size < 30.0 && distance > 0.0 {
-            // For moderately small trees, apply a smaller penalty
-            tsed_similarity * 0.9
-        } else {
-            tsed_similarity
-        }
-    } else {
-        tsed_similarity
-    };
-
     // Apply additional penalties for structural differences
     let mut similarity = tsed_similarity;
 
@@ -87,19 +73,35 @@ pub fn calculate_tsed(tree1: &Rc<TreeNode>, tree2: &Rc<TreeNode>, options: &TSED
     let size_ratio = size1.min(size2) / size1.max(size2);
 
     if options.size_penalty {
-        // For short functions, make differences more pronounced
+        // The short-function penalty guards against coincidental matches on
+        // trivial code (e.g. `() => 0` vs `() => 1`). It should scale with
+        // how much real structural churn exists — pure rename-only diffs
+        // already fall out of the APTED distance via the low rename cost,
+        // so we shouldn't compound them with a large short-function discount.
         let min_size = size1.min(size2);
+        let normalized_distance = if max_size > 0.0 { distance / max_size } else { 0.0 };
 
         if min_size < 30.0 {
-            // Short function penalty: the shorter, the more sensitive to differences
-            let short_function_factor = (min_size / 30.0).powf(0.5);
-            similarity *= short_function_factor;
+            // Base short-function factor: shorter trees get more suspicious
+            // of small similarity signals.
+            let base_factor = (min_size / 30.0).powf(0.5);
+            // Softener moves the penalty toward 1.0 as normalized distance
+            // approaches zero. At normalized_distance >= ~0.33 the full
+            // base_factor is applied; at 0 no penalty is applied.
+            let softener = (1.0 - normalized_distance * 3.0).clamp(0.0, 1.0);
+            let effective_factor = base_factor + (1.0 - base_factor) * softener;
+            similarity *= effective_factor;
 
-            // Additional penalty for very short functions
-            if min_size < 10.0 {
-                similarity *= 0.5; // Strong penalty for very short functions
-            } else if min_size < 20.0 {
-                similarity *= 0.7; // Moderate penalty for short functions
+            // Keep a mild extra discount when trees are both tiny AND the
+            // structural distance is meaningful, which preserves the intent
+            // of filtering trivial lookalikes without squashing rename-only
+            // matches on ~10-node functions.
+            if normalized_distance > 0.15 {
+                if min_size < 10.0 {
+                    similarity *= 0.6;
+                } else if min_size < 20.0 {
+                    similarity *= 0.8;
+                }
             }
         }
 

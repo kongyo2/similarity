@@ -455,13 +455,28 @@ pub fn compare_functions(
 
     let mut similarity = calculate_tsed(&tree1, &tree2, options);
 
-    // Apply size penalty for short functions if enabled
+    // Apply line-count size penalty for short functions if enabled. This is a
+    // second, coarser guard on top of the node-count penalty in
+    // `calculate_tsed` — the purpose is to filter trivial lookalikes like
+    // `() => 0` vs `() => 1`. But the original formulation (`similarity *=
+    // avg_lines / 10.0` for functions under 10 lines) was far too aggressive
+    // for rename-only duplicates: a genuinely-duplicated 6-line helper with
+    // renamed identifiers would have its real ~0.91 TSED reduced to 0.55
+    // purely because it happened to be short, hiding obvious duplication from
+    // the default 0.8 threshold. We still want to discount pairs where the
+    // similarity signal is thin AND the function is short, but we should not
+    // punish high-similarity matches on short functions just for being short.
     if options.size_penalty {
         let avg_lines = (func1.line_count() + func2.line_count()) as f64 / 2.0;
         if avg_lines < 10.0 {
-            // Apply penalty: shorter functions get more penalty
-            let penalty = avg_lines / 10.0;
-            similarity *= penalty;
+            // Confidence softener: scale the base short-function factor back
+            // toward 1.0 as the raw similarity approaches 1.0. At sim >= 0.9
+            // we apply essentially no penalty; at sim <= 0.6 we apply the
+            // full original penalty.
+            let base_factor = (avg_lines / 10.0).max(0.1);
+            let confidence = ((similarity - 0.6) / 0.3).clamp(0.0, 1.0);
+            let effective_factor = base_factor + (1.0 - base_factor) * confidence;
+            similarity *= effective_factor;
         }
     }
 

@@ -63,6 +63,10 @@ pub struct IndexedFunction {
     pub name: String,
     /// File path
     pub file_path: String,
+    /// First source line of the function in the original file (1-based, inclusive)
+    pub start_line: u32,
+    /// Last source line of the function in the original file (1-based, inclusive)
+    pub end_line: u32,
     /// Root fingerprint of the entire function
     pub root_fingerprint: SubtreeFingerprint,
     /// Map from subtree hash to all subtrees with that hash
@@ -75,10 +79,18 @@ pub struct IndexedFunction {
 
 impl IndexedFunction {
     /// Create a new indexed function
-    pub fn new(name: String, file_path: String, root_fingerprint: SubtreeFingerprint) -> Self {
+    pub fn new(
+        name: String,
+        file_path: String,
+        start_line: u32,
+        end_line: u32,
+        root_fingerprint: SubtreeFingerprint,
+    ) -> Self {
         Self {
             name,
             file_path,
+            start_line,
+            end_line,
             root_fingerprint,
             subtree_index: HashMap::new(),
             size_index: HashMap::new(),
@@ -346,11 +358,41 @@ pub fn detect_partial_overlaps(
                     }
 
                     if similarity >= options.threshold {
+                        // Suppress spurious exact-hash matches on tiny
+                        // subtrees. Very small subtree labels (e.g. a 5-node
+                        // `obj.method(arg)` CallExpression) routinely hash
+                        // identically across completely unrelated functions
+                        // because there are only so many ways to shape a
+                        // small label sequence, and the fingerprint hash is
+                        // value-insensitive. Those collisions otherwise
+                        // flood the report with similarity=1.0 "overlaps"
+                        // that aren't real duplicates. Non-exact (<1.0)
+                        // matches are jaccard-based and already carry more
+                        // structural signal, so we leave them alone.
+                        if similarity >= 0.999 && source_window.weight < 8 {
+                            let source_total = source_func.root_fingerprint.weight.max(1);
+                            let target_total = target_func.root_fingerprint.weight.max(1);
+                            let smaller_total = source_total.min(target_total);
+                            if smaller_total >= 30 {
+                                let coverage =
+                                    source_window.weight as f64 / smaller_total as f64;
+                                if coverage < 0.25 {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // The internal fingerprint start/end lines are synthesized
+                        // from node ids inside the per-function AST and do not map
+                        // to real source positions (they can exceed the file's
+                        // actual line count). Report the enclosing function's real
+                        // line range instead so downstream consumers always get
+                        // valid, in-bounds locations.
                         overlaps.push(PartialOverlap {
                             source_function: source_func.name.clone(),
                             target_function: target_func.name.clone(),
-                            source_lines: (source_window.start_line, source_window.end_line),
-                            target_lines: (target_subtree.start_line, target_subtree.end_line),
+                            source_lines: (source_func.start_line, source_func.end_line),
+                            target_lines: (target_func.start_line, target_func.end_line),
                             similarity,
                             node_count: source_window.weight,
                             node_type: target_subtree.node_type.clone(),
@@ -466,8 +508,13 @@ mod tests {
             depth: 0,
         };
 
-        let mut indexed =
-            IndexedFunction::new("testFunc".to_string(), "test.ts".to_string(), root_fp);
+        let mut indexed = IndexedFunction::new(
+            "testFunc".to_string(),
+            "test.ts".to_string(),
+            1,
+            50,
+            root_fp,
+        );
 
         indexed.add_subtree(SubtreeFingerprint {
             weight: 10,
