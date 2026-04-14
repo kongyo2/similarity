@@ -58,6 +58,31 @@ pub struct GenericFunctionDef {
     pub decorators: Vec<String>,
 }
 
+impl GenericFunctionDef {
+    /// Check if this function and `other` are nested in each other (one
+    /// strictly contains the other). Used to drop parent-child pairs in
+    /// same-file overlap scans, where the parent's subtree fingerprints
+    /// trivially include the child and would always "match" — that's a
+    /// containment artifact, not a duplication signal.
+    ///
+    /// Containment is decided on body line ranges so that two functions
+    /// declared on identical line spans (impossible in practice but cheap
+    /// to guard against) are not incorrectly treated as parent/child.
+    pub fn is_parent_child_relationship(&self, other: &GenericFunctionDef) -> bool {
+        let other_inside_self = self.start_line <= other.start_line
+            && self.end_line >= other.end_line
+            && self.body_start_line < other.body_start_line
+            && self.body_end_line > other.body_end_line;
+
+        let self_inside_other = other.start_line <= self.start_line
+            && other.end_line >= self.end_line
+            && other.body_start_line < self.body_start_line
+            && other.body_end_line > self.body_end_line;
+
+        other_inside_self || self_inside_other
+    }
+}
+
 /// Generic type definition that works across languages
 #[derive(Debug, Clone)]
 pub struct GenericTypeDef {

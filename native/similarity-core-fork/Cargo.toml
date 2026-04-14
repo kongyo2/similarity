@@ -17,3 +17,8 @@ toml = "1"
 rayon = "1.10"
 ignore = "0.4"
 anyhow = "1.0"
+
+[dev-dependencies]
+# Required by config_loader.rs tests which write temporary config files to
+# disk; otherwise `cargo test` fails to compile.
+tempfile = "3"

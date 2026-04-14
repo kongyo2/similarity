@@ -5,3 +5,8 @@ coverage/
 
 # Rust build artifacts
 native/**/target/
+
+# Cargo.lock for library crates (intentionally untracked; the wasm binary
+# crate's lockfile *is* tracked and remains so).
+native/similarity-core-fork/Cargo.lock
+native/similarity-core-ts/Cargo.lock

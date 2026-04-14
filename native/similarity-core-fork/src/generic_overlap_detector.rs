@@ -25,14 +25,31 @@ pub fn find_function_overlaps_generic(
     // Parse and index functions
     let mut all_overlaps = Vec::new();
 
-    for source_func in &source_functions {
+    // When the caller feeds us the same file on both sides we must walk only
+    // ordered pairs, otherwise every (A, B) match would be mirrored by a
+    // (B, A) match and the consumer would see each duplicate reported twice.
+    // Identify "same file" by filename only — a content-equality fallback
+    // would wrongly collapse two distinct files that happen to be byte
+    // identical (e.g. legitimate full-file duplication we want to detect).
+    let same_file = source_filename == target_filename;
+
+    for (source_idx, source_func) in source_functions.iter().enumerate() {
         let source_indexed =
             index_function_generic(parser, source_func, source_code, source_filename)?;
 
-        for target_func in &target_functions {
-            // Skip if comparing the same function in the same file
-            // (but allow comparing functions with same name in different files)
-            if source_func.name == target_func.name && source_code == target_code {
+        for (target_idx, target_func) in target_functions.iter().enumerate() {
+            // Avoid emitting both (A, B) and (B, A) when we're walking the
+            // symmetric cartesian product of a single file's functions. The
+            // strict `<=` also drops (A, A) self-pairs.
+            if same_file && target_idx <= source_idx {
+                continue;
+            }
+
+            // A nested function lives entirely inside its parent, so the
+            // parent's subtree fingerprints trivially include the child and
+            // would always "match". That is a containment artifact, not a
+            // duplication signal — skip those pairs in same-file scans.
+            if same_file && source_func.is_parent_child_relationship(target_func) {
                 continue;
             }
 
@@ -138,7 +155,13 @@ fn index_function_generic(
     let (root_fp, subtrees) = generate_subtree_fingerprints(&tree, 0, func.start_line);
 
     // Create indexed function
-    let mut indexed = IndexedFunction::new(func.name.clone(), file_name.to_string(), root_fp);
+    let mut indexed = IndexedFunction::new(
+        func.name.clone(),
+        file_name.to_string(),
+        func.start_line,
+        func.end_line,
+        root_fp,
+    );
 
     // Add all subtrees to the index
     for subtree in subtrees {

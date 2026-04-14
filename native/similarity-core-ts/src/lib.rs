@@ -329,8 +329,13 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
     if input.modes.iter().any(|m| m == "overlap") {
         let map: HashMap<String, String> = files.iter().cloned().collect();
         let options = OverlapOptions {
-            min_window_size: input.overlap_min_window.unwrap_or(10),
-            max_window_size: input.overlap_max_window.unwrap_or(100),
+            // Fallbacks match similarity-ts's TypeScript defaults
+            // (DEFAULT_OVERLAP_MIN_WINDOW=8, DEFAULT_OVERLAP_MAX_WINDOW=30).
+            // The TS layer always passes these explicitly today, but keeping
+            // the fallbacks aligned avoids surprising behavior if a future
+            // caller skips one of the fields.
+            min_window_size: input.overlap_min_window.unwrap_or(8),
+            max_window_size: input.overlap_max_window.unwrap_or(30),
             threshold: input.threshold,
             size_tolerance: input.overlap_size_tolerance.unwrap_or(0.2),
         };
