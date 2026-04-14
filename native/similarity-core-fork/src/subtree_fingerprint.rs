@@ -180,7 +180,10 @@ pub struct OverlapOptions {
 
 impl Default for OverlapOptions {
     fn default() -> Self {
-        Self { min_window_size: 10, max_window_size: 100, threshold: 0.8, size_tolerance: 0.2 }
+        // Defaults intentionally mirror similarity-ts's TypeScript defaults
+        // (DEFAULT_OVERLAP_MIN_WINDOW=8, DEFAULT_OVERLAP_MAX_WINDOW=30) so a
+        // direct Rust caller and the WASM-driven CLI behave the same way.
+        Self { min_window_size: 8, max_window_size: 30, threshold: 0.8, size_tolerance: 0.2 }
     }
 }
 

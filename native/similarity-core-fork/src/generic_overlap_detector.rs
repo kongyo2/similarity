@@ -28,20 +28,28 @@ pub fn find_function_overlaps_generic(
     // When the caller feeds us the same file on both sides we must walk only
     // ordered pairs, otherwise every (A, B) match would be mirrored by a
     // (B, A) match and the consumer would see each duplicate reported twice.
-    let same_file = source_filename == target_filename || source_code == target_code;
+    // Identify "same file" by filename only — a content-equality fallback
+    // would wrongly collapse two distinct files that happen to be byte
+    // identical (e.g. legitimate full-file duplication we want to detect).
+    let same_file = source_filename == target_filename;
 
     for (source_idx, source_func) in source_functions.iter().enumerate() {
         let source_indexed =
             index_function_generic(parser, source_func, source_code, source_filename)?;
 
         for (target_idx, target_func) in target_functions.iter().enumerate() {
-            // Skip if comparing the same function in the same file
-            // (but allow comparing functions with same name in different files)
-            if source_func.name == target_func.name && same_file {
+            // Avoid emitting both (A, B) and (B, A) when we're walking the
+            // symmetric cartesian product of a single file's functions. The
+            // strict `<=` also drops (A, A) self-pairs.
+            if same_file && target_idx <= source_idx {
                 continue;
             }
 
-            if same_file && target_idx <= source_idx {
+            // A nested function lives entirely inside its parent, so the
+            // parent's subtree fingerprints trivially include the child and
+            // would always "match". That is a containment artifact, not a
+            // duplication signal — skip those pairs in same-file scans.
+            if same_file && source_func.is_parent_child_relationship(target_func) {
                 continue;
             }
 

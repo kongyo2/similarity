@@ -40,9 +40,11 @@ pub fn find_function_overlaps(
     // When comparing a file against itself, the (source, target) pair space
     // would otherwise visit every unordered function pair twice (once as
     // (A, B) and once as (B, A)). Walk only ordered pairs in that case so
-    // downstream consumers don't see mirrored duplicates.
-    let same_file = std::ptr::eq(source_code.as_ptr(), target_code.as_ptr())
-        || source_code == target_code;
+    // downstream consumers don't see mirrored duplicates. Identify "same
+    // file" via pointer equality only — a content-equality fallback would
+    // wrongly collapse two distinct files that happen to be byte-identical
+    // (e.g. legitimate full-file duplication we want to detect).
+    let same_file = std::ptr::eq(source_code, target_code);
 
     for (source_idx, source_func) in source_functions.iter().enumerate() {
         // Some functions (e.g. class constructors) cannot be parsed as
@@ -54,14 +56,9 @@ pub fn find_function_overlaps(
         };
 
         for (target_idx, target_func) in target_functions.iter().enumerate() {
-            // Skip if comparing the same function in the same file
-            // (but allow comparing functions with same name in different files)
-            if source_func.name == target_func.name && same_file {
-                continue;
-            }
-
             // Avoid emitting both (A, B) and (B, A) when we're walking the
-            // symmetric cartesian product of a single file's functions.
+            // symmetric cartesian product of a single file's functions. The
+            // strict `<=` also drops (A, A) self-pairs.
             if same_file && target_idx <= source_idx {
                 continue;
             }
