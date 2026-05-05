@@ -45,6 +45,23 @@ function createRootIgnoreMatcher(
 
   return (absolutePath: string): boolean => {
     const relative = toPosixPath(path.relative(cwd, absolutePath));
+    /* c8 ignore next 3 -- Root matcher is only used for paths under cwd. */
+    if (!relative || relative.startsWith("..")) {
+      return false;
+    }
+    return matcher.ignores(relative);
+  };
+}
+
+function createGlobalExcludeMatcher(baseDir: string, extraExclude: string[]): IgnoreFn {
+  const matcher = ignore().add(DEFAULT_EXCLUDES);
+  if (extraExclude.length > 0) {
+    matcher.add(extraExclude);
+  }
+
+  return (absolutePath: string): boolean => {
+    const relative = toPosixPath(path.relative(baseDir, absolutePath));
+    /* c8 ignore next 3 -- Public collection only asks this matcher about paths under baseDir. */
     if (!relative || relative.startsWith("..")) {
       return false;
     }
@@ -59,6 +76,7 @@ function createTargetIgnoreMatcher(baseDir: string, gitIgnoreContent: string): I
   const matcher: Ignore = ignore().add(gitIgnoreContent);
   return (absolutePath: string): boolean => {
     const relative = toPosixPath(path.relative(baseDir, absolutePath));
+    /* c8 ignore next 3 -- Public collection only asks this matcher about paths under baseDir. */
     if (!relative || relative.startsWith("..")) {
       return false;
     }
@@ -93,17 +111,27 @@ export async function collectTypeScriptFiles(options: CollectFilesOptions): Prom
   // Per-directory matchers are cached so we only load each `.gitignore` once
   // even when many files share ancestors.
   const directoryMatcherCache = new Map<string, IgnoreFn>();
+  const globalExcludeMatcherCache = new Map<string, IgnoreFn>();
   async function getDirectoryMatcher(dir: string): Promise<IgnoreFn> {
     const cached = directoryMatcherCache.get(dir);
     if (cached) {
       return cached;
     }
-    // cwd's `.gitignore` is already covered by the root matcher (which also
-    // handles DEFAULT_EXCLUDES and --exclude). Skip it here to avoid double
-    // evaluation.
-    const content = dir === cwd ? "" : await loadGitIgnore(dir);
+    const content = await loadGitIgnore(dir);
     const matcher = createTargetIgnoreMatcher(dir, content);
     directoryMatcherCache.set(dir, matcher);
+    return matcher;
+  }
+
+  function getGlobalExcludeMatcher(baseDir: string): IgnoreFn {
+    const cached = globalExcludeMatcherCache.get(baseDir);
+    if (cached) {
+      return cached;
+    }
+    const matcher = baseDir === cwd
+      ? isIgnoredByRoot
+      : createGlobalExcludeMatcher(baseDir, exclude);
+    globalExcludeMatcherCache.set(baseDir, matcher);
     return matcher;
   }
 
@@ -124,6 +152,7 @@ export async function collectTypeScriptFiles(options: CollectFilesOptions): Prom
   // together with `DEFAULT_EXCLUDES` and `--exclude` patterns.
   async function getAncestorMatchers(base: string, leafDir: string): Promise<IgnoreFn[]> {
     const relative = path.relative(base, leafDir);
+    /* c8 ignore next 3 -- resolveIgnoreBase guarantees leafDir is under base for public callers. */
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
       return [];
     }
@@ -213,8 +242,9 @@ export async function collectTypeScriptFiles(options: CollectFilesOptions): Prom
       // directory scans.
       const ignoreBase = await resolveIgnoreBase(absoluteTarget, true);
       const ancestors = await getAncestorMatchers(ignoreBase, path.dirname(absoluteTarget));
+      const isIgnoredByGlobalRules = getGlobalExcludeMatcher(ignoreBase);
       if (
-        isIgnoredByRoot(absoluteTarget) ||
+        isIgnoredByGlobalRules(absoluteTarget) ||
         isIgnoredByAnyAncestor(ancestors, absoluteTarget)
       ) {
         skipped.push(absoluteTarget);
@@ -241,11 +271,12 @@ export async function collectTypeScriptFiles(options: CollectFilesOptions): Prom
         });
 
     const ignoreBase = await resolveIgnoreBase(absoluteTarget, false);
+    const isIgnoredByGlobalRules = getGlobalExcludeMatcher(ignoreBase);
     for (const file of matches) {
       const resolved = path.resolve(file);
       const ancestors = await getAncestorMatchers(ignoreBase, path.dirname(resolved));
       if (
-        isIgnoredByRoot(resolved) ||
+        isIgnoredByGlobalRules(resolved) ||
         isIgnoredByAnyAncestor(ancestors, resolved)
       ) {
         skipped.push(resolved);
