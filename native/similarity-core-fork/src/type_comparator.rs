@@ -270,6 +270,10 @@ pub fn find_similar_types(
             let type1 = &types[i];
             let type2 = &types[j];
 
+            if type1.has_ignore_directive || type2.has_ignore_directive {
+                continue;
+            }
+
             // Skip if same type (same name and file)
             if type1.name == type2.name && type1.file_path == type2.file_path {
                 continue;
@@ -578,5 +582,23 @@ mod tests {
         assert_eq!(similar_pairs.len(), 1);
         assert_eq!(similar_pairs[0].type1.name, "User");
         assert_eq!(similar_pairs[0].type2.name, "Person");
+    }
+
+    #[test]
+    fn test_find_similar_types_skips_similarity_ignore_directives() {
+        let active = create_test_type(
+            "User",
+            vec![("id", "string", false, false), ("email", "string", false, false)],
+        );
+        let mut ignored = create_test_type(
+            "IgnoredUser",
+            vec![("id", "string", false, false), ("email", "string", false, false)],
+        );
+        ignored.has_ignore_directive = true;
+
+        let options = TypeComparisonOptions::default();
+        let similar_pairs = find_similar_types(&[active, ignored], 0.7, &options);
+
+        assert!(similar_pairs.is_empty());
     }
 }

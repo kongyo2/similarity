@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { runCli } from "../src/cli.js";
+import { isCliEntrypoint, runCli } from "../src/cli.js";
 
 async function withTempProject(run: (projectDir: string) => Promise<void>) {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "similarity-ts-cli-"));
@@ -60,6 +61,42 @@ describe("runCli", () => {
     });
   });
 
+  it("accepts multiple target paths", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.mkdir(path.join(projectDir, "src_a"), { recursive: true });
+      await fs.mkdir(path.join(projectDir, "src_b"), { recursive: true });
+      await fs.writeFile(
+        path.join(projectDir, "src_a", "a.ts"),
+        "export const a = 1;\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectDir, "src_b", "b.ts"),
+        "export const b = 2;\n",
+        "utf8",
+      );
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [
+          path.join(projectDir, "src_a"),
+          path.join(projectDir, "src_b"),
+          "--format",
+          "json",
+        ],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      const parsed = JSON.parse(logs[0]) as { stats: { fileCount: number } };
+      expect(parsed.stats.fileCount).toBe(2);
+    });
+  });
+
   it("returns non-zero on invalid flag combinations", async () => {
     const logs: string[] = [];
     const errors: string[] = [];
@@ -111,6 +148,101 @@ describe("runCli", () => {
     });
   });
 
+  it("falls back to default modes when --modes is empty", async () => {
+    await withTempProject(async (projectDir) => {
+      await createCliFixture(projectDir);
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [path.join(projectDir, "src"), "--modes", "", "--format", "json"],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      const parsed = JSON.parse(logs[0]) as {
+        byMode: Record<string, unknown[]>;
+      };
+      expect(Object.keys(parsed.byMode).sort()).toEqual([
+        "classes",
+        "functions",
+        "overlap",
+        "types",
+      ]);
+    });
+  });
+
+  it("falls back to default extensions when --extensions is empty", async () => {
+    await withTempProject(async (projectDir) => {
+      await createCliFixture(projectDir);
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [path.join(projectDir, "src"), "--extensions", "", "--format", "json"],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      const parsed = JSON.parse(logs[0]) as { stats: { fileCount: number } };
+      expect(parsed.stats.fileCount).toBe(2);
+    });
+  });
+
+  it("applies repeated --exclude patterns", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.mkdir(path.join(projectDir, "src"), { recursive: true });
+      await fs.writeFile(
+        path.join(projectDir, "src", "kept.ts"),
+        "export const kept = true;\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectDir, "src", "first.generated.ts"),
+        "export const first = true;\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(projectDir, "src", "second.fixture.ts"),
+        "export const second = true;\n",
+        "utf8",
+      );
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [
+          path.join(projectDir, "src"),
+          "--exclude",
+          "**/*.generated.ts",
+          "--exclude",
+          "**/*.fixture.ts",
+          "--format",
+          "json",
+        ],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      const parsed = JSON.parse(logs[0]) as {
+        analyzedFiles: string[];
+        skippedFiles: string[];
+      };
+      expect(parsed.analyzedFiles).toHaveLength(1);
+      expect(parsed.analyzedFiles[0].endsWith("kept.ts")).toBe(true);
+      expect(parsed.skippedFiles).toHaveLength(2);
+    });
+  });
+
   it("rejects non-integer values for --min-lines", async () => {
     const logs: string[] = [];
     const errors: string[] = [];
@@ -121,6 +253,54 @@ describe("runCli", () => {
     expect(exitCode).toBe(1);
     expect(logs).toHaveLength(0);
     expect(errors[0]).toContain("min-lines must be an integer");
+  });
+
+  it("rejects values below the minimum for --min-lines", async () => {
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const exitCode = await runCli([".", "--min-lines", "0"], {
+      log: (message) => logs.push(message),
+      error: (message) => errors.push(message),
+    });
+    expect(exitCode).toBe(1);
+    expect(logs).toHaveLength(0);
+    expect(errors[0]).toContain("min-lines must be greater than or equal to 1");
+  });
+
+  it("rejects empty values for --min-lines", async () => {
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const exitCode = await runCli([".", "--min-lines", ""], {
+      log: (message) => logs.push(message),
+      error: (message) => errors.push(message),
+    });
+    expect(exitCode).toBe(1);
+    expect(logs).toHaveLength(0);
+    expect(errors[0]).toContain("min-lines must be an integer");
+  });
+
+  it("rejects non-numeric threshold values", async () => {
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const exitCode = await runCli([".", "--threshold", "abc"], {
+      log: (message) => logs.push(message),
+      error: (message) => errors.push(message),
+    });
+    expect(exitCode).toBe(1);
+    expect(logs).toHaveLength(0);
+    expect(errors[0]).toContain("threshold must be a valid number");
+  });
+
+  it("rejects threshold values outside the accepted ratio range", async () => {
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const exitCode = await runCli([".", "--threshold", "2"], {
+      log: (message) => logs.push(message),
+      error: (message) => errors.push(message),
+    });
+    expect(exitCode).toBe(1);
+    expect(logs).toHaveLength(0);
+    expect(errors[0]).toContain("threshold must be between 0 and 1");
   });
 
   it("rejects non-integer values for --overlap-min-window", async () => {
@@ -161,6 +341,79 @@ describe("runCli", () => {
     expect(errors[0]).toContain(
       "overlap-min-window must be less than or equal to overlap-max-window",
     );
+  });
+
+  it("rejects overlap-size-tolerance outside the accepted ratio range", async () => {
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const exitCode = await runCli(
+      [".", "--modes", "overlap", "--overlap-size-tolerance", "1.5"],
+      {
+        log: (message) => logs.push(message),
+        error: (message) => errors.push(message),
+      },
+    );
+    expect(exitCode).toBe(1);
+    expect(logs).toHaveLength(0);
+    expect(errors[0]).toContain("overlap-size-tolerance must be between 0 and 1");
+  });
+
+  it("renders pretty output by default", async () => {
+    await withTempProject(async (projectDir) => {
+      await createCliFixture(projectDir);
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [path.join(projectDir, "src"), "--modes", "types", "--threshold", "0.5"],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toContain("Analyzing code similarity...");
+      expect(logs[0]).toContain("=== Type Similarity ===");
+      expect(logs[0]).toContain("Total pairs:");
+    });
+  });
+
+  it("writes the rendered report to an output file", async () => {
+    await withTempProject(async (projectDir) => {
+      await createCliFixture(projectDir);
+      const outputPath = path.join(projectDir, "report.json");
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [
+          path.join(projectDir, "src"),
+          "--modes",
+          "types",
+          "--format",
+          "json",
+          "--threshold",
+          "0.5",
+          "--output",
+          outputPath,
+        ],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+      expect(logs).toEqual([`Report written: ${outputPath}`]);
+      const parsed = JSON.parse(await fs.readFile(outputPath, "utf8")) as {
+        stats: { fileCount: number };
+        byMode: { types: unknown[] };
+      };
+      expect(parsed.stats.fileCount).toBe(2);
+      expect(parsed.byMode.types.length).toBeGreaterThan(0);
+    });
   });
 
   it("exits with a non-zero code when every target path is missing", async () => {
@@ -445,6 +698,37 @@ describe("runCli", () => {
       expect(exitCode).toBe(0);
       expect(logs).toHaveLength(1);
       expect(errors.some((message) => message.includes("Parse errors"))).toBe(true);
+    });
+  });
+});
+
+describe("isCliEntrypoint", () => {
+  it("returns false when Node did not provide an argv script path", () => {
+    expect(isCliEntrypoint(undefined, import.meta.url)).toBe(false);
+  });
+
+  it("resolves symlinked argv paths before comparing the current module", async () => {
+    await withTempProject(async (projectDir) => {
+      const realScript = path.join(projectDir, "dist", "cli.js");
+      const linkedScript = path.join(projectDir, "node_modules", ".bin", "similarity-ts");
+      await fs.mkdir(path.dirname(realScript), { recursive: true });
+      await fs.mkdir(path.dirname(linkedScript), { recursive: true });
+      await fs.writeFile(realScript, "#!/usr/bin/env node\n", "utf8");
+      await fs.symlink(realScript, linkedScript);
+
+      expect(
+        isCliEntrypoint(linkedScript, pathToFileURL(realScript).href),
+      ).toBe(true);
+    });
+  });
+
+  it("falls back to the raw argv path when realpath resolution fails", async () => {
+    await withTempProject(async (projectDir) => {
+      const missingScript = path.join(projectDir, "missing.js");
+
+      expect(
+        isCliEntrypoint(missingScript, pathToFileURL(missingScript).href),
+      ).toBe(true);
     });
   });
 });

@@ -161,7 +161,7 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
   return {
     ...wasmReport,
     skippedFiles: collected.skipped,
-    warnings: [...(wasmReport.warnings ?? []), ...warnings.map((message) => ({ message }))],
+    warnings: [...wasmReport.warnings, ...warnings.map((message) => ({ message }))],
     stats: {
       ...wasmReport.stats,
       elapsedMs: Date.now() - startTime,

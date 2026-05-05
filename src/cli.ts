@@ -165,7 +165,7 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
   // positive key (`sizePenalty`) rather than `noSizePenalty`, and defaults
   // to `true` unless the flag is passed. Translate back to the library's
   // `noSizePenalty` flag.
-  const sizePenalty = rawOptions.sizePenalty ?? true;
+  const sizePenalty = rawOptions.sizePenalty;
   return {
     modes: parseModes(rawOptions.modes),
     threshold,
@@ -192,12 +192,7 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
     const program = buildProgram();
     program.parse(argv, { from: "user" });
 
-    const paths = program.processedArgs.flatMap((value) => {
-      if (Array.isArray(value)) {
-        return value.map(String);
-      }
-      return [String(value)];
-    });
+    const paths = program.args.map(String);
     const rawOptions = program.opts<ParsedCliOptions>();
     const options = normalizeOptions(rawOptions);
     const report = await analyzeProject({
@@ -229,7 +224,7 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
       io.log(rendered);
     }
 
-    const warnings = report.warnings ?? [];
+    const warnings = report.warnings;
     if (warnings.length > 0) {
       for (const warning of warnings) {
         io.error(warning.filePath ? `${warning.filePath}: ${warning.message}` : warning.message);
@@ -245,24 +240,25 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
   }
 }
 
-const isMainModule = (() => {
-  if (!process.argv[1]) {
+export function isCliEntrypoint(argvPath: string | undefined, moduleUrl: string): boolean {
+  if (!argvPath) {
     return false;
   }
-  const currentFile = fileURLToPath(import.meta.url);
+  const currentFile = fileURLToPath(moduleUrl);
   // `process.argv[1]` may point to a symlink (e.g. `node_modules/.bin/similarity-ts`
   // when invoked through `npx`), while `import.meta.url` always resolves to the
   // real file path. Resolve the symlink so the comparison still succeeds.
   let resolvedArgv: string;
   try {
-    resolvedArgv = realpathSync(process.argv[1]);
+    resolvedArgv = realpathSync(argvPath);
   } catch {
-    resolvedArgv = process.argv[1];
+    resolvedArgv = argvPath;
   }
   return path.resolve(currentFile) === path.resolve(resolvedArgv);
-})();
+}
 
-if (isMainModule) {
+/* c8 ignore next 5 */
+if (isCliEntrypoint(process.argv[1], import.meta.url)) {
   runCli(process.argv.slice(2)).then((exitCode) => {
     process.exitCode = exitCode;
   });

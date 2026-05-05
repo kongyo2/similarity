@@ -164,8 +164,42 @@ describe("analyzeProject", () => {
       resolveAnalyzeOptions({ paths: ["."], minLines: Number.NaN }),
     ).toThrow("minLines must be a positive integer");
     expect(() =>
+      resolveAnalyzeOptions({ paths: ["."], minLines: 0 }),
+    ).toThrow("minLines must be greater than or equal to 1");
+    expect(() =>
       resolveAnalyzeOptions({ paths: ["."], overlapMinWindow: 1.5 }),
     ).toThrow("overlapMinWindow must be a positive integer");
+    expect(() =>
+      resolveAnalyzeOptions({ paths: ["."], overlapMaxWindow: 0 }),
+    ).toThrow("overlapMaxWindow must be greater than or equal to 1");
+  });
+
+  it("rejects invalid path and comparison constraint options", () => {
+    expect(() => resolveAnalyzeOptions({ paths: [] })).toThrow(
+      "At least one path is required",
+    );
+    expect(() =>
+      resolveAnalyzeOptions({
+        paths: ["."],
+        sameFileOnly: true,
+        crossFileOnly: true,
+      }),
+    ).toThrow("Cannot use both sameFileOnly and crossFileOnly");
+  });
+
+  it("rejects out-of-range ratio options via resolveAnalyzeOptions", () => {
+    expect(() =>
+      resolveAnalyzeOptions({ paths: ["."], threshold: -0.01 }),
+    ).toThrow("threshold must be between 0 and 1");
+    expect(() =>
+      resolveAnalyzeOptions({ paths: ["."], threshold: Number.NaN }),
+    ).toThrow("threshold must be between 0 and 1");
+    expect(() =>
+      resolveAnalyzeOptions({ paths: ["."], overlapSizeTolerance: 1.01 }),
+    ).toThrow("overlapSizeTolerance must be between 0 and 1");
+    expect(() =>
+      resolveAnalyzeOptions({ paths: ["."], overlapSizeTolerance: Number.NaN }),
+    ).toThrow("overlapSizeTolerance must be between 0 and 1");
   });
 
   it("rejects overlapMinWindow greater than overlapMaxWindow", () => {
@@ -295,6 +329,31 @@ describe("analyzeProject", () => {
       ).toBe(true);
     });
   });
+
+  it.skipIf(typeof process.getuid === "function" && process.getuid() === 0)(
+    "reports unreadable discovered files as warnings",
+    async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.mkdir(path.join(projectDir, "src"), { recursive: true });
+      const unreadablePath = path.join(projectDir, "src", "unreadable.ts");
+      await fs.writeFile(unreadablePath, "export const locked = true;\n", "utf8");
+      await fs.chmod(unreadablePath, 0);
+      try {
+        const report = await analyzeProject({
+          cwd: projectDir,
+          paths: ["src"],
+        });
+
+        expect(report.stats.fileCount).toBe(0);
+        expect(report.warnings.some((warning) =>
+          warning.message.includes(`Failed to read ${unreadablePath}`),
+        )).toBe(true);
+      } finally {
+        await fs.chmod(unreadablePath, 0o600);
+      }
+    });
+    },
+  );
 
   it("translates noSizePenalty into sizePenalty=false", () => {
     const withPenalty = resolveAnalyzeOptions({ paths: ["."] });
