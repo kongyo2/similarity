@@ -48,6 +48,23 @@ pub struct FunctionDefinition {
     /// expression (e.g. `x => x + 1`). The normalization wrapper has to
     /// add an explicit `return` in that case.
     pub is_arrow_expression: bool,
+    /// True when the declaration was `async function ...` or
+    /// `async (...) => ...`. Preserved through normalization so an
+    /// `async` and a sync function with otherwise-identical bodies
+    /// don't collapse into the same tree (their runtime contracts
+    /// differ — `Promise<T>` vs `T`).
+    pub is_async: bool,
+    /// True when the declaration was `function* ...` or, for methods,
+    /// `*foo() ...`. Generators differ structurally from non-generator
+    /// counterparts and have to survive normalization.
+    pub is_generator: bool,
+    /// True only for class methods declared `static`. Static and
+    /// instance methods with identical bodies are runtime-distinct,
+    /// so the normalized fragment carries this prefix forward.
+    pub is_static: bool,
+    /// Method kind: `Normal`, `Getter`, or `Setter`. For functions,
+    /// arrows, and constructors this is always `Normal`.
+    pub method_kind: MethodKind,
     pub start_line: u32,
     pub end_line: u32,
     pub class_name: Option<String>,
@@ -85,6 +102,16 @@ pub enum FunctionType {
     Method,
     Arrow,
     Constructor,
+}
+
+/// Class-method kind preserved across normalization so a `get` accessor
+/// and a regular method, or `set` vs `get`, never collapse into the same
+/// tree. Non-method functions always carry `Normal`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MethodKind {
+    Normal,
+    Getter,
+    Setter,
 }
 
 /// Extract all functions from TypeScript/JavaScript code
@@ -147,6 +174,10 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     params_span: func.params.span,
                     body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
                     is_arrow_expression: false,
+                    is_async: func.r#async,
+                    is_generator: func.generator,
+                    is_static: false,
+                    method_kind: MethodKind::Normal,
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -186,6 +217,11 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     } else {
                         FunctionType::Method
                     };
+                    let method_kind = match method.kind {
+                        MethodDefinitionKind::Get => MethodKind::Getter,
+                        MethodDefinitionKind::Set => MethodKind::Setter,
+                        _ => MethodKind::Normal,
+                    };
 
                     let method_full_name = if let Some(ref class) = class_name {
                         format!("{class}.{method_name}")
@@ -207,6 +243,10 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                             .map(|b| b.span)
                             .unwrap_or(method.span),
                         is_arrow_expression: false,
+                        is_async: method.value.r#async,
+                        is_generator: method.value.generator,
+                        is_static: method.r#static,
+                        method_kind,
                         start_line,
                         end_line: get_line_number(method.span.end, ctx.source_text),
                         class_name: class_name.clone(),
@@ -245,6 +285,10 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                             params_span: arrow.params.span,
                             body_block_span: arrow.body.span,
                             is_arrow_expression: arrow.expression,
+                            is_async: arrow.r#async,
+                            is_generator: false,
+                            is_static: false,
+                            method_kind: MethodKind::Normal,
                             start_line,
                             end_line: get_line_number(arrow.span.end, ctx.source_text),
                             class_name: None,
@@ -290,6 +334,10 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     params_span: func.params.span,
                     body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
                     is_arrow_expression: false,
+                    is_async: func.r#async,
+                    is_generator: func.generator,
+                    is_static: false,
+                    method_kind: MethodKind::Normal,
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -329,6 +377,10 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                     params_span: func.params.span,
                     body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
                     is_arrow_expression: false,
+                    is_async: func.r#async,
+                    is_generator: func.generator,
+                    is_static: false,
+                    method_kind: MethodKind::Normal,
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -368,6 +420,11 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                     } else {
                         FunctionType::Method
                     };
+                    let method_kind = match method.kind {
+                        MethodDefinitionKind::Get => MethodKind::Getter,
+                        MethodDefinitionKind::Set => MethodKind::Setter,
+                        _ => MethodKind::Normal,
+                    };
 
                     let method_full_name = if let Some(ref class) = class_name {
                         format!("{class}.{method_name}")
@@ -389,6 +446,10 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                             .map(|b| b.span)
                             .unwrap_or(method.span),
                         is_arrow_expression: false,
+                        is_async: method.value.r#async,
+                        is_generator: method.value.generator,
+                        is_static: method.r#static,
+                        method_kind,
                         start_line,
                         end_line: get_line_number(method.span.end, ctx.source_text),
                         class_name: class_name.clone(),
@@ -427,6 +488,10 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                             params_span: arrow.params.span,
                             body_block_span: arrow.body.span,
                             is_arrow_expression: arrow.expression,
+                            is_async: arrow.r#async,
+                            is_generator: false,
+                            is_static: false,
+                            method_kind: MethodKind::Normal,
                             start_line,
                             end_line: get_line_number(arrow.span.end, ctx.source_text),
                             class_name: None,
@@ -673,15 +738,46 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
     match func.function_type {
         FunctionType::Method | FunctionType::Constructor => {
             // Class methods can't be parsed in isolation, so keep the
-            // synthetic class wrapper. Use the original method name where
-            // possible so two methods with the same body still differ on
-            // the method-name label.
+            // synthetic class wrapper. Preserve `static`, getter/setter,
+            // `async` and generator modifiers — runtime-distinct methods
+            // like `static foo` vs `foo` or `get foo` vs `foo` must not
+            // collapse onto the same tree even when their bodies agree.
+            let mut prefix = String::new();
+            if func.is_static {
+                prefix.push_str("static ");
+            }
+            match func.method_kind {
+                MethodKind::Getter => prefix.push_str("get "),
+                MethodKind::Setter => prefix.push_str("set "),
+                MethodKind::Normal => {
+                    if func.is_async {
+                        prefix.push_str("async ");
+                    }
+                    if func.is_generator {
+                        prefix.push('*');
+                    }
+                }
+            }
             format!(
-                "class __C__ {{ {}{} {} }}",
-                name_text, params_text, body_text
+                "class __C__ {{ {}{}{} {} }}",
+                prefix, name_text, params_text, body_text
             )
         }
         FunctionType::Function | FunctionType::Arrow => {
+            // Carry async / generator flags through the wrapper so two
+            // functions that differ only in `async`-ness (different
+            // runtime return type) don't compare as identical. Arrows
+            // can be async but never generators, so the generator marker
+            // is only meaningful for the Function path.
+            let mut prefix = String::new();
+            if func.is_async {
+                prefix.push_str("async ");
+            }
+            prefix.push_str("function");
+            if func.is_generator {
+                prefix.push('*');
+            }
+
             if func.is_arrow_expression {
                 // Wrap a single-expression arrow body in an explicit
                 // `return` so it ends up shaped like a block-bodied
@@ -690,11 +786,11 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
                 // adding a structural wrapper that an equivalent
                 // `function f(x) { return x + 1; }` would not have.
                 format!(
-                    "function {}{} {{ return {}; }}",
-                    name_text, params_text, body_text
+                    "{} {}{} {{ return {}; }}",
+                    prefix, name_text, params_text, body_text
                 )
             } else {
-                format!("function {}{} {}", name_text, params_text, body_text)
+                format!("{} {}{} {}", prefix, name_text, params_text, body_text)
             }
         }
     }

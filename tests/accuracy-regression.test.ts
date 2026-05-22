@@ -904,4 +904,190 @@ export const createAdmin = (payload: { id: string; name: string; email: string }
       expect(report.byMode.types.length).toBeGreaterThan(0);
     });
   });
+
+  it("does not treat async and sync functions with the same body as duplicates", async () => {
+    // Review regression: the normalization wrapper used to drop `async`,
+    // so `async function f() { ... }` and `function f() { ... }` collapsed
+    // into the same tree even though their runtime contracts differ
+    // (`Promise<T>` vs `T`).
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/async_vs_sync.ts",
+        `
+export async function loadValueAsync(): Promise<number> {
+  const next = 42;
+  return next;
+}
+
+export function loadValueSync(): number {
+  const next = 42;
+  return next;
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.85,
+        minLines: 3,
+      });
+
+      expect(
+        hasPair(report.byMode.functions, "loadValueAsync", "loadValueSync"),
+      ).toBe(false);
+    });
+  });
+
+  it("scores static and instance methods below identical pairs", async () => {
+    // Review regression: the normalization wrapper used to strip `static`
+    // (and `get` / `set`) so a static helper and an instance method with
+    // identical bodies parsed into byte-identical trees. The wrapper now
+    // carries the `static` prefix into the parsed class fragment, so the
+    // pair still scores high (they share most structure) but it sits
+    // measurably below a static-vs-static or instance-vs-instance match
+    // — enough that the modifier reaches APTED as a label difference
+    // instead of being silently erased.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/static_vs_instance.ts",
+        `
+export class HelperA {
+  static createAlpha(value: number): number {
+    const next = value + 1;
+    return next;
+  }
+}
+
+export class HelperB {
+  createAlpha(value: number): number {
+    const next = value + 1;
+    return next;
+  }
+}
+
+export class HelperC {
+  createAlpha(value: number): number {
+    const next = value + 1;
+    return next;
+  }
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.0,
+        minLines: 3,
+      });
+
+      const findSim = (a: string, b: string, kindA: string, kindB: string) =>
+        report.byMode.functions.find((pair) => {
+          const sides = [pair.left, pair.right];
+          return sides.some((s) => s.symbolName === a && s.kind === kindA)
+            && sides.some((s) => s.symbolName === b && s.kind === kindB);
+        })?.similarity;
+
+      const sameKindSim = findSim("createAlpha", "createAlpha", "method", "method");
+      // The static-vs-instance pair appears once; either side may be the
+      // method-kind in the report so we just look for any pair whose
+      // similarity is strictly below the instance-vs-instance match.
+      const allCreateAlphaPairs = report.byMode.functions.filter((pair) =>
+        pair.left.symbolName === "createAlpha" && pair.right.symbolName === "createAlpha",
+      );
+
+      expect(sameKindSim).toBeDefined();
+      // Two identical instance methods are a perfect tree match.
+      expect(sameKindSim!).toBeGreaterThan(0.97);
+      // The static-vs-instance pair must score visibly lower.
+      const crossModifierMax = Math.max(
+        ...allCreateAlphaPairs
+          .filter((pair) => pair.similarity < sameKindSim! - 0.001)
+          .map((pair) => pair.similarity),
+        -1,
+      );
+      expect(crossModifierMax).toBeGreaterThanOrEqual(0);
+      expect(crossModifierMax).toBeLessThan(sameKindSim! - 0.02);
+    });
+  });
+
+  it("treats `type X = {}` and `interface X {}` as the same empty shape", async () => {
+    // Review regression: the property-less fallback injected a
+    // `<type-body>` property even for `type X = {}` (a real empty object
+    // type), so the cross-kind match between an empty interface and an
+    // empty type alias fell apart at threshold 0.9.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/empty.ts",
+        `
+export interface EmptyA {}
+export type EmptyB = {};
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["types"], {
+        threshold: 0.9,
+      });
+
+      expect(hasPair(report.byMode.types, "EmptyA", "EmptyB")).toBe(true);
+    });
+  });
+
+  it("respects whitespace inside string literals when comparing type-alias bodies", async () => {
+    // Review regression: the body-signature collapser called
+    // `split_whitespace().join(" ")` on the raw source text, which also
+    // normalized whitespace inside `"…"` literals — so distinct aliases
+    // like `"a b"` and `"a   b"` collapsed onto the same signature.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/literal_whitespace.ts",
+        `
+export type SingleSpace = "a b";
+export type DoubleSpace = "a   b";
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["types"], {
+        threshold: 0.9,
+      });
+
+      expect(hasPair(report.byMode.types, "SingleSpace", "DoubleSpace")).toBe(false);
+    });
+  });
+
+  it("accepts the legacy --allow-cross-kind CLI flag as a no-op", async () => {
+    // Review regression: removing `--allow-cross-kind` in favor of the new
+    // `--no-allow-cross-kind` form made commander exit non-zero on any
+    // existing CI command that still passed the old flag.
+    const { runCli } = await import("../src/cli.js");
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/sample.ts",
+        `export interface User { id: string }\nexport type Person = { id: string };\n`,
+      );
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [
+          path.join(projectDir, "src"),
+          "--modes",
+          "types",
+          "--threshold",
+          "0.85",
+          "--allow-cross-kind",
+          "--format",
+          "json",
+        ],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+    });
+  });
 });

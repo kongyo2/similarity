@@ -52,6 +52,57 @@ fn ts_type_span(ts_type: &TSType) -> (u32, u32) {
     };
     (span.start, span.end)
 }
+
+/// Collapse runs of whitespace down to a single space, but leave whitespace
+/// inside string literals (`"…"`, `'…'`) and template literals (`` `…` ``)
+/// untouched. Pure `split_whitespace().join(" ")` would equate
+/// `type A = "a b"` with `type A = "a  b"` (different cooked string values)
+/// because it doesn't respect literal boundaries, so we walk the bytes by
+/// hand and only collapse outside quoted regions. Escape sequences (`\"`,
+/// `\\`, …) inside strings are also preserved verbatim.
+fn collapse_whitespace_outside_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut last_was_space = false;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) => {
+                out.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                } else if ch == q {
+                    quote = None;
+                }
+                last_was_space = false;
+            }
+            None => {
+                if ch == '"' || ch == '\'' || ch == '`' {
+                    quote = Some(ch);
+                    out.push(ch);
+                    last_was_space = false;
+                } else if ch.is_whitespace() {
+                    if !last_was_space && !out.is_empty() {
+                        out.push(' ');
+                        last_was_space = true;
+                    }
+                } else {
+                    out.push(ch);
+                    last_was_space = false;
+                }
+            }
+        }
+    }
+
+    while out.ends_with(' ') {
+        out.pop();
+    }
+
+    out
+}
 use std::collections::HashMap;
 
 use crate::ignore_directive::has_similarity_ignore_directive;
@@ -239,7 +290,17 @@ impl TypeExtractor {
         // type mode effectively useless for non-object aliases. Synthesize a
         // single virtual property holding the textual type body so identical
         // aliases match exactly and distinct aliases compare by their body.
-        if properties.is_empty() {
+        //
+        // `type X = {}` legitimately is an empty object type — the property
+        // vector being empty there is the truth, not a fallback case. Only
+        // synthesize the body signature when the underlying type is *not*
+        // an object literal; otherwise the cross-kind match between
+        // `interface X {}` and `type X = {}` would compare a real empty
+        // interface against an alias carrying a `<type-body>` property and
+        // fall apart.
+        let is_object_literal_body =
+            matches!(&type_alias.type_annotation, TSType::TSTypeLiteral(_));
+        if properties.is_empty() && !is_object_literal_body {
             let body_signature = self.extract_type_body_signature(&type_alias.type_annotation);
             if !body_signature.is_empty() {
                 properties.push(PropertyDefinition {
@@ -268,9 +329,10 @@ impl TypeExtractor {
 
     /// Capture a stable textual signature for the body of a non-object
     /// type alias. Uses the source span when available so the signature
-    /// reflects what the user actually wrote (modulo collapsed whitespace);
-    /// falls back to the structured `extract_type_string` for shapes whose
-    /// span we cannot recover.
+    /// reflects what the user actually wrote (modulo collapsed whitespace
+    /// outside of string and template literals); falls back to the
+    /// structured `extract_type_string` for shapes whose span we cannot
+    /// recover.
     fn extract_type_body_signature(&self, ts_type: &TSType) -> String {
         let (start, end) = ts_type_span(ts_type);
         if end > start {
@@ -278,10 +340,7 @@ impl TypeExtractor {
             let end = end as usize;
             if start < self.source_text.len() && end <= self.source_text.len() {
                 let raw = &self.source_text[start..end];
-                // Collapse runs of whitespace so cosmetic formatting does
-                // not cause two otherwise-identical aliases to look like
-                // distinct types.
-                let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                let collapsed = collapse_whitespace_outside_strings(raw);
                 if !collapsed.is_empty() {
                     return collapsed;
                 }
