@@ -161,18 +161,23 @@ fn calculate_naming_similarity(
     type2: &NormalizedType,
     matches: &[PropertyMatch],
 ) -> f64 {
+    // Type-name similarity is always meaningful (and the only signal we have
+    // for property-less types like `type StatusA = "a" | "b"`).
+    let type_name_similarity =
+        calculate_property_similarity(&type1.original_name, &type2.original_name);
+
     if matches.is_empty() {
-        return 0.0;
+        // Without property matches the only remaining naming signal is the
+        // type alias / interface name itself. Returning 0.0 here used to
+        // collapse all property-less type comparisons onto the same 0.6
+        // similarity regardless of how close their bodies were.
+        return type_name_similarity;
     }
 
     // Calculate average naming similarity from matches
     let naming_similarities: Vec<f64> = matches.iter().map(|m| m.name_similarity).collect();
     let average_naming_similarity =
         naming_similarities.iter().sum::<f64>() / naming_similarities.len() as f64;
-
-    // Also consider type name similarity
-    let type_name_similarity =
-        calculate_property_similarity(&type1.original_name, &type2.original_name);
 
     // Weight property naming more heavily than type naming
     (average_naming_similarity * 0.8) + (type_name_similarity * 0.2)

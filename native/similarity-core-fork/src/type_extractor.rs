@@ -5,6 +5,53 @@ use oxc_ast::ast::{
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
+
+/// Return the byte span (start, end) of any `TSType` variant. The variants
+/// each carry their own `span` field but there is no shared accessor; pattern
+/// matching every variant explicitly keeps us insulated from changes to oxc's
+/// `GetSpan` trait surface area.
+fn ts_type_span(ts_type: &TSType) -> (u32, u32) {
+    let span = match ts_type {
+        TSType::TSAnyKeyword(t) => t.span,
+        TSType::TSBigIntKeyword(t) => t.span,
+        TSType::TSBooleanKeyword(t) => t.span,
+        TSType::TSIntrinsicKeyword(t) => t.span,
+        TSType::TSNeverKeyword(t) => t.span,
+        TSType::TSNullKeyword(t) => t.span,
+        TSType::TSNumberKeyword(t) => t.span,
+        TSType::TSObjectKeyword(t) => t.span,
+        TSType::TSStringKeyword(t) => t.span,
+        TSType::TSSymbolKeyword(t) => t.span,
+        TSType::TSUndefinedKeyword(t) => t.span,
+        TSType::TSUnknownKeyword(t) => t.span,
+        TSType::TSVoidKeyword(t) => t.span,
+        TSType::TSArrayType(t) => t.span,
+        TSType::TSConditionalType(t) => t.span,
+        TSType::TSConstructorType(t) => t.span,
+        TSType::TSFunctionType(t) => t.span,
+        TSType::TSImportType(t) => t.span,
+        TSType::TSIndexedAccessType(t) => t.span,
+        TSType::TSInferType(t) => t.span,
+        TSType::TSIntersectionType(t) => t.span,
+        TSType::TSLiteralType(t) => t.span,
+        TSType::TSMappedType(t) => t.span,
+        TSType::TSNamedTupleMember(t) => t.span,
+        TSType::TSTemplateLiteralType(t) => t.span,
+        TSType::TSThisType(t) => t.span,
+        TSType::TSTupleType(t) => t.span,
+        TSType::TSTypeLiteral(t) => t.span,
+        TSType::TSTypeOperatorType(t) => t.span,
+        TSType::TSTypePredicate(t) => t.span,
+        TSType::TSTypeQuery(t) => t.span,
+        TSType::TSTypeReference(t) => t.span,
+        TSType::TSUnionType(t) => t.span,
+        TSType::TSParenthesizedType(t) => t.span,
+        TSType::JSDocNullableType(t) => t.span,
+        TSType::JSDocNonNullableType(t) => t.span,
+        TSType::JSDocUnknownType(t) => t.span,
+    };
+    (span.start, span.end)
+}
 use std::collections::HashMap;
 
 use crate::ignore_directive::has_similarity_ignore_directive;
@@ -181,8 +228,30 @@ impl TypeExtractor {
         let start_line = self.get_line_number(type_alias.span.start as usize);
         let end_line = self.get_line_number(type_alias.span.end as usize);
 
-        let properties = self.extract_type_properties(&type_alias.type_annotation);
+        let mut properties = self.extract_type_properties(&type_alias.type_annotation);
         let generics = self.extract_generics(type_alias.type_parameters.as_ref());
+
+        // Type aliases whose body is not an object literal (string-literal
+        // unions, primitive aliases, function types, Record<…>, …) extract
+        // to an empty `properties` Vec. Without a fallback the type comparator
+        // sees them as "two empty objects", which collapses every such alias
+        // pair onto the same structural-1.0 / naming-0 score and makes the
+        // type mode effectively useless for non-object aliases. Synthesize a
+        // single virtual property holding the textual type body so identical
+        // aliases match exactly and distinct aliases compare by their body.
+        if properties.is_empty() {
+            let body_signature = self.extract_type_body_signature(&type_alias.type_annotation);
+            if !body_signature.is_empty() {
+                properties.push(PropertyDefinition {
+                    // Use angle brackets so the synthetic name can never
+                    // collide with a real TypeScript identifier.
+                    name: "<type-body>".to_string(),
+                    type_annotation: body_signature,
+                    optional: false,
+                    readonly: false,
+                });
+            }
+        }
 
         Some(TypeDefinition {
             name,
@@ -195,6 +264,30 @@ impl TypeExtractor {
             file_path: self.file_path.clone(),
             has_ignore_directive: has_similarity_ignore_directive(&self.source_text, start_line),
         })
+    }
+
+    /// Capture a stable textual signature for the body of a non-object
+    /// type alias. Uses the source span when available so the signature
+    /// reflects what the user actually wrote (modulo collapsed whitespace);
+    /// falls back to the structured `extract_type_string` for shapes whose
+    /// span we cannot recover.
+    fn extract_type_body_signature(&self, ts_type: &TSType) -> String {
+        let (start, end) = ts_type_span(ts_type);
+        if end > start {
+            let start = start as usize;
+            let end = end as usize;
+            if start < self.source_text.len() && end <= self.source_text.len() {
+                let raw = &self.source_text[start..end];
+                // Collapse runs of whitespace so cosmetic formatting does
+                // not cause two otherwise-identical aliases to look like
+                // distinct types.
+                let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !collapsed.is_empty() {
+                    return collapsed;
+                }
+            }
+        }
+        self.extract_type_string(ts_type)
     }
 
     fn extract_interface_properties(
@@ -392,57 +485,179 @@ impl TypeExtractor {
     ) {
         match stmt {
             Statement::FunctionDeclaration(func) => {
-                if let Some(name) = &func.id {
-                    // Extract return type literal
-                    if let Some(return_type) = &func.return_type {
-                        if let Some(type_literal) = self.extract_type_literal_from_ts_type(
-                            &return_type.type_annotation,
-                            TypeLiteralContext::FunctionReturn(name.name.to_string()),
-                        ) {
-                            type_literals.push(type_literal);
-                        }
-                    }
+                self.extract_from_function(func, type_literals);
+            }
+            Statement::VariableDeclaration(var_decl) => {
+                self.extract_from_variable_declaration(var_decl, type_literals);
+            }
+            // Exports were previously dropped on the floor here, so anonymous
+            // `export function foo(arg: { ... })` parameters were invisible to
+            // `--type-literals`. Unwrap the inner declaration so they flow
+            // through the same handlers as un-exported declarations.
+            Statement::ExportNamedDeclaration(export) => {
+                if let Some(decl) = &export.declaration {
+                    self.extract_type_literals_from_declaration(decl, type_literals);
+                }
+            }
+            Statement::ExportDefaultDeclaration(export) => {
+                if let oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(func) =
+                    &export.declaration
+                {
+                    self.extract_from_function(func, type_literals);
+                }
+            }
+            _ => {}
+        }
+    }
 
-                    // Extract parameter type literals
-                    for param in &func.params.items {
-                        if let Some(param_name) = self.get_parameter_name(param) {
-                            if let Some(type_annotation) = &param.type_annotation {
-                                if let Some(type_literal) = self.extract_type_literal_from_ts_type(
-                                    &type_annotation.type_annotation,
-                                    TypeLiteralContext::FunctionParameter(
-                                        name.name.to_string(),
-                                        param_name,
-                                    ),
-                                ) {
-                                    type_literals.push(type_literal);
-                                }
+    fn extract_type_literals_from_declaration(
+        &self,
+        decl: &oxc_ast::ast::Declaration,
+        type_literals: &mut Vec<TypeLiteralDefinition>,
+    ) {
+        match decl {
+            oxc_ast::ast::Declaration::FunctionDeclaration(func) => {
+                self.extract_from_function(func, type_literals);
+            }
+            oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
+                self.extract_from_variable_declaration(var_decl, type_literals);
+            }
+            _ => {}
+        }
+    }
+
+    fn extract_from_function(
+        &self,
+        func: &oxc_ast::ast::Function,
+        type_literals: &mut Vec<TypeLiteralDefinition>,
+    ) {
+        let func_name = func
+            .id
+            .as_ref()
+            .map(|id| id.name.to_string())
+            .unwrap_or_else(|| "<anonymous>".to_string());
+
+        // Extract return type literal
+        if let Some(return_type) = &func.return_type {
+            if let Some(type_literal) = self.extract_type_literal_from_ts_type(
+                &return_type.type_annotation,
+                TypeLiteralContext::FunctionReturn(func_name.clone()),
+            ) {
+                type_literals.push(type_literal);
+            }
+        }
+
+        // Extract parameter type literals
+        for param in &func.params.items {
+            if let Some(param_name) = self.get_parameter_name(param) {
+                if let Some(type_annotation) = &param.type_annotation {
+                    if let Some(type_literal) = self.extract_type_literal_from_ts_type(
+                        &type_annotation.type_annotation,
+                        TypeLiteralContext::FunctionParameter(
+                            func_name.clone(),
+                            param_name,
+                        ),
+                    ) {
+                        type_literals.push(type_literal);
+                    }
+                }
+            }
+        }
+
+        // Recursively walk into the function body so type literals attached
+        // to nested declarations don't disappear into the parent scope.
+        if let Some(body) = &func.body {
+            for stmt in &body.statements {
+                self.extract_type_literals_from_statement(stmt, type_literals);
+            }
+        }
+    }
+
+    fn extract_from_variable_declaration(
+        &self,
+        var_decl: &oxc_ast::ast::VariableDeclaration,
+        type_literals: &mut Vec<TypeLiteralDefinition>,
+    ) {
+        for declarator in &var_decl.declarations {
+            if let Some(var_name) = self.get_variable_name(declarator) {
+                // Check for variable type annotation
+                if let Some(type_annotation) = &declarator.type_annotation {
+                    if let Some(type_literal) = self.extract_type_literal_from_ts_type(
+                        &type_annotation.type_annotation,
+                        TypeLiteralContext::VariableDeclaration(var_name.clone()),
+                    ) {
+                        type_literals.push(type_literal);
+                    }
+                }
+
+                // Check for arrow function in variable initialization
+                if let Some(init) = &declarator.init {
+                    self.extract_type_literals_from_initializer(init, &var_name, type_literals);
+                }
+            }
+        }
+    }
+
+    fn extract_type_literals_from_initializer(
+        &self,
+        expr: &Expression,
+        var_name: &str,
+        type_literals: &mut Vec<TypeLiteralDefinition>,
+    ) {
+        if let Some(type_literal) = self.extract_type_literal_from_expression(
+            expr,
+            TypeLiteralContext::ArrowFunctionReturn(var_name.to_string()),
+        ) {
+            type_literals.push(type_literal);
+        }
+
+        // Also walk parameters and the body of arrow / function expressions
+        // assigned to a variable. Previously the only signal we extracted
+        // from `const make = (req: { id: string }) => ...` was the return
+        // type, so a parameter type literal common to multiple arrow
+        // functions was never compared.
+        match expr {
+            Expression::ArrowFunctionExpression(arrow) => {
+                for param in &arrow.params.items {
+                    if let Some(param_name) = self.get_parameter_name(param) {
+                        if let Some(type_annotation) = &param.type_annotation {
+                            if let Some(type_literal) = self.extract_type_literal_from_ts_type(
+                                &type_annotation.type_annotation,
+                                TypeLiteralContext::FunctionParameter(
+                                    var_name.to_string(),
+                                    param_name,
+                                ),
+                            ) {
+                                type_literals.push(type_literal);
                             }
                         }
                     }
                 }
+                if !arrow.expression {
+                    for stmt in &arrow.body.statements {
+                        self.extract_type_literals_from_statement(stmt, type_literals);
+                    }
+                }
             }
-            Statement::VariableDeclaration(var_decl) => {
-                for declarator in &var_decl.declarations {
-                    if let Some(var_name) = self.get_variable_name(declarator) {
-                        // Check for variable type annotation
-                        if let Some(type_annotation) = &declarator.type_annotation {
+            Expression::FunctionExpression(func) => {
+                for param in &func.params.items {
+                    if let Some(param_name) = self.get_parameter_name(param) {
+                        if let Some(type_annotation) = &param.type_annotation {
                             if let Some(type_literal) = self.extract_type_literal_from_ts_type(
                                 &type_annotation.type_annotation,
-                                TypeLiteralContext::VariableDeclaration(var_name.clone()),
+                                TypeLiteralContext::FunctionParameter(
+                                    var_name.to_string(),
+                                    param_name,
+                                ),
                             ) {
                                 type_literals.push(type_literal);
                             }
                         }
-
-                        // Check for arrow function in variable initialization
-                        if let Some(init) = &declarator.init {
-                            if let Some(type_literal) = self.extract_type_literal_from_expression(
-                                init,
-                                TypeLiteralContext::ArrowFunctionReturn(var_name),
-                            ) {
-                                type_literals.push(type_literal);
-                            }
-                        }
+                    }
+                }
+                if let Some(body) = &func.body {
+                    for stmt in &body.statements {
+                        self.extract_type_literals_from_statement(stmt, type_literals);
                     }
                 }
             }

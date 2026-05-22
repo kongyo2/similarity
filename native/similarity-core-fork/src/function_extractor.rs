@@ -28,7 +28,26 @@ pub struct FunctionDefinition {
     pub name: String,
     pub function_type: FunctionType,
     pub parameters: Vec<String>,
+    /// Span of the whole function (header + body). Misleadingly named — kept
+    /// for backwards compatibility with the surrounding code that uses it to
+    /// detect nested-function containment.
     pub body_span: Span,
+    /// Span of the formal parameter list (`(x, y)` or, for arrow functions
+    /// with a single un-parenthesised parameter, just `x`). Used together
+    /// with `body_block_span` to assemble a normalization wrapper that
+    /// treats arrow functions and regular function declarations
+    /// equivalently.
+    pub params_span: Span,
+    /// Span of just the function body (the `{ ... }` block, or the
+    /// expression for expression-bodied arrow functions). Used to extract
+    /// a normalized comparison fragment so a `function foo` and a
+    /// `const foo = () => ...` with identical bodies look structurally
+    /// equivalent to the comparator.
+    pub body_block_span: Span,
+    /// True when this is an arrow function whose body is a single
+    /// expression (e.g. `x => x + 1`). The normalization wrapper has to
+    /// add an explicit `return` in that case.
+    pub is_arrow_expression: bool,
     pub start_line: u32,
     pub end_line: u32,
     pub class_name: Option<String>,
@@ -125,6 +144,9 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     function_type: FunctionType::Function,
                     parameters: params,
                     body_span: func.span,
+                    params_span: func.params.span,
+                    body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
+                    is_arrow_expression: false,
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -177,6 +199,14 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                         function_type,
                         parameters: params,
                         body_span: method.span,
+                        params_span: method.value.params.span,
+                        body_block_span: method
+                            .value
+                            .body
+                            .as_ref()
+                            .map(|b| b.span)
+                            .unwrap_or(method.span),
+                        is_arrow_expression: false,
                         start_line,
                         end_line: get_line_number(method.span.end, ctx.source_text),
                         class_name: class_name.clone(),
@@ -212,6 +242,9 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                             function_type: FunctionType::Arrow,
                             parameters: params,
                             body_span: arrow.span,
+                            params_span: arrow.params.span,
+                            body_block_span: arrow.body.span,
+                            is_arrow_expression: arrow.expression,
                             start_line,
                             end_line: get_line_number(arrow.span.end, ctx.source_text),
                             class_name: None,
@@ -254,6 +287,9 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     function_type: FunctionType::Function,
                     parameters: params,
                     body_span: func.span,
+                    params_span: func.params.span,
+                    body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
+                    is_arrow_expression: false,
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -290,6 +326,9 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                     function_type: FunctionType::Function,
                     parameters: params,
                     body_span: func.span,
+                    params_span: func.params.span,
+                    body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
+                    is_arrow_expression: false,
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -342,6 +381,14 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                         function_type,
                         parameters: params,
                         body_span: method.span,
+                        params_span: method.value.params.span,
+                        body_block_span: method
+                            .value
+                            .body
+                            .as_ref()
+                            .map(|b| b.span)
+                            .unwrap_or(method.span),
+                        is_arrow_expression: false,
                         start_line,
                         end_line: get_line_number(method.span.end, ctx.source_text),
                         class_name: class_name.clone(),
@@ -377,6 +424,9 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                             function_type: FunctionType::Arrow,
                             parameters: params,
                             body_span: arrow.span,
+                            params_span: arrow.params.span,
+                            body_block_span: arrow.body.span,
+                            is_arrow_expression: arrow.expression,
                             start_line,
                             end_line: get_line_number(arrow.span.end, ctx.source_text),
                             class_name: None,
@@ -462,13 +512,14 @@ pub fn compare_functions_with_threshold(
     options: &TSEDOptions,
     threshold: f64,
 ) -> Result<f64, String> {
-    // Extract function body text
-    let body1 = extract_body_text(func1, source1);
-    let body2 = extract_body_text(func2, source2);
-
-    // Parse and compare
-    let tree1 = parse_function_fragment("func1.ts", &body1, &func1.function_type)?;
-    let tree2 = parse_function_fragment("func2.ts", &body2, &func2.function_type)?;
+    // Parse using the normalization-friendly fragments so arrow / regular /
+    // method declarations whose bodies agree end up structurally equivalent
+    // at the tree level. The old path passed the raw function text to
+    // `parse_function_fragment`, which preserved the surrounding declaration
+    // shape and made e.g. `(x) => x` vs `function f(x) { return x; }` look
+    // ~25% less similar than their bodies actually were.
+    let tree1 = parse_function_for_comparison("func1.ts", func1, source1)?;
+    let tree2 = parse_function_for_comparison("func2.ts", func2, source2)?;
     compare_function_trees(&tree1, &tree2, func1, func2, options, threshold)
 }
 
@@ -553,11 +604,16 @@ fn compare_function_trees(
         let avg_lines = (func1.line_count() + func2.line_count()) as f64 / 2.0;
         if avg_lines < 10.0 {
             // Confidence softener: scale the base short-function factor back
-            // toward 1.0 as the raw similarity approaches 1.0. At sim >= 0.9
-            // we apply essentially no penalty; at sim <= 0.6 we apply the
-            // full original penalty.
+            // toward 1.0 as the raw similarity approaches 1.0. At sim >= 0.92
+            // (essentially identical bodies) we apply no further penalty;
+            // below 0.6 we apply the full original short-function discount.
+            // The previous curve still pulled identical 3-line functions
+            // down by ~30% because the confidence range bottomed out at
+            // similarity 0.6 — but identical bodies already register at the
+            // node-count layer's softened score (~0.85) so the avg_lines
+            // multiplier should let those through.
             let base_factor = (avg_lines / 10.0).max(0.1);
-            let confidence = ((similarity - 0.6) / 0.3).clamp(0.0, 1.0);
+            let confidence = ((similarity - 0.6) / 0.32).clamp(0.0, 1.0);
             let effective_factor = base_factor + (1.0 - base_factor) * confidence;
             similarity *= effective_factor;
         }
@@ -570,6 +626,94 @@ fn extract_body_text(func: &FunctionDefinition, source: &str) -> String {
     let start = func.body_span.start as usize;
     let end = func.body_span.end as usize;
     source[start..end].to_string()
+}
+
+/// Build a normalization-friendly fragment for a function. The goal is that
+/// two functions whose bodies and parameter lists agree end up producing
+/// identical fragments regardless of whether they were declared as
+/// `function foo() {...}`, `const foo = () => {...}`, or
+/// `const foo = (x) => x + 1`. Without this layer the wrapping shape
+/// (FunctionDeclaration vs ExpressionStatement→ArrowFunctionExpression)
+/// dominated the structural distance on short bodies.
+fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String {
+    let safe_slice = |start: u32, end: u32| -> &str {
+        let s = start as usize;
+        let e = end as usize;
+        if s < e && e <= source.len() {
+            &source[s..e]
+        } else {
+            ""
+        }
+    };
+
+    let params_text = {
+        let raw = safe_slice(func.params_span.start, func.params_span.end).trim();
+        if raw.starts_with('(') && raw.ends_with(')') {
+            raw.to_string()
+        } else if raw.is_empty() {
+            "()".to_string()
+        } else {
+            // Single un-parenthesised arrow parameter, e.g. `x => ...`.
+            format!("({raw})")
+        }
+    };
+
+    // Preserve the original function name in the wrapper so two functions
+    // with distinct names still differ at the FunctionDeclaration label
+    // level. Using a fixed `__sim__` name was tempting but it erased one
+    // of APTED's cheaper-but-still-useful rename signals and caused
+    // semantically-different functions (different intent, same shape) to
+    // creep over the similarity threshold. Falling back to `__sim__` when
+    // the source name isn't a valid identifier keeps the wrapper
+    // syntactically valid.
+    let name_text = sanitize_function_name(&func.name);
+
+    let body_text = safe_slice(func.body_block_span.start, func.body_block_span.end);
+
+    match func.function_type {
+        FunctionType::Method | FunctionType::Constructor => {
+            // Class methods can't be parsed in isolation, so keep the
+            // synthetic class wrapper. Use the original method name where
+            // possible so two methods with the same body still differ on
+            // the method-name label.
+            format!(
+                "class __C__ {{ {}{} {} }}",
+                name_text, params_text, body_text
+            )
+        }
+        FunctionType::Function | FunctionType::Arrow => {
+            if func.is_arrow_expression {
+                // Wrap a single-expression arrow body in an explicit
+                // `return` so it ends up shaped like a block-bodied
+                // function. Without this an `(x) => x + 1` would parse as
+                // a top-level `ExpressionStatement → ArrowFunctionExpression`,
+                // adding a structural wrapper that an equivalent
+                // `function f(x) { return x + 1; }` would not have.
+                format!(
+                    "function {}{} {{ return {}; }}",
+                    name_text, params_text, body_text
+                )
+            } else {
+                format!("function {}{} {}", name_text, params_text, body_text)
+            }
+        }
+    }
+}
+
+fn sanitize_function_name(name: &str) -> String {
+    let valid_ident = !name.is_empty()
+        && name.chars().enumerate().all(|(idx, ch)| {
+            if idx == 0 {
+                ch.is_alphabetic() || ch == '_' || ch == '$'
+            } else {
+                ch.is_alphanumeric() || ch == '_' || ch == '$'
+            }
+        });
+    if valid_ident {
+        name.to_string()
+    } else {
+        "__sim__".to_string()
+    }
 }
 
 /// Parse a function body snippet into a tree, wrapping method-shorthand
@@ -596,6 +740,26 @@ fn parse_function_fragment(
                     parse_and_convert_to_tree(filename, &wrapped)
                 }
             }
+        }
+    }
+}
+
+/// Parse a function for structural comparison, using `build_normalized_fragment`
+/// so arrow vs regular vs method declarations all end up shape-equivalent
+/// when their bodies agree.
+fn parse_function_for_comparison(
+    filename: &str,
+    func: &FunctionDefinition,
+    source: &str,
+) -> Result<std::rc::Rc<crate::tree::TreeNode>, String> {
+    let fragment = build_normalized_fragment(func, source);
+    match parse_and_convert_to_tree(filename, &fragment) {
+        Ok(tree) => Ok(tree),
+        Err(_) => {
+            // Fallback to the legacy whole-function parse path so we don't
+            // regress on edge cases the normalizer happens to break.
+            let body_text = extract_body_text(func, source);
+            parse_function_fragment(filename, &body_text, &func.function_type)
         }
     }
 }
@@ -677,8 +841,7 @@ pub fn find_similar_functions_in_file(
     let mut trees: Vec<Option<std::rc::Rc<crate::tree::TreeNode>>> =
         Vec::with_capacity(functions.len());
     for func in &functions {
-        let body = extract_body_text(func, source_text);
-        trees.push(parse_function_fragment(filename, &body, &func.function_type).ok());
+        trees.push(parse_function_for_comparison(filename, func, source_text).ok());
     }
 
     let mut similar_pairs = Vec::new();
@@ -771,10 +934,7 @@ pub fn find_similar_functions_across_files(
     // alone dwarfs the APTED computation.
     let trees: Vec<Option<std::rc::Rc<crate::tree::TreeNode>>> = all_functions
         .iter()
-        .map(|(filename, source, func)| {
-            let body = extract_body_text(func, source);
-            parse_function_fragment(filename, &body, &func.function_type).ok()
-        })
+        .map(|(filename, source, func)| parse_function_for_comparison(filename, func, source).ok())
         .collect();
 
     let mut similar_pairs = Vec::new();

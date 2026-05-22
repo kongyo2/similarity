@@ -33,6 +33,12 @@ interface ParsedCliOptions {
   extensions: string;
   exclude: string[];
   typesOnly: "interface" | "type" | "all";
+  /**
+   * Commander's `--no-allow-cross-kind` flag stores its value on this key.
+   * It defaults to `true` and flips to `false` when the negative flag is
+   * passed, so we keep the boolean shape but rely on the underlying
+   * default rather than an explicit one.
+   */
   allowCrossKind: boolean;
   typeLiterals: boolean;
   overlapMinWindow: number;
@@ -96,7 +102,9 @@ function buildProgram(): Command {
       return previous;
     }, [])
     .addOption(new Option("--types-only <kind>", "Type mode filter").choices(["all", "interface", "type"]).default("all"))
-    .option("--allow-cross-kind", "Allow type comparisons across kind boundaries", false)
+    // Cross-kind comparison is on by default — pass `--no-allow-cross-kind`
+    // to restrict matches to interface↔interface and type↔type pairs only.
+    .option("--no-allow-cross-kind", "Disable cross-kind type comparisons (cross-kind matches are detected by default)")
     .option("--type-literals", "Include anonymous type literals in type mode", false)
     .option("--overlap-min-window <number>", "Overlap mode minimum token window", String(DEFAULT_OVERLAP_MIN_WINDOW))
     .option("--overlap-max-window <number>", "Overlap mode maximum token window", String(DEFAULT_OVERLAP_MAX_WINDOW))

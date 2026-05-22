@@ -33,6 +33,11 @@ export interface AnalyzeProjectOptions {
   extensions?: string[];
   exclude?: string[];
   typesOnly?: "interface" | "type" | "all";
+  /**
+   * When true (the default), an `interface` and a structurally identical
+   * `type` alias are eligible to match. Set to `false` to restrict the
+   * comparison to same-kind pairs only.
+   */
   allowCrossKind?: boolean;
   includeTypeLiterals?: boolean;
   overlapMinWindow?: number;
