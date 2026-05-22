@@ -62,6 +62,31 @@ fn make_node(label: &str, kind: &str, id_counter: &mut usize) -> TreeNode {
     node
 }
 
+/// Stringify a class member's `PropertyKey` into a label that's unique per
+/// distinct key. Identifier and private-identifier keys already produce a
+/// stable string form, but the original handler collapsed every other key
+/// (string literals like `"alpha"`, numeric literals, computed
+/// expressions) onto a single `"Method"` / `"Property"` placeholder so two
+/// runtime-distinct members ended up sharing a tree label. The richer
+/// labels below let APTED see those as a single-rename difference instead
+/// of a perfect match.
+fn property_key_label(key: &PropertyKey) -> String {
+    match key {
+        PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_string(),
+        PropertyKey::PrivateIdentifier(ident) => format!("#{}", ident.name.as_str()),
+        PropertyKey::StringLiteral(lit) => format!("\"{}\"", lit.value.as_str()),
+        PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
+        PropertyKey::BigIntLiteral(lit) => lit.value.as_str().to_string(),
+        PropertyKey::TemplateLiteral(_) => "TemplateKey".to_string(),
+        // Computed keys fall through here. Use a generic label rather than
+        // recursing into the expression — the inner expression nodes are
+        // already part of the tree elsewhere, and labeling each computed
+        // key by its raw shape would interact badly with the wrapper-level
+        // normalization that uses `display_name`.
+        _ => "ComputedKey".to_string(),
+    }
+}
+
 fn leaf(label: &str, kind: &str, id_counter: &mut usize) -> Rc<TreeNode> {
     Rc::new(make_node(label, kind, id_counter))
 }
@@ -1239,11 +1264,7 @@ fn class_element_to_tree_node(
                 oxc_ast::ast::MethodDefinitionKind::Get => "Getter",
                 oxc_ast::ast::MethodDefinitionKind::Set => "Setter",
             };
-            let key_label = match &method.key {
-                PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_string(),
-                PropertyKey::PrivateIdentifier(ident) => format!("#{}", ident.name.as_str()),
-                _ => "Method".to_string(),
-            };
+            let key_label = property_key_label(&method.key);
             let static_marker = if method.r#static { "static_" } else { "" };
             let label = format!("{}{}:{}", static_marker, kind_marker, key_label);
             let mut node = TreeNode::new(label, "MethodDefinition".to_string(), *id_counter);
@@ -1265,11 +1286,7 @@ fn class_element_to_tree_node(
             Some(Rc::new(node))
         }
         ClassElement::PropertyDefinition(prop) => {
-            let key_label = match &prop.key {
-                PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_string(),
-                PropertyKey::PrivateIdentifier(ident) => format!("#{}", ident.name.as_str()),
-                _ => "Property".to_string(),
-            };
+            let key_label = property_key_label(&prop.key);
             let static_marker = if prop.r#static { "static_" } else { "" };
             let label = format!("{}{}", static_marker, key_label);
             let mut node = TreeNode::new(label, "PropertyDefinition".to_string(), *id_counter);

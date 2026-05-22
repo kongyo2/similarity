@@ -259,7 +259,11 @@ export interface Person {
     });
   });
 
-  it("requires allowCrossKind before matching an interface to an equivalent type alias", async () => {
+  it("matches an interface to an equivalent type alias by default and can be opted out", async () => {
+    // Cross-kind comparison is on by default so a refactoring run flags
+    // an `interface User { ... }` and an equivalent `type User = { ... }`
+    // automatically; pass `allowCrossKind: false` to restrict the report
+    // to same-kind pairs only.
     await withTempProject(async (projectDir) => {
       await writeSource(
         projectDir,
@@ -284,13 +288,13 @@ export type TUser = {
       const defaultReport = await analyzeTempProject(projectDir, ["types"], {
         threshold: 0.9,
       });
-      const crossKindReport = await analyzeTempProject(projectDir, ["types"], {
+      const sameKindOnlyReport = await analyzeTempProject(projectDir, ["types"], {
         threshold: 0.9,
-        allowCrossKind: true,
+        allowCrossKind: false,
       });
 
-      expect(hasPair(defaultReport.byMode.types, "IUser", "TUser")).toBe(false);
-      expect(hasPair(crossKindReport.byMode.types, "IUser", "TUser")).toBe(true);
+      expect(hasPair(defaultReport.byMode.types, "IUser", "TUser")).toBe(true);
+      expect(hasPair(sameKindOnlyReport.byMode.types, "IUser", "TUser")).toBe(false);
     });
   });
 
@@ -765,6 +769,498 @@ export class CustomerRepository {
       });
 
       expect(hasPair(report.byMode.functions, "findById", "findById")).toBe(true);
+    });
+  });
+
+  it("scores property-less type aliases with identical bodies as duplicates", async () => {
+    // Regression: two type aliases like `type X = "a" | "b" | "c"` used to
+    // collapse onto a flat 0.6 similarity score regardless of how close their
+    // bodies were, because the type-alias extractor produced an empty
+    // property list for non-object bodies. The synthetic `<type-body>`
+    // property added during extraction now lets the comparator distinguish
+    // identical-body aliases from merely-named-similarly ones.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/aliases.ts",
+        `
+export type StatusA = "pending" | "active" | "archived";
+export type StatusB = "pending" | "active" | "archived";
+
+export type NumberMapA = Record<string, number>;
+export type NumberMapB = Record<string, number>;
+
+export type Unrelated = "left" | "right";
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["types"], {
+        threshold: 0.85,
+      });
+
+      expect(hasPair(report.byMode.types, "StatusA", "StatusB")).toBe(true);
+      expect(hasPair(report.byMode.types, "NumberMapA", "NumberMapB")).toBe(true);
+      expect(hasPair(report.byMode.types, "StatusA", "Unrelated")).toBe(false);
+    });
+  });
+
+  it("flags an arrow function and a regular function with identical bodies as duplicates", async () => {
+    // Regression: the structural distance used to be dominated by the
+    // FunctionDeclaration vs ArrowFunctionExpression wrapping, so e.g.
+    // `function sum(a, b) { return a + b; }` and
+    // `const sum = (a, b) => { return a + b; }` reported around 0.6 even
+    // though the bodies were byte-identical. The normalization wrapper
+    // applied during comparison erases that wrapping difference.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/arrow_vs_fn.ts",
+        `
+export function sumArray(values: number[]): number {
+  let total = 0;
+  for (const value of values) {
+    total += value;
+  }
+  return total;
+}
+
+export const totalArray = (values: number[]): number => {
+  let total = 0;
+  for (const value of values) {
+    total += value;
+  }
+  return total;
+};
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.85,
+        minLines: 3,
+      });
+
+      expect(hasPair(report.byMode.functions, "sumArray", "totalArray")).toBe(true);
+    });
+  });
+
+  it("keeps identical short helpers visible instead of crushing them by size penalty", async () => {
+    // Regression: two byte-identical 3-line helpers used to land at ~0.13
+    // similarity because the compounded short-function and node-count
+    // penalties were applied even when the structural edit distance was
+    // exactly zero. The penalty layer now releases the discount when the
+    // trees match exactly.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/short.ts",
+        `
+export function smallA(value: number): number {
+  const next = value + 1;
+  return next;
+}
+
+export function smallB(value: number): number {
+  const next = value + 1;
+  return next;
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.8,
+        minLines: 3,
+      });
+
+      expect(hasPair(report.byMode.functions, "smallA", "smallB")).toBe(true);
+    });
+  });
+
+  it("extracts anonymous type literals from exports and arrow function parameters", async () => {
+    // Regression: the `--type-literals` extractor only walked top-level
+    // FunctionDeclaration / VariableDeclaration nodes, so anonymous type
+    // literals attached to exported or arrow-bound functions never made
+    // it into the type comparison pool and `--type-literals` reported zero
+    // additional pairs.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/literals.ts",
+        `
+export function createUser(payload: { id: string; name: string; email: string }) {
+  return payload;
+}
+
+export const createAdmin = (payload: { id: string; name: string; email: string }) => {
+  return payload;
+};
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["types"], {
+        threshold: 0.85,
+        includeTypeLiterals: true,
+      });
+
+      expect(report.byMode.types.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("does not treat async and sync functions with the same body as duplicates", async () => {
+    // Review regression: the normalization wrapper used to drop `async`,
+    // so `async function f() { ... }` and `function f() { ... }` collapsed
+    // into the same tree even though their runtime contracts differ
+    // (`Promise<T>` vs `T`).
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/async_vs_sync.ts",
+        `
+export async function loadValueAsync(): Promise<number> {
+  const next = 42;
+  return next;
+}
+
+export function loadValueSync(): number {
+  const next = 42;
+  return next;
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.85,
+        minLines: 3,
+      });
+
+      expect(
+        hasPair(report.byMode.functions, "loadValueAsync", "loadValueSync"),
+      ).toBe(false);
+    });
+  });
+
+  it("scores static and instance methods below identical pairs", async () => {
+    // Review regression: the normalization wrapper used to strip `static`
+    // (and `get` / `set`) so a static helper and an instance method with
+    // identical bodies parsed into byte-identical trees. The wrapper now
+    // carries the `static` prefix into the parsed class fragment, so the
+    // pair still scores high (they share most structure) but it sits
+    // measurably below a static-vs-static or instance-vs-instance match
+    // — enough that the modifier reaches APTED as a label difference
+    // instead of being silently erased.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/static_vs_instance.ts",
+        `
+export class HelperA {
+  static createAlpha(value: number): number {
+    const next = value + 1;
+    return next;
+  }
+}
+
+export class HelperB {
+  createAlpha(value: number): number {
+    const next = value + 1;
+    return next;
+  }
+}
+
+export class HelperC {
+  createAlpha(value: number): number {
+    const next = value + 1;
+    return next;
+  }
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.0,
+        minLines: 3,
+      });
+
+      const findSim = (a: string, b: string, kindA: string, kindB: string) =>
+        report.byMode.functions.find((pair) => {
+          const sides = [pair.left, pair.right];
+          return sides.some((s) => s.symbolName === a && s.kind === kindA)
+            && sides.some((s) => s.symbolName === b && s.kind === kindB);
+        })?.similarity;
+
+      const sameKindSim = findSim("createAlpha", "createAlpha", "method", "method");
+      // The static-vs-instance pair appears once; either side may be the
+      // method-kind in the report so we just look for any pair whose
+      // similarity is strictly below the instance-vs-instance match.
+      const allCreateAlphaPairs = report.byMode.functions.filter((pair) =>
+        pair.left.symbolName === "createAlpha" && pair.right.symbolName === "createAlpha",
+      );
+
+      expect(sameKindSim).toBeDefined();
+      // Two identical instance methods are a perfect tree match.
+      expect(sameKindSim!).toBeGreaterThan(0.97);
+      // The static-vs-instance pair must score visibly lower.
+      const crossModifierMax = Math.max(
+        ...allCreateAlphaPairs
+          .filter((pair) => pair.similarity < sameKindSim! - 0.001)
+          .map((pair) => pair.similarity),
+        -1,
+      );
+      expect(crossModifierMax).toBeGreaterThanOrEqual(0);
+      expect(crossModifierMax).toBeLessThan(sameKindSim! - 0.02);
+    });
+  });
+
+  it("treats `type X = {}` and `interface X {}` as the same empty shape", async () => {
+    // Review regression: the property-less fallback injected a
+    // `<type-body>` property even for `type X = {}` (a real empty object
+    // type), so the cross-kind match between an empty interface and an
+    // empty type alias fell apart at threshold 0.9.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/empty.ts",
+        `
+export interface EmptyA {}
+export type EmptyB = {};
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["types"], {
+        threshold: 0.9,
+      });
+
+      expect(hasPair(report.byMode.types, "EmptyA", "EmptyB")).toBe(true);
+    });
+  });
+
+  it("respects whitespace inside string literals when comparing type-alias bodies", async () => {
+    // Review regression: the body-signature collapser called
+    // `split_whitespace().join(" ")` on the raw source text, which also
+    // normalized whitespace inside `"…"` literals — so distinct aliases
+    // like `"a b"` and `"a   b"` collapsed onto the same signature.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/literal_whitespace.ts",
+        `
+export type SingleSpace = "a b";
+export type DoubleSpace = "a   b";
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["types"], {
+        threshold: 0.9,
+      });
+
+      expect(hasPair(report.byMode.types, "SingleSpace", "DoubleSpace")).toBe(false);
+    });
+  });
+
+  it("accepts the legacy --allow-cross-kind CLI flag as a no-op", async () => {
+    // Review regression: removing `--allow-cross-kind` in favor of the new
+    // `--no-allow-cross-kind` form made commander exit non-zero on any
+    // existing CI command that still passed the old flag.
+    const { runCli } = await import("../src/cli.js");
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/sample.ts",
+        `export interface User { id: string }\nexport type Person = { id: string };\n`,
+      );
+      const logs: string[] = [];
+      const errors: string[] = [];
+      const exitCode = await runCli(
+        [
+          path.join(projectDir, "src"),
+          "--modes",
+          "types",
+          "--threshold",
+          "0.85",
+          "--allow-cross-kind",
+          "--format",
+          "json",
+        ],
+        {
+          log: (message) => logs.push(message),
+          error: (message) => errors.push(message),
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(errors).toHaveLength(0);
+    });
+  });
+
+  it("keeps private method identifiers distinguishable through the wrapper", async () => {
+    // Review regression: `sanitize_function_name` rejected names starting
+    // with `#`, so `#load` and `#save` were both rewritten to `__sim__`
+    // before parsing. Distinct private methods with similar bodies then
+    // looked identical at the tree level.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/private_methods.ts",
+        `
+export class Storage {
+  #load(key: string): string {
+    const result = key + ":loaded";
+    return result;
+  }
+
+  #save(key: string): string {
+    const result = key + ":saved";
+    return result;
+  }
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.0,
+        minLines: 3,
+        sameFileOnly: true,
+      });
+
+      const pair = report.byMode.functions.find((p) =>
+        ([p.left.symbolName, p.right.symbolName].sort().join(",") === ["#load", "#save"].sort().join(",")),
+      );
+
+      expect(pair).toBeDefined();
+      // The bodies differ only by a string literal, so similarity is high,
+      // but it must stay below the perfect-match floor the broken wrapper
+      // produced — two distinct private identifiers should never compare
+      // as identical.
+      expect(pair!.similarity).toBeLessThan(0.999);
+    });
+  });
+
+  it("ignores comments inside non-object type alias bodies", async () => {
+    // Review regression: the type-body signature was built from raw source
+    // text with whitespace collapsed but comments kept verbatim, so a
+    // comment-only edit produced a fresh signature and caused otherwise
+    // identical aliases to miss the match.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/commented.ts",
+        `
+export type Plain = "foo" | "bar";
+export type WithLineComment = "foo" | "bar"; // a note
+export type WithBlockComment = "foo" /* legacy */ | "bar";
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["types"], {
+        threshold: 0.9,
+      });
+
+      expect(hasPair(report.byMode.types, "Plain", "WithLineComment")).toBe(true);
+      expect(hasPair(report.byMode.types, "Plain", "WithBlockComment")).toBe(true);
+    });
+  });
+
+  it("extracts type literals from default-exported arrow functions", async () => {
+    // Review regression: the ExportDefaultDeclaration unwrap path only
+    // handled FunctionDeclaration, leaving
+    // `export default (arg: { id: string; name: string }) => arg`
+    // outside the comparison pool even though equivalent non-default
+    // forms were captured.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/default_arrow.ts",
+        `
+export default (arg: { id: string; name: string; email: string }) => arg;
+`,
+      );
+      await writeSource(
+        projectDir,
+        "src/named_arrow.ts",
+        `
+export const createUser = (arg: { id: string; name: string; email: string }) => arg;
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["types"], {
+        threshold: 0.85,
+        includeTypeLiterals: true,
+      });
+
+      // Two anonymous parameter literals with identical shape must show up
+      // as a pair regardless of whether they came from a named export or
+      // a default export.
+      expect(report.byMode.types.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("extracts return type literals from function expression initializers", async () => {
+    // Review regression: only arrow-function return type literals were
+    // captured during variable-initializer extraction. A `const f =
+    // function(): { id: string } { ... }` therefore lost its return type
+    // literal even though equivalent arrow forms were captured.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/function_expr_return.ts",
+        `
+export const fromArrow = (): { id: string; name: string; email: string } => ({
+  id: "",
+  name: "",
+  email: "",
+});
+
+export const fromFunctionExpr = function (): { id: string; name: string; email: string } {
+  return { id: "", name: "", email: "" };
+};
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["types"], {
+        threshold: 0.85,
+        includeTypeLiterals: true,
+      });
+
+      expect(report.byMode.types.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("distinguishes string-literal and computed method keys in the wrapper", async () => {
+    // Review regression: the normalization wrapper used `name` directly,
+    // and the underlying extractor reduced non-identifier keys (string
+    // literals, computed expressions) to `"anonymous"`. Two methods with
+    // distinct literal keys therefore collapsed to identical fragments.
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/literal_keys.ts",
+        `
+export class Mapper {
+  "alpha"(value: number): number {
+    const next = value + 1;
+    return next;
+  }
+
+  "beta"(value: number): number {
+    const next = value + 1;
+    return next;
+  }
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.0,
+        minLines: 3,
+        sameFileOnly: true,
+      });
+
+      const pair = report.byMode.functions[0];
+      expect(pair).toBeDefined();
+      // The bodies are byte-identical, so similarity is high, but the
+      // distinct literal keys must not collapse to a perfect-match score
+      // — `"alpha"` vs `"beta"` is a real rename at the class-element
+      // label and has to register as such.
+      expect(pair!.similarity).toBeLessThan(0.999);
     });
   });
 });

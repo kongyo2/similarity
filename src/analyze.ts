@@ -99,7 +99,11 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
     extensions: (input.extensions ?? DEFAULT_EXTENSIONS).map((extension) => extension.replace(/^\./, "").toLowerCase()),
     exclude: input.exclude ?? [],
     typesOnly: input.typesOnly ?? "all",
-    allowCrossKind: Boolean(input.allowCrossKind),
+    // Default to cross-kind comparison so an `interface User` and a
+    // structurally identical `type User = {...}` show up as a refactoring
+    // candidate. Pass `false` explicitly when the caller wants to restrict
+    // results to same-kind pairs only.
+    allowCrossKind: input.allowCrossKind ?? true,
     includeTypeLiterals: Boolean(input.includeTypeLiterals),
     overlapMinWindow,
     overlapMaxWindow,

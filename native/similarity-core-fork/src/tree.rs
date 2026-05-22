@@ -11,12 +11,22 @@ use std::rc::Rc;
 /// wrapped in `Rc` (no `&mut` access) and the cached value never escapes
 /// the same logical tree — so `Cell` is enough; no need for `RefCell`'s
 /// extra borrow tracking.
+///
+/// `source_span` carries the byte range the node was parsed from. The
+/// subtree-fingerprint overlap detector uses it to report meaningful
+/// `(start_line, end_line)` ranges instead of placeholder values derived
+/// from internal node ids.
 #[derive(Debug)]
 pub struct TreeNode {
     pub label: String,
     pub value: String,
     pub children: Vec<Rc<TreeNode>>,
     pub id: usize,
+    /// (start_byte, end_byte) for the source slice this node was parsed
+    /// from. `0,0` indicates an absent or synthetic node — callers should
+    /// treat that as "no source position available" rather than "byte
+    /// range [0, 0]".
+    pub source_span: (u32, u32),
     subtree_size: Cell<Option<usize>>,
 }
 
@@ -27,6 +37,7 @@ impl Clone for TreeNode {
             value: self.value.clone(),
             children: self.children.clone(),
             id: self.id,
+            source_span: self.source_span,
             subtree_size: Cell::new(self.subtree_size.get()),
         }
     }
@@ -35,13 +46,24 @@ impl Clone for TreeNode {
 impl TreeNode {
     #[must_use]
     pub fn new(label: String, value: String, id: usize) -> Self {
-        TreeNode { label, value, children: Vec::new(), id, subtree_size: Cell::new(None) }
+        TreeNode {
+            label,
+            value,
+            children: Vec::new(),
+            id,
+            source_span: (0, 0),
+            subtree_size: Cell::new(None),
+        }
     }
 
     pub fn add_child(&mut self, child: Rc<TreeNode>) {
         // Adding a child invalidates the cached subtree size.
         self.subtree_size.set(None);
         self.children.push(child);
+    }
+
+    pub fn set_source_span(&mut self, start: u32, end: u32) {
+        self.source_span = (start, end);
     }
 
     #[must_use]

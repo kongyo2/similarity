@@ -1,5 +1,5 @@
 use oxc_ast::ast::*;
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 
 use crate::ignore_directive::has_similarity_ignore_directive;
 use crate::parser::parse_and_convert_to_tree;
@@ -28,7 +28,50 @@ pub struct FunctionDefinition {
     pub name: String,
     pub function_type: FunctionType,
     pub parameters: Vec<String>,
+    /// Span of the whole function (header + body). Misleadingly named — kept
+    /// for backwards compatibility with the surrounding code that uses it to
+    /// detect nested-function containment.
     pub body_span: Span,
+    /// Span of the formal parameter list (`(x, y)` or, for arrow functions
+    /// with a single un-parenthesised parameter, just `x`). Used together
+    /// with `body_block_span` to assemble a normalization wrapper that
+    /// treats arrow functions and regular function declarations
+    /// equivalently.
+    pub params_span: Span,
+    /// Span of just the function body (the `{ ... }` block, or the
+    /// expression for expression-bodied arrow functions). Used to extract
+    /// a normalized comparison fragment so a `function foo` and a
+    /// `const foo = () => ...` with identical bodies look structurally
+    /// equivalent to the comparator.
+    pub body_block_span: Span,
+    /// True when this is an arrow function whose body is a single
+    /// expression (e.g. `x => x + 1`). The normalization wrapper has to
+    /// add an explicit `return` in that case.
+    pub is_arrow_expression: bool,
+    /// True when the declaration was `async function ...` or
+    /// `async (...) => ...`. Preserved through normalization so an
+    /// `async` and a sync function with otherwise-identical bodies
+    /// don't collapse into the same tree (their runtime contracts
+    /// differ — `Promise<T>` vs `T`).
+    pub is_async: bool,
+    /// True when the declaration was `function* ...` or, for methods,
+    /// `*foo() ...`. Generators differ structurally from non-generator
+    /// counterparts and have to survive normalization.
+    pub is_generator: bool,
+    /// True only for class methods declared `static`. Static and
+    /// instance methods with identical bodies are runtime-distinct,
+    /// so the normalized fragment carries this prefix forward.
+    pub is_static: bool,
+    /// Method kind: `Normal`, `Getter`, or `Setter`. For functions,
+    /// arrows, and constructors this is always `Normal`.
+    pub method_kind: MethodKind,
+    /// The exact source text of the method key (`"alpha"`, `#load`,
+    /// `[Symbol.iterator]`, …) or, for functions and arrows, the
+    /// declaration name. Used in the normalization wrapper so a
+    /// `static "alpha"()` and a `static "beta"()` do not collapse onto
+    /// the same `anonymous` placeholder the simple `name` field uses.
+    /// Falls back to `name` when the underlying span can't be recovered.
+    pub display_name: String,
     pub start_line: u32,
     pub end_line: u32,
     pub class_name: Option<String>,
@@ -66,6 +109,34 @@ pub enum FunctionType {
     Method,
     Arrow,
     Constructor,
+}
+
+/// Class-method kind preserved across normalization so a `get` accessor
+/// and a regular method, or `set` vs `get`, never collapse into the same
+/// tree. Non-method functions always carry `Normal`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MethodKind {
+    Normal,
+    Getter,
+    Setter,
+}
+
+/// Best-effort source text for a method key. For static identifiers and
+/// private identifiers we already have a clean string form on the AST node,
+/// but for string literals, numeric literals, and computed expressions the
+/// original key text (e.g. `"alpha"`, `[Symbol.iterator]`) is the only
+/// signal that survives into the normalization wrapper. Returns `None`
+/// when the span is empty or out of bounds so callers fall back to the
+/// existing name.
+fn method_key_source_text(key: &PropertyKey, source: &str) -> Option<String> {
+    let span = key.span();
+    let s = span.start as usize;
+    let e = span.end as usize;
+    if s < e && e <= source.len() {
+        Some(source[s..e].to_string())
+    } else {
+        None
+    }
 }
 
 /// Extract all functions from TypeScript/JavaScript code
@@ -125,6 +196,14 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     function_type: FunctionType::Function,
                     parameters: params,
                     body_span: func.span,
+                    params_span: func.params.span,
+                    body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
+                    is_arrow_expression: false,
+                    is_async: func.r#async,
+                    is_generator: func.generator,
+                    is_static: false,
+                    method_kind: MethodKind::Normal,
+                    display_name: func_name.clone(),
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -164,6 +243,20 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     } else {
                         FunctionType::Method
                     };
+                    let method_kind = match method.kind {
+                        MethodDefinitionKind::Get => MethodKind::Getter,
+                        MethodDefinitionKind::Set => MethodKind::Setter,
+                        _ => MethodKind::Normal,
+                    };
+                    // Capture the original source text of the method key so
+                    // string/number literal and computed keys (which the
+                    // simple `method_name` resolver flattens to
+                    // `"anonymous"`) still differentiate during
+                    // comparison, and so private `#name` methods survive
+                    // the normalization wrapper instead of collapsing onto
+                    // a `__sim__` placeholder.
+                    let method_display_name = method_key_source_text(&method.key, ctx.source_text)
+                        .unwrap_or_else(|| method_name.clone());
 
                     let method_full_name = if let Some(ref class) = class_name {
                         format!("{class}.{method_name}")
@@ -177,6 +270,19 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                         function_type,
                         parameters: params,
                         body_span: method.span,
+                        params_span: method.value.params.span,
+                        body_block_span: method
+                            .value
+                            .body
+                            .as_ref()
+                            .map(|b| b.span)
+                            .unwrap_or(method.span),
+                        is_arrow_expression: false,
+                        is_async: method.value.r#async,
+                        is_generator: method.value.generator,
+                        is_static: method.r#static,
+                        method_kind,
+                        display_name: method_display_name.clone(),
                         start_line,
                         end_line: get_line_number(method.span.end, ctx.source_text),
                         class_name: class_name.clone(),
@@ -212,6 +318,14 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                             function_type: FunctionType::Arrow,
                             parameters: params,
                             body_span: arrow.span,
+                            params_span: arrow.params.span,
+                            body_block_span: arrow.body.span,
+                            is_arrow_expression: arrow.expression,
+                            is_async: arrow.r#async,
+                            is_generator: false,
+                            is_static: false,
+                            method_kind: MethodKind::Normal,
+                            display_name: arrow_name.clone(),
                             start_line,
                             end_line: get_line_number(arrow.span.end, ctx.source_text),
                             class_name: None,
@@ -254,6 +368,14 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     function_type: FunctionType::Function,
                     parameters: params,
                     body_span: func.span,
+                    params_span: func.params.span,
+                    body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
+                    is_arrow_expression: false,
+                    is_async: func.r#async,
+                    is_generator: func.generator,
+                    is_static: false,
+                    method_kind: MethodKind::Normal,
+                    display_name: func_name.clone(),
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -290,6 +412,14 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                     function_type: FunctionType::Function,
                     parameters: params,
                     body_span: func.span,
+                    params_span: func.params.span,
+                    body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
+                    is_arrow_expression: false,
+                    is_async: func.r#async,
+                    is_generator: func.generator,
+                    is_static: false,
+                    method_kind: MethodKind::Normal,
+                    display_name: func_name.clone(),
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -329,6 +459,20 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                     } else {
                         FunctionType::Method
                     };
+                    let method_kind = match method.kind {
+                        MethodDefinitionKind::Get => MethodKind::Getter,
+                        MethodDefinitionKind::Set => MethodKind::Setter,
+                        _ => MethodKind::Normal,
+                    };
+                    // Capture the original source text of the method key so
+                    // string/number literal and computed keys (which the
+                    // simple `method_name` resolver flattens to
+                    // `"anonymous"`) still differentiate during
+                    // comparison, and so private `#name` methods survive
+                    // the normalization wrapper instead of collapsing onto
+                    // a `__sim__` placeholder.
+                    let method_display_name = method_key_source_text(&method.key, ctx.source_text)
+                        .unwrap_or_else(|| method_name.clone());
 
                     let method_full_name = if let Some(ref class) = class_name {
                         format!("{class}.{method_name}")
@@ -342,6 +486,19 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                         function_type,
                         parameters: params,
                         body_span: method.span,
+                        params_span: method.value.params.span,
+                        body_block_span: method
+                            .value
+                            .body
+                            .as_ref()
+                            .map(|b| b.span)
+                            .unwrap_or(method.span),
+                        is_arrow_expression: false,
+                        is_async: method.value.r#async,
+                        is_generator: method.value.generator,
+                        is_static: method.r#static,
+                        method_kind,
+                        display_name: method_display_name.clone(),
                         start_line,
                         end_line: get_line_number(method.span.end, ctx.source_text),
                         class_name: class_name.clone(),
@@ -377,6 +534,14 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                             function_type: FunctionType::Arrow,
                             parameters: params,
                             body_span: arrow.span,
+                            params_span: arrow.params.span,
+                            body_block_span: arrow.body.span,
+                            is_arrow_expression: arrow.expression,
+                            is_async: arrow.r#async,
+                            is_generator: false,
+                            is_static: false,
+                            method_kind: MethodKind::Normal,
+                            display_name: arrow_name.clone(),
                             start_line,
                             end_line: get_line_number(arrow.span.end, ctx.source_text),
                             class_name: None,
@@ -462,13 +627,14 @@ pub fn compare_functions_with_threshold(
     options: &TSEDOptions,
     threshold: f64,
 ) -> Result<f64, String> {
-    // Extract function body text
-    let body1 = extract_body_text(func1, source1);
-    let body2 = extract_body_text(func2, source2);
-
-    // Parse and compare
-    let tree1 = parse_function_fragment("func1.ts", &body1, &func1.function_type)?;
-    let tree2 = parse_function_fragment("func2.ts", &body2, &func2.function_type)?;
+    // Parse using the normalization-friendly fragments so arrow / regular /
+    // method declarations whose bodies agree end up structurally equivalent
+    // at the tree level. The old path passed the raw function text to
+    // `parse_function_fragment`, which preserved the surrounding declaration
+    // shape and made e.g. `(x) => x` vs `function f(x) { return x; }` look
+    // ~25% less similar than their bodies actually were.
+    let tree1 = parse_function_for_comparison("func1.ts", func1, source1)?;
+    let tree2 = parse_function_for_comparison("func2.ts", func2, source2)?;
     compare_function_trees(&tree1, &tree2, func1, func2, options, threshold)
 }
 
@@ -553,11 +719,16 @@ fn compare_function_trees(
         let avg_lines = (func1.line_count() + func2.line_count()) as f64 / 2.0;
         if avg_lines < 10.0 {
             // Confidence softener: scale the base short-function factor back
-            // toward 1.0 as the raw similarity approaches 1.0. At sim >= 0.9
-            // we apply essentially no penalty; at sim <= 0.6 we apply the
-            // full original penalty.
+            // toward 1.0 as the raw similarity approaches 1.0. At sim >= 0.92
+            // (essentially identical bodies) we apply no further penalty;
+            // below 0.6 we apply the full original short-function discount.
+            // The previous curve still pulled identical 3-line functions
+            // down by ~30% because the confidence range bottomed out at
+            // similarity 0.6 — but identical bodies already register at the
+            // node-count layer's softened score (~0.85) so the avg_lines
+            // multiplier should let those through.
             let base_factor = (avg_lines / 10.0).max(0.1);
-            let confidence = ((similarity - 0.6) / 0.3).clamp(0.0, 1.0);
+            let confidence = ((similarity - 0.6) / 0.32).clamp(0.0, 1.0);
             let effective_factor = base_factor + (1.0 - base_factor) * confidence;
             similarity *= effective_factor;
         }
@@ -570,6 +741,130 @@ fn extract_body_text(func: &FunctionDefinition, source: &str) -> String {
     let start = func.body_span.start as usize;
     let end = func.body_span.end as usize;
     source[start..end].to_string()
+}
+
+/// Build a normalization-friendly fragment for a function. The goal is that
+/// two functions whose bodies and parameter lists agree end up producing
+/// identical fragments regardless of whether they were declared as
+/// `function foo() {...}`, `const foo = () => {...}`, or
+/// `const foo = (x) => x + 1`. Without this layer the wrapping shape
+/// (FunctionDeclaration vs ExpressionStatement→ArrowFunctionExpression)
+/// dominated the structural distance on short bodies.
+fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String {
+    let safe_slice = |start: u32, end: u32| -> &str {
+        let s = start as usize;
+        let e = end as usize;
+        if s < e && e <= source.len() {
+            &source[s..e]
+        } else {
+            ""
+        }
+    };
+
+    let params_text = {
+        let raw = safe_slice(func.params_span.start, func.params_span.end).trim();
+        if raw.starts_with('(') && raw.ends_with(')') {
+            raw.to_string()
+        } else if raw.is_empty() {
+            "()".to_string()
+        } else {
+            // Single un-parenthesised arrow parameter, e.g. `x => ...`.
+            format!("({raw})")
+        }
+    };
+
+    let body_text = safe_slice(func.body_block_span.start, func.body_block_span.end);
+
+    match func.function_type {
+        FunctionType::Method | FunctionType::Constructor => {
+            // Class methods can't be parsed in isolation, so keep the
+            // synthetic class wrapper. Preserve `static`, getter/setter,
+            // `async` and generator modifiers — runtime-distinct methods
+            // like `static foo` vs `foo` or `get foo` vs `foo` must not
+            // collapse onto the same tree even when their bodies agree.
+            let mut prefix = String::new();
+            if func.is_static {
+                prefix.push_str("static ");
+            }
+            match func.method_kind {
+                MethodKind::Getter => prefix.push_str("get "),
+                MethodKind::Setter => prefix.push_str("set "),
+                MethodKind::Normal => {
+                    if func.is_async {
+                        prefix.push_str("async ");
+                    }
+                    if func.is_generator {
+                        prefix.push('*');
+                    }
+                }
+            }
+            // Methods use `display_name` directly: it already carries the
+            // exact source text of the key (`"alpha"`, `#load`,
+            // `[Symbol.iterator]`, …), all of which are syntactically valid
+            // inside a class body, so no sanitization is needed. The
+            // sanitizer used for top-level functions would otherwise reject
+            // these forms and collapse distinct methods onto `__sim__`.
+            let method_name_text = if func.display_name.is_empty() {
+                "__sim__".to_string()
+            } else {
+                func.display_name.clone()
+            };
+            format!(
+                "class __C__ {{ {}{}{} {} }}",
+                prefix, method_name_text, params_text, body_text
+            )
+        }
+        FunctionType::Function | FunctionType::Arrow => {
+            // Carry async / generator flags through the wrapper so two
+            // functions that differ only in `async`-ness (different
+            // runtime return type) don't compare as identical. Arrows
+            // can be async but never generators, so the generator marker
+            // is only meaningful for the Function path.
+            let mut prefix = String::new();
+            if func.is_async {
+                prefix.push_str("async ");
+            }
+            prefix.push_str("function");
+            if func.is_generator {
+                prefix.push('*');
+            }
+
+            // Top-level functions and arrow declarations always bind to
+            // an ordinary identifier, so the sanitizer is enough — there
+            // is no private-method / string-literal-key path here.
+            let name_text = sanitize_function_name(&func.name);
+            if func.is_arrow_expression {
+                // Wrap a single-expression arrow body in an explicit
+                // `return` so it ends up shaped like a block-bodied
+                // function. Without this an `(x) => x + 1` would parse as
+                // a top-level `ExpressionStatement → ArrowFunctionExpression`,
+                // adding a structural wrapper that an equivalent
+                // `function f(x) { return x + 1; }` would not have.
+                format!(
+                    "{} {}{} {{ return {}; }}",
+                    prefix, name_text, params_text, body_text
+                )
+            } else {
+                format!("{} {}{} {}", prefix, name_text, params_text, body_text)
+            }
+        }
+    }
+}
+
+fn sanitize_function_name(name: &str) -> String {
+    let valid_ident = !name.is_empty()
+        && name.chars().enumerate().all(|(idx, ch)| {
+            if idx == 0 {
+                ch.is_alphabetic() || ch == '_' || ch == '$'
+            } else {
+                ch.is_alphanumeric() || ch == '_' || ch == '$'
+            }
+        });
+    if valid_ident {
+        name.to_string()
+    } else {
+        "__sim__".to_string()
+    }
 }
 
 /// Parse a function body snippet into a tree, wrapping method-shorthand
@@ -596,6 +891,26 @@ fn parse_function_fragment(
                     parse_and_convert_to_tree(filename, &wrapped)
                 }
             }
+        }
+    }
+}
+
+/// Parse a function for structural comparison, using `build_normalized_fragment`
+/// so arrow vs regular vs method declarations all end up shape-equivalent
+/// when their bodies agree.
+fn parse_function_for_comparison(
+    filename: &str,
+    func: &FunctionDefinition,
+    source: &str,
+) -> Result<std::rc::Rc<crate::tree::TreeNode>, String> {
+    let fragment = build_normalized_fragment(func, source);
+    match parse_and_convert_to_tree(filename, &fragment) {
+        Ok(tree) => Ok(tree),
+        Err(_) => {
+            // Fallback to the legacy whole-function parse path so we don't
+            // regress on edge cases the normalizer happens to break.
+            let body_text = extract_body_text(func, source);
+            parse_function_fragment(filename, &body_text, &func.function_type)
         }
     }
 }
@@ -677,8 +992,7 @@ pub fn find_similar_functions_in_file(
     let mut trees: Vec<Option<std::rc::Rc<crate::tree::TreeNode>>> =
         Vec::with_capacity(functions.len());
     for func in &functions {
-        let body = extract_body_text(func, source_text);
-        trees.push(parse_function_fragment(filename, &body, &func.function_type).ok());
+        trees.push(parse_function_for_comparison(filename, func, source_text).ok());
     }
 
     let mut similar_pairs = Vec::new();
@@ -771,10 +1085,7 @@ pub fn find_similar_functions_across_files(
     // alone dwarfs the APTED computation.
     let trees: Vec<Option<std::rc::Rc<crate::tree::TreeNode>>> = all_functions
         .iter()
-        .map(|(filename, source, func)| {
-            let body = extract_body_text(func, source);
-            parse_function_fragment(filename, &body, &func.function_type).ok()
-        })
+        .map(|(filename, source, func)| parse_function_for_comparison(filename, func, source).ok())
         .collect();
 
     let mut similar_pairs = Vec::new();

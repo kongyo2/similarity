@@ -136,31 +136,56 @@ fn finalize_tsed_similarity(
         if max_size < 8.0 && distance > 0.0 {
             similarity *= 0.55;
         } else if max_size < 16.0 && distance > 0.0 {
-            similarity *= 0.92;
+            // Soften the short-tree penalty when the structural difference
+            // is tiny — a single-rename match between two ~11-node helpers
+            // should land far above the default 0.8 threshold, not at
+            // ~0.84 where the prior flat 0.92 multiplier put it. The
+            // softener tilts the factor toward 1.0 as `normalized_distance`
+            // approaches 0 and toward 0.92 as it grows.
+            let softener = (1.0 - normalized_distance * 8.0).clamp(0.0, 1.0);
+            let effective = 0.92 + (1.0 - 0.92) * softener;
+            similarity *= effective;
         }
 
-        if min_size < 10.0 {
-            let base_factor = (min_size / 10.0).powf(0.7).max(0.25);
+        // Soften the short-function penalties when the trees are exactly
+        // identical (distance == 0). Two 3-line helpers that happen to be
+        // byte-equivalent are clearly refactoring candidates regardless of
+        // their size; previously the compounded `< 10` and `>0.04` factors
+        // crushed them to ~0.13 even at distance zero, which sat far below
+        // every reasonable threshold. The penalty curve still applies its
+        // full discount once the bodies diverge.
+        if distance > 0.0 {
+            if min_size < 10.0 {
+                let base_factor = (min_size / 10.0).powf(0.7).max(0.25);
+                similarity *= base_factor;
+                if normalized_distance > 0.04 {
+                    similarity *= 0.6;
+                }
+            } else if min_size < 20.0 {
+                let softener = (1.0 - normalized_distance * 4.0).clamp(0.0, 1.0);
+                let base_factor = 0.92;
+                let effective_factor = base_factor + (1.0 - base_factor) * softener;
+                similarity *= effective_factor;
+                if normalized_distance > 0.18 {
+                    similarity *= 0.85;
+                }
+            } else if min_size < 30.0 {
+                let softener = (1.0 - normalized_distance * 4.0).clamp(0.0, 1.0);
+                let base_factor = 0.95;
+                let effective_factor = base_factor + (1.0 - base_factor) * softener;
+                similarity *= effective_factor;
+                if normalized_distance > 0.13 {
+                    similarity *= 0.88;
+                }
+            }
+        } else if min_size < 10.0 {
+            // Identical trees of < 10 nodes still get a mild discount so a
+            // 1-token `() => 0` vs `() => 0` doesn't dominate the report,
+            // but the discount is bounded — for two distinct 4-line helpers
+            // with byte-identical bodies the score lands around 0.85, well
+            // above the default 0.8 threshold.
+            let base_factor = ((min_size + 4.0) / 14.0).clamp(0.7, 0.95);
             similarity *= base_factor;
-            if normalized_distance > 0.04 {
-                similarity *= 0.6;
-            }
-        } else if min_size < 20.0 {
-            let softener = (1.0 - normalized_distance * 4.0).clamp(0.0, 1.0);
-            let base_factor = 0.92;
-            let effective_factor = base_factor + (1.0 - base_factor) * softener;
-            similarity *= effective_factor;
-            if normalized_distance > 0.18 {
-                similarity *= 0.85;
-            }
-        } else if min_size < 30.0 {
-            let softener = (1.0 - normalized_distance * 4.0).clamp(0.0, 1.0);
-            let base_factor = 0.95;
-            let effective_factor = base_factor + (1.0 - base_factor) * softener;
-            similarity *= effective_factor;
-            if normalized_distance > 0.13 {
-                similarity *= 0.88;
-            }
         }
 
         if normalized_distance > 0.16 {
