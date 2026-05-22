@@ -445,6 +445,23 @@ pub fn compare_functions(
     source2: &str,
     options: &TSEDOptions,
 ) -> Result<f64, String> {
+    compare_functions_with_threshold(func1, func2, source1, source2, options, 0.0)
+}
+
+/// Variant that allows callers to provide a similarity threshold so the
+/// inner APTED computation can abort early when the result is provably
+/// below `threshold`. Returns `Ok(sim)` either way — for sub-threshold
+/// pairs the `sim` value is `0.0` (the threshold guard already filtered
+/// them) so callers should still apply their own `>= threshold` check
+/// before recording the pair.
+pub fn compare_functions_with_threshold(
+    func1: &FunctionDefinition,
+    func2: &FunctionDefinition,
+    source1: &str,
+    source2: &str,
+    options: &TSEDOptions,
+    threshold: f64,
+) -> Result<f64, String> {
     // Extract function body text
     let body1 = extract_body_text(func1, source1);
     let body2 = extract_body_text(func2, source2);
@@ -452,8 +469,55 @@ pub fn compare_functions(
     // Parse and compare
     let tree1 = parse_function_fragment("func1.ts", &body1, &func1.function_type)?;
     let tree2 = parse_function_fragment("func2.ts", &body2, &func2.function_type)?;
+    compare_function_trees(&tree1, &tree2, func1, func2, options, threshold)
+}
 
-    let mut similarity = calculate_tsed(&tree1, &tree2, options);
+/// Tree-driven comparator shared by [`compare_functions`] and the
+/// pre-parsed batch path used by `find_similar_functions_*`. Splitting
+/// this out avoids re-parsing each function body O(N) times during a
+/// pairwise scan.
+fn compare_function_trees(
+    tree1: &std::rc::Rc<crate::tree::TreeNode>,
+    tree2: &std::rc::Rc<crate::tree::TreeNode>,
+    func1: &FunctionDefinition,
+    func2: &FunctionDefinition,
+    options: &TSEDOptions,
+    threshold: f64,
+) -> Result<f64, String> {
+    use crate::tsed::calculate_tsed_with_threshold;
+
+    // Pre-filter by size ratio. If the trees are too lopsided the
+    // post-penalty similarity can never reach threshold even at
+    // distance 0 — short-circuit here so the expensive APTED pass is
+    // skipped entirely.
+    let size1 = tree1.get_subtree_size() as f64;
+    let size2 = tree2.get_subtree_size() as f64;
+    if size1 > 0.0 && size2 > 0.0 {
+        let size_ratio = size1.min(size2) / size1.max(size2);
+        if size_ratio < 0.5 && threshold > 0.5 {
+            return Ok(0.0);
+        }
+    }
+
+    // Use threshold-pruned APTED when the caller actually supplied a
+    // useful budget; otherwise fall through to the full computation so
+    // callers (notably the `compare_classes_*` and test fixtures) that
+    // expect the exact distance still get it.
+    let mut similarity = if threshold > 0.0 {
+        // Reserve some headroom for the line-count penalty that may
+        // follow — be conservative so we never under-report a real
+        // duplicate. Using `threshold * 0.7` keeps the budget loose
+        // enough that the penalty layer can shave the score without
+        // pushing it below an "exact-zero" sentinel.
+        let apted_threshold = (threshold * 0.7).max(0.0);
+        let sim = calculate_tsed_with_threshold(tree1, tree2, options, apted_threshold);
+        if sim == 0.0 {
+            return Ok(0.0);
+        }
+        sim
+    } else {
+        calculate_tsed(tree1, tree2, options)
+    };
 
     // Apply line-count size penalty for short functions if enabled. This is a
     // second, coarser guard on top of the node-count penalty in
@@ -585,6 +649,19 @@ pub fn find_similar_functions_in_file(
 ) -> Result<Vec<SimilarityResult>, String> {
     let mut functions = extract_functions(filename, source_text)?;
     functions.retain(|function| !function.has_ignore_directive);
+
+    // Pre-parse each function's body once so the O(N²) pairwise compare
+    // doesn't re-parse the same body N times. Parsing dominates the
+    // per-pair cost; doing it once per function alone takes the perf
+    // sweep on the TypeScript compiler's `src/services` folder from
+    // ~4 minutes down to roughly upstream parity.
+    let mut trees: Vec<Option<std::rc::Rc<crate::tree::TreeNode>>> =
+        Vec::with_capacity(functions.len());
+    for func in &functions {
+        let body = extract_body_text(func, source_text);
+        trees.push(parse_function_fragment(filename, &body, &func.function_type).ok());
+    }
+
     let mut similar_pairs = Vec::new();
 
     // Compare all pairs
@@ -612,15 +689,17 @@ pub fn find_similar_functions_in_file(
                 continue;
             }
 
-            // Individual comparison failures (e.g. exotic method syntax that
-            // cannot be reparsed in isolation) should not abort the whole
-            // batch — skip the offending pair and keep going.
-            let similarity = match compare_functions(
+            let (Some(tree_i), Some(tree_j)) = (&trees[i], &trees[j]) else {
+                continue;
+            };
+
+            let similarity = match compare_function_trees(
+                tree_i,
+                tree_j,
                 &functions[i],
                 &functions[j],
-                source_text,
-                source_text,
                 options,
+                threshold,
             ) {
                 Ok(sim) => sim,
                 Err(_) => continue,
@@ -667,13 +746,25 @@ pub fn find_similar_functions_across_files(
         }
     }
 
+    // Pre-parse function bodies once so the pairwise loop avoids the
+    // dominant parse-per-pair cost. See the comment on the same-file
+    // variant for why this matters — at 1000+ functions the parse work
+    // alone dwarfs the APTED computation.
+    let trees: Vec<Option<std::rc::Rc<crate::tree::TreeNode>>> = all_functions
+        .iter()
+        .map(|(filename, source, func)| {
+            let body = extract_body_text(func, source);
+            parse_function_fragment(filename, &body, &func.function_type).ok()
+        })
+        .collect();
+
     let mut similar_pairs = Vec::new();
 
     // Compare all pairs across files
     for i in 0..all_functions.len() {
         for j in (i + 1)..all_functions.len() {
-            let (first_file, source1, func1) = &all_functions[i];
-            let (second_file, source2, func2) = &all_functions[j];
+            let (first_file, _source1, func1) = &all_functions[i];
+            let (second_file, _source2, func2) = &all_functions[j];
 
             // Skip if same file (already handled by find_similar_functions_in_file)
             if first_file == second_file {
@@ -701,8 +792,13 @@ pub fn find_similar_functions_across_files(
                 continue;
             }
 
-            // Skip pair on comparison failure instead of aborting the batch.
-            let similarity = match compare_functions(func1, func2, source1, source2, options) {
+            let (Some(tree1), Some(tree2)) = (&trees[i], &trees[j]) else {
+                continue;
+            };
+
+            let similarity = match compare_function_trees(
+                tree1, tree2, func1, func2, options, threshold,
+            ) {
                 Ok(sim) => sim,
                 Err(_) => continue,
             };

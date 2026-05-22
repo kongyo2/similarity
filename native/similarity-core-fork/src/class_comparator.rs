@@ -97,6 +97,76 @@ fn normalize_type(type_str: &str) -> String {
     type_str.replace("Array<", "[").replace(">", "]").replace(" ", "").trim().to_string()
 }
 
+/// Strip parameter names and class-shaped tokens so two methods that have
+/// the same structural signature but sit in renamed classes can still be
+/// recognised as matching. Used only by the fuzzy method-pairing pass.
+fn normalize_signature_for_fuzzy(method: &ClassMethod) -> String {
+    let stripped_params: Vec<String> = method
+        .parameters
+        .iter()
+        .map(|p| {
+            if let Some(idx) = p.find(':') {
+                p[idx + 1..].trim().to_string()
+            } else {
+                p.clone()
+            }
+        })
+        .collect();
+    // Replace CamelCase identifiers in the return type with a placeholder so
+    // a method returning `UserBuilder` matches one returning `CustomerBuilder`
+    // when nothing else differs.
+    let normalized_return = replace_camelcase_identifiers(&method.return_type);
+    format!("({}) => {}", stripped_params.join(", "), normalized_return)
+}
+
+fn replace_camelcase_identifiers(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut current = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_alphabetic() || ch == '_' || ch.is_ascii_digit() {
+            current.push(ch);
+        } else {
+            push_identifier_token(&current, &mut out);
+            current.clear();
+            out.push(ch);
+        }
+    }
+    push_identifier_token(&current, &mut out);
+    out
+}
+
+fn push_identifier_token(token: &str, out: &mut String) {
+    if token.is_empty() {
+        return;
+    }
+    let is_camel_class = token.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && token.chars().any(|c| c.is_ascii_lowercase());
+    if is_camel_class {
+        // Substitute a fixed placeholder so two class names of the same
+        // shape collapse together. Primitive type names (string, number,
+        // boolean, void, etc.) stay intact since they're lowercase.
+        out.push_str("#T");
+    } else {
+        out.push_str(token);
+    }
+}
+
+fn normalized_signature_overlap(sig1: &str, sig2: &str) -> f64 {
+    // Rough Jaccard on alphabetic tokens. Good enough to give a small
+    // bonus when two normalised signatures share a few tokens but aren't
+    // identical (e.g. partially overlapping parameter types).
+    let tokens1: std::collections::HashSet<&str> =
+        sig1.split(|c: char| !c.is_ascii_alphabetic()).filter(|s| !s.is_empty()).collect();
+    let tokens2: std::collections::HashSet<&str> =
+        sig2.split(|c: char| !c.is_ascii_alphabetic()).filter(|s| !s.is_empty()).collect();
+    if tokens1.is_empty() && tokens2.is_empty() {
+        return 1.0;
+    }
+    let intersection = tokens1.intersection(&tokens2).count();
+    let union = tokens1.union(&tokens2).count();
+    if union == 0 { 0.0 } else { intersection as f64 / union as f64 }
+}
+
 pub fn compare_classes(
     class1: &ClassDefinition,
     class2: &ClassDefinition,
@@ -140,75 +210,202 @@ fn calculate_structural_similarity(
     let mut extra_properties = Vec::new();
     let mut property_type_mismatches = Vec::new();
 
-    // Check properties
-    let mut property_matches = 0;
-    let mut property_total = 0;
+    // Properties: two-phase matching.
+    //
+    // Phase 1 — strict by name. A property keeps its name across most
+    // refactors so this is the primary signal.
+    //
+    // Phase 2 — fuzzy by type for the leftovers. A common refactor pattern
+    // is renaming a private storage field (`store` → `items` between two
+    // cache classes); strict-name matching scores those as a full mismatch
+    // which then drowns out an otherwise-identical method surface. Pairing
+    // unmatched properties by type — and crediting them as partial matches
+    // — recovers that signal without falsely matching properties of
+    // unrelated types.
+    let mut property_score = 0.0;
+    let property_total_count = (class1.properties.len() + class2.properties.len()) as f64;
+    let mut matched_in_class2: std::collections::HashSet<String> = Default::default();
+
+    let mut leftovers_class1: Vec<&str> = Vec::new();
 
     for (name, prop1) in &class1.properties {
-        property_total += 1;
         if let Some(prop2) = class2.properties.get(name) {
             if prop1.type_annotation == prop2.type_annotation {
-                property_matches += 1;
+                // Strict match — credit both class1 and class2 sides.
+                property_score += 2.0;
             } else {
+                // Same name, different type — partial match.
+                property_score += 1.4;
                 property_type_mismatches.push(PropertyMismatch {
                     name: name.clone(),
                     type1: prop1.type_annotation.clone(),
                     type2: prop2.type_annotation.clone(),
                 });
             }
+            matched_in_class2.insert(name.clone());
         } else {
-            missing_properties.push(name.clone());
+            leftovers_class1.push(name.as_str());
         }
     }
 
-    for name in class2.properties.keys() {
-        if !class1.properties.contains_key(name) {
-            extra_properties.push(name.clone());
-            property_total += 1;
+    let leftovers_class2: Vec<&str> = class2
+        .properties
+        .keys()
+        .filter(|n| !matched_in_class2.contains(n.as_str()))
+        .map(|n| n.as_str())
+        .collect();
+
+    // Greedy best-match by type for the leftovers. This is N×M but class
+    // properties are typically a handful so the quadratic factor is fine.
+    let mut leftover_consumed_class2: std::collections::HashSet<String> = Default::default();
+    for name1 in &leftovers_class1 {
+        let prop1 = &class1.properties[*name1];
+        let mut best_match: Option<(&str, f64)> = None;
+        for name2 in &leftovers_class2 {
+            if leftover_consumed_class2.contains(*name2) {
+                continue;
+            }
+            let prop2 = &class2.properties[*name2];
+            // Score: type match dominates, name similarity tie-breaks.
+            let type_match = if prop1.type_annotation == prop2.type_annotation {
+                1.0
+            } else if !prop1.type_annotation.is_empty() && !prop2.type_annotation.is_empty() {
+                // Both annotated but mismatched: weak partial credit if the
+                // annotation strings share a non-trivial prefix (e.g.
+                // `Map<string, A>` vs `Map<string, B>`).
+                let shared_prefix = prop1
+                    .type_annotation
+                    .chars()
+                    .zip(prop2.type_annotation.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let max_len =
+                    prop1.type_annotation.len().max(prop2.type_annotation.len()).max(1) as f64;
+                (shared_prefix as f64 / max_len).min(0.6)
+            } else {
+                0.4
+            };
+            let name_sim = calculate_name_similarity(name1, name2);
+            let score = 0.8 * type_match + 0.2 * name_sim;
+            if best_match.is_none_or(|(_, b)| score > b) {
+                best_match = Some((name2, score));
+            }
+        }
+        if let Some((name2, score)) = best_match {
+            if score >= 0.7 {
+                // Credit it as a rename match — both sides count.
+                property_score += 2.0 * score;
+                leftover_consumed_class2.insert(name2.to_string());
+                continue;
+            }
+        }
+        missing_properties.push((*name1).to_string());
+    }
+    for name2 in &leftovers_class2 {
+        if !leftover_consumed_class2.contains(*name2) {
+            extra_properties.push((*name2).to_string());
         }
     }
 
-    // Check methods
+    // Check methods — same two-phase matching strategy so renamed methods
+    // (e.g. `findById` → `lookupById`) still register as related.
     let mut missing_methods = Vec::new();
     let mut extra_methods = Vec::new();
     let mut method_signature_mismatches = Vec::new();
 
-    let mut method_matches = 0;
-    let mut method_total = 0;
+    let method_total_count = (class1.methods.len() + class2.methods.len()) as f64;
+    let mut method_score = 0.0;
+    let mut method_matched_in_class2: std::collections::HashSet<String> = Default::default();
+    let mut method_leftovers_class1: Vec<&str> = Vec::new();
 
     for (name, method1) in &class1.methods {
-        method_total += 1;
         if let Some(method2) = class2.methods.get(name) {
             let sig1 = format!("({}) => {}", method1.parameters.join(", "), method1.return_type);
             let sig2 = format!("({}) => {}", method2.parameters.join(", "), method2.return_type);
-
             if sig1 == sig2 {
-                method_matches += 1;
+                method_score += 2.0;
             } else {
+                method_score += 1.4;
                 method_signature_mismatches.push(MethodMismatch {
                     name: name.clone(),
                     signature1: sig1,
                     signature2: sig2,
                 });
             }
+            method_matched_in_class2.insert(name.clone());
         } else {
-            missing_methods.push(name.clone());
+            method_leftovers_class1.push(name.as_str());
         }
     }
 
-    for name in class2.methods.keys() {
-        if !class1.methods.contains_key(name) {
-            extra_methods.push(name.clone());
-            method_total += 1;
+    let method_leftovers_class2: Vec<&str> = class2
+        .methods
+        .keys()
+        .filter(|n| !method_matched_in_class2.contains(n.as_str()))
+        .map(|n| n.as_str())
+        .collect();
+
+    let mut method_leftover_consumed: std::collections::HashSet<String> = Default::default();
+    for name1 in &method_leftovers_class1 {
+        let method1 = &class1.methods[*name1];
+        let sig1 = format!("({}) => {}", method1.parameters.join(", "), method1.return_type);
+        let normalized_sig1 = normalize_signature_for_fuzzy(method1);
+        let mut best_match: Option<(&str, f64)> = None;
+        for name2 in &method_leftovers_class2 {
+            if method_leftover_consumed.contains(*name2) {
+                continue;
+            }
+            let method2 = &class2.methods[*name2];
+            let sig2 = format!("({}) => {}", method2.parameters.join(", "), method2.return_type);
+            let normalized_sig2 = normalize_signature_for_fuzzy(method2);
+            // Tiered signature match: exact > param-shape-only > nothing.
+            // The "param-shape" tier strips identifier names from
+            // parameters and the surrounding-class name from the return
+            // type, so methods that genuinely have the same shape but
+            // sit in renamed classes (UserBuilder.withName vs
+            // CustomerBuilder.withLabel) still register as similar.
+            let sig_match = if sig1 == sig2 {
+                1.0
+            } else if normalized_sig1 == normalized_sig2 {
+                0.85
+            } else {
+                let name_overlap = normalized_signature_overlap(&normalized_sig1, &normalized_sig2);
+                0.4 + 0.4 * name_overlap
+            };
+            let name_sim = calculate_name_similarity(name1, name2);
+            let score = 0.6 * sig_match + 0.4 * name_sim;
+            if best_match.is_none_or(|(_, b)| score > b) {
+                best_match = Some((name2, score));
+            }
+        }
+        if let Some((name2, score)) = best_match {
+            // Threshold tuned so a same-shape method whose name has
+            // some lexical overlap with the original (`withName` vs
+            // `withLabel` share a `with` prefix) registers, but a
+            // structurally different method with a tangentially similar
+            // name does not.
+            if score >= 0.65 {
+                method_score += 2.0 * score;
+                method_leftover_consumed.insert(name2.to_string());
+                continue;
+            }
+        }
+        missing_methods.push((*name1).to_string());
+    }
+    for name2 in &method_leftovers_class2 {
+        if !method_leftover_consumed.contains(*name2) {
+            extra_methods.push((*name2).to_string());
         }
     }
 
-    // Calculate overall structural similarity
-    let total_elements = property_total + method_total;
-    let matched_elements = property_matches + method_matches;
+    // Calculate overall structural similarity. Each side counts once, so
+    // a "complete match" pair contributes 2 to the score and 2 to the
+    // denominator — leaving the ratio at 1.0 for an exact match.
+    let total_elements = property_total_count + method_total_count;
+    let matched_elements = property_score + method_score;
 
     let structural_similarity =
-        if total_elements > 0 { matched_elements as f64 / total_elements as f64 } else { 1.0 };
+        if total_elements > 0.0 { (matched_elements / total_elements).min(1.0) } else { 1.0 };
 
     let differences = ClassDifferences {
         missing_properties,

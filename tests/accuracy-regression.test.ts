@@ -512,3 +512,259 @@ export interface Type${index} {
     });
   }, 10_000);
 });
+
+describe("accuracy improvements over upstream for refactoring use", () => {
+  it("matches medium-sized rename refactors that upstream over-penalises", async () => {
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/fetch.ts",
+        `
+export function fetchUserData(userId: string): Promise<{ id: string; name: string }> {
+  return fetch(\`/api/users/\${userId}\`)
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error(\`Failed to fetch user \${userId}\`);
+      }
+      return response.json();
+    })
+    .then((payload) => ({ id: payload.id, name: payload.name }));
+}
+
+export function loadCustomerProfile(customerId: string): Promise<{ id: string; name: string }> {
+  return fetch(\`/api/customers/\${customerId}\`)
+    .then((res) => {
+      if (!res.ok) {
+        throw new Error(\`Failed to fetch customer \${customerId}\`);
+      }
+      return res.json();
+    })
+    .then((data) => ({ id: data.id, name: data.name }));
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.85,
+        minLines: 5,
+      });
+
+      expect(hasPair(report.byMode.functions, "fetchUserData", "loadCustomerProfile")).toBe(true);
+    });
+  });
+
+  it("detects renamed class methods even though upstream cannot reparse them in isolation", async () => {
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/repos.ts",
+        `
+export class UserRepository {
+  async findById(id: string): Promise<unknown> {
+    const url = \`/api/users/\${id}\`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(\`HTTP \${response.status}\`);
+    }
+    return response.json();
+  }
+}
+
+export class CustomerRepository {
+  async findById(id: string): Promise<unknown> {
+    const path = \`/api/customers/\${id}\`;
+    const res = await fetch(path);
+    if (!res.ok) {
+      throw new Error(\`HTTP \${res.status}\`);
+    }
+    return res.json();
+  }
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.8,
+        minLines: 3,
+      });
+
+      expect(hasPair(report.byMode.functions, "findById", "findById")).toBe(true);
+    });
+  });
+
+  it("distinguishes for-loops whose body operations diverge (assignment vs aggregation)", async () => {
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/loops.ts",
+        `
+export function transformUppercase(text: string): string {
+  if (!text) return "";
+  let result = "";
+  for (const ch of text) {
+    result += ch.toUpperCase();
+  }
+  return result;
+}
+
+export function transformReverse(text: string): string {
+  if (!text) return "";
+  let result = "";
+  for (const ch of text) {
+    result = ch + result;
+  }
+  return result;
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.85,
+        minLines: 3,
+      });
+
+      expect(hasPair(report.byMode.functions, "transformUppercase", "transformReverse")).toBe(
+        false,
+      );
+    });
+  });
+
+  it("rejects trivial 1-line operator-differs pairs as duplicates", async () => {
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/math.ts",
+        `
+export const add = (a: number, b: number) => a + b;
+export const sub = (a: number, b: number) => a - b;
+export const mul = (a: number, b: number) => a * b;
+export const div = (a: number, b: number) => a / b;
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.85,
+        minLines: 1,
+      });
+
+      expect(report.byMode.functions).toHaveLength(0);
+    });
+  });
+
+  it("matches duplicated cache classes despite renamed private storage", async () => {
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/caches.ts",
+        `
+export class UserCache {
+  private store = new Map<string, unknown>();
+  get(key: string): unknown { return this.store.get(key); }
+  set(key: string, value: unknown): void { this.store.set(key, value); }
+  delete(key: string): boolean { return this.store.delete(key); }
+  clear(): void { this.store.clear(); }
+}
+
+export class SessionCache {
+  private items = new Map<string, unknown>();
+  get(key: string): unknown { return this.items.get(key); }
+  set(key: string, value: unknown): void { this.items.set(key, value); }
+  delete(key: string): boolean { return this.items.delete(key); }
+  clear(): void { this.items.clear(); }
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["classes"], {
+        threshold: 0.8,
+        minLines: 3,
+      });
+
+      expect(hasPair(report.byMode.classes, "UserCache", "SessionCache")).toBe(true);
+    });
+  });
+
+  it("flags identical validation blocks across two functions in overlap mode", async () => {
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/validation.ts",
+        `
+export function createUser(payload: { email: string }) {
+  if (!payload.email) {
+    throw new Error("Email is required");
+  }
+  if (!payload.email.includes("@")) {
+    throw new Error("Invalid email format");
+  }
+  if (payload.email.length > 100) {
+    throw new Error("Email too long");
+  }
+  return payload;
+}
+
+export function createAdmin(payload: { email: string }) {
+  if (!payload.email) {
+    throw new Error("Email is required");
+  }
+  if (!payload.email.includes("@")) {
+    throw new Error("Invalid email format");
+  }
+  if (payload.email.length > 100) {
+    throw new Error("Email too long");
+  }
+  return payload;
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["overlap"], {
+        threshold: 0.7,
+        overlapMinWindow: 4,
+        overlapMaxWindow: 25,
+        overlapSizeTolerance: 0.5,
+      });
+
+      expect(report.byMode.overlap.some((pair) => pair.similarity >= 0.99)).toBe(true);
+    });
+  });
+
+  it("matches duplicated class methods that upstream's parser drops as unparseable", async () => {
+    await withTempProject(async (projectDir) => {
+      await writeSource(
+        projectDir,
+        "src/repos.ts",
+        `
+export class UserRepository {
+  async findById(id: string): Promise<unknown> {
+    const url = \`/api/users/\${id}\`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(\`HTTP \${response.status}\`);
+    }
+    return response.json();
+  }
+}
+
+export class CustomerRepository {
+  async findById(id: string): Promise<unknown> {
+    const path = \`/api/customers/\${id}\`;
+    const res = await fetch(path);
+    if (!res.ok) {
+      throw new Error(\`HTTP \${res.status}\`);
+    }
+    return res.json();
+  }
+}
+`,
+      );
+
+      const report = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.85,
+        minLines: 3,
+      });
+
+      expect(hasPair(report.byMode.functions, "findById", "findById")).toBe(true);
+    });
+  });
+});
