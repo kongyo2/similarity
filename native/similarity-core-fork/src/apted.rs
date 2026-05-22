@@ -33,24 +33,22 @@ pub const DISTANCE_EXCEEDED: f64 = f64::MAX / 4.0;
 // surrounding code does. Most rename refactors land here, so we give them
 // the base `rename_cost`.
 //
+// Literal kinds are intentionally NOT classified as identifier-like:
+// changing `length > 100` to `length > 1000`, or `"info"` to `"warn"`,
+// is a behavioural change rather than a rename refactor, so it pays the
+// non-identifier-rename rate. Same goes for `TemplateElement` content —
+// switching the literal portion of a template string changes what the
+// code does, not just what its parts are called.
+//
 // All other label-only changes (operator labels on BinaryExpression,
-// UnaryExpression, AssignmentExpression, …; method/property keys; literal
-// values; etc.) are actually semantic changes inside the same syntactic
-// kind, so we charge a higher rate so APTED prefers to delete+insert
-// when that's cheaper than masking the change as a "rename".
+// UnaryExpression, AssignmentExpression, …; method/property keys; etc.)
+// are also semantic changes inside the same syntactic kind, so they too
+// stay outside this allow-list and end up paying the higher within-kind
+// rename cost.
 fn is_identifier_like_kind(value: &str) -> bool {
     matches!(
         value,
-        "Identifier"
-            | "BindingIdentifier"
-            | "PrivateIdentifier"
-            | "StringLiteral"
-            | "NumericLiteral"
-            | "BooleanLiteral"
-            | "BigIntLiteral"
-            | "NullLiteral"
-            | "TemplateElement"
-            | "Parameter"
+        "Identifier" | "BindingIdentifier" | "PrivateIdentifier" | "Parameter"
     )
 }
 
@@ -253,6 +251,13 @@ fn compute_edit_distance_cutoff(
         }
     }
 
+    // If the best path we found still overshoots the caller's budget,
+    // return the sentinel so they can short-circuit. Memoizing `best`
+    // would also be wrong here — the same node pair might be visited
+    // later under a looser budget where the exact distance is needed.
+    if best > max_distance {
+        return DISTANCE_EXCEEDED;
+    }
     memo.insert(key, best);
     best
 }

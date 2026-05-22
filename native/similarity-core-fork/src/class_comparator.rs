@@ -228,8 +228,15 @@ fn calculate_structural_similarity(
 
     let mut leftovers_class1: Vec<&str> = Vec::new();
 
-    for (name, prop1) in &class1.properties {
-        if let Some(prop2) = class2.properties.get(name) {
+    // Iterate properties in name-sorted order so the strict pass behaves
+    // deterministically (the HashMap iteration order is randomised in
+    // Rust, and the greedy phase 2 below would otherwise produce
+    // different pairings on different runs of the same input).
+    let mut class1_property_names: Vec<&String> = class1.properties.keys().collect();
+    class1_property_names.sort();
+    for name in &class1_property_names {
+        let prop1 = &class1.properties[*name];
+        if let Some(prop2) = class2.properties.get(*name) {
             if prop1.type_annotation == prop2.type_annotation {
                 // Strict match — credit both class1 and class2 sides.
                 property_score += 2.0;
@@ -237,23 +244,26 @@ fn calculate_structural_similarity(
                 // Same name, different type — partial match.
                 property_score += 1.4;
                 property_type_mismatches.push(PropertyMismatch {
-                    name: name.clone(),
+                    name: (*name).to_string(),
                     type1: prop1.type_annotation.clone(),
                     type2: prop2.type_annotation.clone(),
                 });
             }
-            matched_in_class2.insert(name.clone());
+            matched_in_class2.insert((*name).to_string());
         } else {
             leftovers_class1.push(name.as_str());
         }
     }
 
-    let leftovers_class2: Vec<&str> = class2
+    let mut leftovers_class2: Vec<&str> = class2
         .properties
         .keys()
         .filter(|n| !matched_in_class2.contains(n.as_str()))
         .map(|n| n.as_str())
         .collect();
+    // Sorting both leftover lists makes the greedy match below produce
+    // the same pairings on every run for a given input.
+    leftovers_class2.sort();
 
     // Greedy best-match by type for the leftovers. This is N×M but class
     // properties are typically a handful so the quadratic factor is fine.
@@ -318,8 +328,13 @@ fn calculate_structural_similarity(
     let mut method_matched_in_class2: std::collections::HashSet<String> = Default::default();
     let mut method_leftovers_class1: Vec<&str> = Vec::new();
 
-    for (name, method1) in &class1.methods {
-        if let Some(method2) = class2.methods.get(name) {
+    // Same deterministic ordering as the property pass — see the comment
+    // there for why.
+    let mut class1_method_names: Vec<&String> = class1.methods.keys().collect();
+    class1_method_names.sort();
+    for name in &class1_method_names {
+        let method1 = &class1.methods[*name];
+        if let Some(method2) = class2.methods.get(*name) {
             let sig1 = format!("({}) => {}", method1.parameters.join(", "), method1.return_type);
             let sig2 = format!("({}) => {}", method2.parameters.join(", "), method2.return_type);
             if sig1 == sig2 {
@@ -327,23 +342,24 @@ fn calculate_structural_similarity(
             } else {
                 method_score += 1.4;
                 method_signature_mismatches.push(MethodMismatch {
-                    name: name.clone(),
+                    name: (*name).to_string(),
                     signature1: sig1,
                     signature2: sig2,
                 });
             }
-            method_matched_in_class2.insert(name.clone());
+            method_matched_in_class2.insert((*name).to_string());
         } else {
             method_leftovers_class1.push(name.as_str());
         }
     }
 
-    let method_leftovers_class2: Vec<&str> = class2
+    let mut method_leftovers_class2: Vec<&str> = class2
         .methods
         .keys()
         .filter(|n| !method_matched_in_class2.contains(n.as_str()))
         .map(|n| n.as_str())
         .collect();
+    method_leftovers_class2.sort();
 
     let mut method_leftover_consumed: std::collections::HashSet<String> = Default::default();
     for name1 in &method_leftovers_class1 {

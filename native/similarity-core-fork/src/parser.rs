@@ -466,9 +466,12 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
             Some(leaf(big.value.as_str(), "BigIntLiteral", id_counter))
         }
         Expression::RegExpLiteral(re) => {
-            // Encode the pattern text into the label so distinct regexes
-            // don't collide.
-            let label = format!("/{}/", re.regex.pattern.text.as_str());
+            // Encode both the pattern text and the flags into the label so
+            // distinct regexes don't collide. `/foo/i` (case-insensitive
+            // match) and `/foo/g` (global match) have meaningfully
+            // different runtime behaviour and shouldn't be treated as
+            // identical leaves.
+            let label = format!("/{}/{}", re.regex.pattern.text.as_str(), re.regex.flags);
             Some(leaf(&label, "RegExpLiteral", id_counter))
         }
         Expression::TemplateLiteral(tpl) => {

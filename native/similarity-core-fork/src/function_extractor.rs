@@ -492,7 +492,13 @@ fn compare_function_trees(
     // skipped entirely.
     let size1 = tree1.get_subtree_size() as f64;
     let size2 = tree2.get_subtree_size() as f64;
-    if size1 > 0.0 && size2 > 0.0 {
+    // Pre-filter by size ratio — but only when `size_penalty` is on. The
+    // post-APTED layer's size-ratio penalty is what makes very lopsided
+    // pairs scorable at most ~`sqrt(size_ratio)`, which is what justifies
+    // skipping them here. With size_penalty off the caller has explicitly
+    // opted out of that penalty and a low-distance match can legitimately
+    // score above threshold even on lopsided pairs, so we must keep going.
+    if options.size_penalty && size1 > 0.0 && size2 > 0.0 {
         let size_ratio = size1.min(size2) / size1.max(size2);
         if size_ratio < 0.5 && threshold > 0.5 {
             return Ok(0.0);
