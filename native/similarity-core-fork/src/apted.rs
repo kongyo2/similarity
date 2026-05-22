@@ -92,22 +92,32 @@ fn node_rename_cost(node1: &TreeNode, node2: &TreeNode, options: &APTEDOptions) 
     }
 }
 
-/// Maximum cost we allow a within-kind rename to charge. Capped below
-/// `delete + insert` so APTED never prefers delete-then-insert over a
-/// straight rename when the rename would otherwise be cheaper. The
-/// `.max(0.0)` guard keeps the cap non-negative for callers that pass
-/// very small `delete_cost`/`insert_cost` values — without it the cap
-/// could go negative and produce edit distances below zero, which
-/// would then normalise to similarity scores above 1.0 and break
-/// downstream thresholds and ranking.
+/// Maximum cost we allow a within-kind rename to charge.
+///
+/// The cap exists so APTED's optimal alignment never prefers a
+/// delete-then-insert over a straight rename when the rename would
+/// otherwise be cheaper — i.e. the cap stays strictly below
+/// `delete + insert`. A naive `delete + insert - 0.01` offset would
+/// collapse to zero for callers that configure very small per-op costs
+/// (e.g. `delete = insert = 0.005`), and a zero cap would make many
+/// non-identifier substitutions effectively free — distance would
+/// collapse and similarity would inflate well above the intended
+/// values. Use a multiplicative epsilon instead so the cap scales with
+/// the configured cost and stays positive as long as the sum is
+/// positive.
 fn within_kind_rename_cap(options: &APTEDOptions) -> f64 {
-    (options.delete_cost + options.insert_cost - 0.01).max(0.0)
+    cap_below_delete_plus_insert(options)
 }
 
 /// Same idea for cross-kind substitutions. Kept as a separate function
 /// so the intent reads clearly at the call sites.
 fn cross_kind_rename_cap(options: &APTEDOptions) -> f64 {
-    (options.delete_cost + options.insert_cost - 0.01).max(0.0)
+    cap_below_delete_plus_insert(options)
+}
+
+fn cap_below_delete_plus_insert(options: &APTEDOptions) -> f64 {
+    let sum = options.delete_cost + options.insert_cost;
+    (sum * 0.99).max(0.0)
 }
 
 #[must_use]

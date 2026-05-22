@@ -103,33 +103,62 @@ fn normalize_type(type_str: &str) -> String {
 ///
 /// `ClassMethod.parameters` is populated by the class extractor as a
 /// one-element `Vec<String>` containing the whole comma-separated
-/// parameter list (e.g. `["a: A, b: B"]`), so we have to split on `,`
-/// before stripping `name:` from each piece — otherwise a naive `find(':')`
-/// only removes the first parameter's name and the rest of the list keeps
-/// its identifier prefixes, which then defeats the renamed-method
-/// fast-path on any signature with two or more parameters.
+/// parameter list (e.g. `["a: A, b: B"]`). Splitting it requires
+/// brackets-aware handling because parameter types legitimately contain
+/// commas (`Map<string, number>`, tuples `[a, b]`, object literals,
+/// function types `(a, b) => c`); a naive `split(',')` would otherwise
+/// shred those types and break the rename-detection fast path.
+///
+/// Class-shaped tokens (CamelCase identifiers) get a placeholder both in
+/// parameter types AND in the return type — a method whose body
+/// references the surrounding class also exposes that class in its
+/// parameter signature, and we want renamed-class methods to match on
+/// either side.
 fn normalize_signature_for_fuzzy(method: &ClassMethod) -> String {
     let joined = method.parameters.join(", ");
     let stripped_params: Vec<String> = if joined.trim().is_empty() {
         Vec::new()
     } else {
-        joined
-            .split(',')
+        split_parameter_list(&joined)
+            .into_iter()
             .map(|piece| {
-                let trimmed = piece.trim();
-                if let Some(idx) = trimmed.find(':') {
-                    trimmed[idx + 1..].trim().to_string()
-                } else {
-                    trimmed.to_string()
-                }
+                let without_name = match piece.find(':') {
+                    Some(idx) => piece[idx + 1..].trim(),
+                    None => piece,
+                };
+                replace_camelcase_identifiers(without_name)
             })
             .collect()
     };
-    // Replace CamelCase identifiers in the return type with a placeholder so
-    // a method returning `UserBuilder` matches one returning `CustomerBuilder`
-    // when nothing else differs.
     let normalized_return = replace_camelcase_identifiers(&method.return_type);
     format!("({}) => {}", stripped_params.join(", "), normalized_return)
+}
+
+/// Split a parameter list on top-level commas, ignoring commas that sit
+/// inside `<>`, `()`, `[]` or `{}`. Returned slices are trimmed.
+fn split_parameter_list(input: &str) -> Vec<&str> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '<' | '(' | '[' | '{' => depth += 1,
+            '>' | ')' | ']' | '}' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => {
+                let piece = input[start..idx].trim();
+                if !piece.is_empty() {
+                    parts.push(piece);
+                }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
 }
 
 fn replace_camelcase_identifiers(input: &str) -> String {

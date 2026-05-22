@@ -327,21 +327,28 @@ pub fn detect_partial_overlaps(
         map
     };
 
-    // Multiplicity signal: count how many distinct source subtrees have at
-    // least one exact-hash match in the target. A single small match
-    // between two unrelated functions is likely coincidence (a shared
-    // 5-node `obj.method(arg)` shape), but many small matches between the
-    // same pair is itself a duplication signal — e.g. three identical
-    // `if (!user.email) throw new Error(...)` validation blocks that
-    // happen to differ only in the surrounding parameter name. We use
-    // this signal below to relax the tiny-match suppression when the
-    // aggregate-match density is high.
-    let candidate_match_count = source_natural
-        .iter()
-        .filter(|src| src.weight >= options.min_window_size)
-        .filter(|src| target_natural_by_hash.contains_key(&src.hash))
-        .count();
-    let strong_multiplicity_signal = candidate_match_count >= 5;
+    // Multiplicity signal: count how many DISTINCT source-subtree hashes
+    // have at least one exact-hash match in the target. A single small
+    // match between two unrelated functions is likely coincidence (a
+    // shared 5-node `obj.method(arg)` shape), but multiple distinct
+    // matching shapes between the same pair is itself a duplication
+    // signal — e.g. three different validation-block hashes that happen
+    // to recur across two endpoints' error-checking preludes.
+    //
+    // Counting distinct hashes rather than raw occurrences keeps this
+    // honest: a function that repeats the same trivial shape 50 times
+    // would otherwise inflate the count and disable suppression even
+    // though only one shape actually overlaps.
+    let mut distinct_match_hashes: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
+    for src in &source_natural {
+        if src.weight >= options.min_window_size
+            && target_natural_by_hash.contains_key(&src.hash)
+        {
+            distinct_match_hashes.insert(src.hash);
+        }
+    }
+    let strong_multiplicity_signal = distinct_match_hashes.len() >= 3;
 
     for src in &source_natural {
         if let Some(matches) = target_natural_by_hash.get(&src.hash) {
