@@ -326,6 +326,23 @@ pub fn detect_partial_overlaps(
         }
         map
     };
+
+    // Multiplicity signal: count how many distinct source subtrees have at
+    // least one exact-hash match in the target. A single small match
+    // between two unrelated functions is likely coincidence (a shared
+    // 5-node `obj.method(arg)` shape), but many small matches between the
+    // same pair is itself a duplication signal — e.g. three identical
+    // `if (!user.email) throw new Error(...)` validation blocks that
+    // happen to differ only in the surrounding parameter name. We use
+    // this signal below to relax the tiny-match suppression when the
+    // aggregate-match density is high.
+    let candidate_match_count = source_natural
+        .iter()
+        .filter(|src| src.weight >= options.min_window_size)
+        .filter(|src| target_natural_by_hash.contains_key(&src.hash))
+        .count();
+    let strong_multiplicity_signal = candidate_match_count >= 5;
+
     for src in &source_natural {
         if let Some(matches) = target_natural_by_hash.get(&src.hash) {
             for tgt in matches {
@@ -334,20 +351,16 @@ pub fn detect_partial_overlaps(
                 if src.weight < options.min_window_size {
                     continue;
                 }
-                // For very small subtrees, suppress only when the enclosing
-                // functions are LARGE enough that the matched fragment is
-                // unlikely to represent the meaningful refactoring signal.
-                // Small functions (~30 nodes) might genuinely share a
-                // 5-node validation block as their primary duplicate
-                // pattern, so the coverage gate kicks in only when the
-                // smaller function is ≥ 80 nodes.
+                // Tiny-subtree suppression. Aligned with the windowed
+                // pass when there's no multiplicity signal, relaxed when
+                // many small matches exist between the same pair.
                 if src.weight < 8 {
                     let source_total = source_func.root_fingerprint.weight.max(1);
                     let target_total = target_func.root_fingerprint.weight.max(1);
                     let smaller_total = source_total.min(target_total);
-                    if smaller_total >= 80 {
+                    if smaller_total >= 30 && !strong_multiplicity_signal {
                         let coverage = src.weight as f64 / smaller_total as f64;
-                        if coverage < 0.15 {
+                        if coverage < 0.25 {
                             continue;
                         }
                     }

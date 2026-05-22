@@ -331,11 +331,52 @@ fn for_statement_left_to_tree_node(
         ForStatementLeft::VariableDeclaration(var_decl) => {
             variable_declaration_to_tree_node(var_decl, id_counter)
         }
-        _ => {
-            // AssignmentTarget — keep a leaf node that names the role rather
-            // than synthesizing a fake expression tree.
-            Some(leaf("ForStatementLeft", "ForStatementLeft", id_counter))
+        // `ForStatementLeft` inherits every `AssignmentTarget` variant, so we
+        // route them through the same shape-preserving handlers used for
+        // assignments elsewhere. Otherwise `for (x of xs)` and
+        // `for (obj.prop of xs)` would collapse onto the same generic leaf
+        // and the parser-level distinction we get for assignments would be
+        // lost the moment they appeared in a loop head.
+        ForStatementLeft::AssignmentTargetIdentifier(ident) => {
+            Some(leaf(ident.name.as_str(), "Identifier", id_counter))
         }
+        ForStatementLeft::StaticMemberExpression(mem) => {
+            let mut node = make_node(".", "StaticMemberExpression", id_counter);
+            if let Some(obj_node) = expression_to_tree_node(&mem.object, id_counter) {
+                node.add_child(obj_node);
+            }
+            node.add_child(leaf(mem.property.name.as_str(), "Identifier", id_counter));
+            Some(Rc::new(node))
+        }
+        ForStatementLeft::ComputedMemberExpression(mem) => {
+            let mut node = make_node("[]", "ComputedMemberExpression", id_counter);
+            if let Some(obj_node) = expression_to_tree_node(&mem.object, id_counter) {
+                node.add_child(obj_node);
+            }
+            if let Some(prop_node) = expression_to_tree_node(&mem.expression, id_counter) {
+                node.add_child(prop_node);
+            }
+            Some(Rc::new(node))
+        }
+        ForStatementLeft::PrivateFieldExpression(mem) => {
+            let mut node = make_node(".#", "PrivateFieldExpression", id_counter);
+            if let Some(obj_node) = expression_to_tree_node(&mem.object, id_counter) {
+                node.add_child(obj_node);
+            }
+            node.add_child(leaf(
+                &format!("#{}", mem.field.name.as_str()),
+                "PrivateIdentifier",
+                id_counter,
+            ));
+            Some(Rc::new(node))
+        }
+        ForStatementLeft::ArrayAssignmentTarget(_) => {
+            Some(leaf("ArrayAssignmentTarget", "ArrayAssignmentTarget", id_counter))
+        }
+        ForStatementLeft::ObjectAssignmentTarget(_) => {
+            Some(leaf("ObjectAssignmentTarget", "ObjectAssignmentTarget", id_counter))
+        }
+        _ => Some(leaf("ForStatementLeft", "ForStatementLeft", id_counter)),
     }
 }
 

@@ -492,15 +492,19 @@ fn compare_function_trees(
     // skipped entirely.
     let size1 = tree1.get_subtree_size() as f64;
     let size2 = tree2.get_subtree_size() as f64;
-    // Pre-filter by size ratio — but only when `size_penalty` is on. The
-    // post-APTED layer's size-ratio penalty is what makes very lopsided
-    // pairs scorable at most ~`sqrt(size_ratio)`, which is what justifies
-    // skipping them here. With size_penalty off the caller has explicitly
-    // opted out of that penalty and a low-distance match can legitimately
-    // score above threshold even on lopsided pairs, so we must keep going.
-    if options.size_penalty && size1 > 0.0 && size2 > 0.0 {
+    // Pre-filter by size ratio. APTED's edit distance is at minimum
+    // `|size1 - size2|` (one tree has to consume the size gap via
+    // deletes or inserts), so the base TSED is bounded above by
+    // `1 - |size1 - size2| / max_size = size_ratio`. Every penalty
+    // applied afterwards can only reduce the score, so we can safely
+    // skip the APTED run when `size_ratio < threshold` — the pair
+    // cannot reach the user's threshold no matter what the tree
+    // contents look like. This bound holds for both `size_penalty`
+    // modes (the post-penalty layer only divides further), so no
+    // toggle is required.
+    if threshold > 0.0 && size1 > 0.0 && size2 > 0.0 {
         let size_ratio = size1.min(size2) / size1.max(size2);
-        if size_ratio < 0.5 && threshold > 0.5 {
+        if size_ratio < threshold {
             return Ok(0.0);
         }
     }
