@@ -1,5 +1,5 @@
 use oxc_ast::ast::*;
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 
 use crate::ignore_directive::has_similarity_ignore_directive;
 use crate::parser::parse_and_convert_to_tree;
@@ -65,6 +65,13 @@ pub struct FunctionDefinition {
     /// Method kind: `Normal`, `Getter`, or `Setter`. For functions,
     /// arrows, and constructors this is always `Normal`.
     pub method_kind: MethodKind,
+    /// The exact source text of the method key (`"alpha"`, `#load`,
+    /// `[Symbol.iterator]`, …) or, for functions and arrows, the
+    /// declaration name. Used in the normalization wrapper so a
+    /// `static "alpha"()` and a `static "beta"()` do not collapse onto
+    /// the same `anonymous` placeholder the simple `name` field uses.
+    /// Falls back to `name` when the underlying span can't be recovered.
+    pub display_name: String,
     pub start_line: u32,
     pub end_line: u32,
     pub class_name: Option<String>,
@@ -112,6 +119,24 @@ pub enum MethodKind {
     Normal,
     Getter,
     Setter,
+}
+
+/// Best-effort source text for a method key. For static identifiers and
+/// private identifiers we already have a clean string form on the AST node,
+/// but for string literals, numeric literals, and computed expressions the
+/// original key text (e.g. `"alpha"`, `[Symbol.iterator]`) is the only
+/// signal that survives into the normalization wrapper. Returns `None`
+/// when the span is empty or out of bounds so callers fall back to the
+/// existing name.
+fn method_key_source_text(key: &PropertyKey, source: &str) -> Option<String> {
+    let span = key.span();
+    let s = span.start as usize;
+    let e = span.end as usize;
+    if s < e && e <= source.len() {
+        Some(source[s..e].to_string())
+    } else {
+        None
+    }
 }
 
 /// Extract all functions from TypeScript/JavaScript code
@@ -178,6 +203,7 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     is_generator: func.generator,
                     is_static: false,
                     method_kind: MethodKind::Normal,
+                    display_name: func_name.clone(),
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -222,6 +248,15 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                         MethodDefinitionKind::Set => MethodKind::Setter,
                         _ => MethodKind::Normal,
                     };
+                    // Capture the original source text of the method key so
+                    // string/number literal and computed keys (which the
+                    // simple `method_name` resolver flattens to
+                    // `"anonymous"`) still differentiate during
+                    // comparison, and so private `#name` methods survive
+                    // the normalization wrapper instead of collapsing onto
+                    // a `__sim__` placeholder.
+                    let method_display_name = method_key_source_text(&method.key, ctx.source_text)
+                        .unwrap_or_else(|| method_name.clone());
 
                     let method_full_name = if let Some(ref class) = class_name {
                         format!("{class}.{method_name}")
@@ -247,6 +282,7 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                         is_generator: method.value.generator,
                         is_static: method.r#static,
                         method_kind,
+                        display_name: method_display_name.clone(),
                         start_line,
                         end_line: get_line_number(method.span.end, ctx.source_text),
                         class_name: class_name.clone(),
@@ -289,6 +325,7 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                             is_generator: false,
                             is_static: false,
                             method_kind: MethodKind::Normal,
+                            display_name: arrow_name.clone(),
                             start_line,
                             end_line: get_line_number(arrow.span.end, ctx.source_text),
                             class_name: None,
@@ -338,6 +375,7 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     is_generator: func.generator,
                     is_static: false,
                     method_kind: MethodKind::Normal,
+                    display_name: func_name.clone(),
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -381,6 +419,7 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                     is_generator: func.generator,
                     is_static: false,
                     method_kind: MethodKind::Normal,
+                    display_name: func_name.clone(),
                     start_line,
                     end_line: get_line_number(func.span.end, ctx.source_text),
                     class_name: None,
@@ -425,6 +464,15 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                         MethodDefinitionKind::Set => MethodKind::Setter,
                         _ => MethodKind::Normal,
                     };
+                    // Capture the original source text of the method key so
+                    // string/number literal and computed keys (which the
+                    // simple `method_name` resolver flattens to
+                    // `"anonymous"`) still differentiate during
+                    // comparison, and so private `#name` methods survive
+                    // the normalization wrapper instead of collapsing onto
+                    // a `__sim__` placeholder.
+                    let method_display_name = method_key_source_text(&method.key, ctx.source_text)
+                        .unwrap_or_else(|| method_name.clone());
 
                     let method_full_name = if let Some(ref class) = class_name {
                         format!("{class}.{method_name}")
@@ -450,6 +498,7 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                         is_generator: method.value.generator,
                         is_static: method.r#static,
                         method_kind,
+                        display_name: method_display_name.clone(),
                         start_line,
                         end_line: get_line_number(method.span.end, ctx.source_text),
                         class_name: class_name.clone(),
@@ -492,6 +541,7 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                             is_generator: false,
                             is_static: false,
                             method_kind: MethodKind::Normal,
+                            display_name: arrow_name.clone(),
                             start_line,
                             end_line: get_line_number(arrow.span.end, ctx.source_text),
                             class_name: None,
@@ -723,16 +773,6 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
         }
     };
 
-    // Preserve the original function name in the wrapper so two functions
-    // with distinct names still differ at the FunctionDeclaration label
-    // level. Using a fixed `__sim__` name was tempting but it erased one
-    // of APTED's cheaper-but-still-useful rename signals and caused
-    // semantically-different functions (different intent, same shape) to
-    // creep over the similarity threshold. Falling back to `__sim__` when
-    // the source name isn't a valid identifier keeps the wrapper
-    // syntactically valid.
-    let name_text = sanitize_function_name(&func.name);
-
     let body_text = safe_slice(func.body_block_span.start, func.body_block_span.end);
 
     match func.function_type {
@@ -758,9 +798,20 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
                     }
                 }
             }
+            // Methods use `display_name` directly: it already carries the
+            // exact source text of the key (`"alpha"`, `#load`,
+            // `[Symbol.iterator]`, …), all of which are syntactically valid
+            // inside a class body, so no sanitization is needed. The
+            // sanitizer used for top-level functions would otherwise reject
+            // these forms and collapse distinct methods onto `__sim__`.
+            let method_name_text = if func.display_name.is_empty() {
+                "__sim__".to_string()
+            } else {
+                func.display_name.clone()
+            };
             format!(
                 "class __C__ {{ {}{}{} {} }}",
-                prefix, name_text, params_text, body_text
+                prefix, method_name_text, params_text, body_text
             )
         }
         FunctionType::Function | FunctionType::Arrow => {
@@ -778,6 +829,10 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
                 prefix.push('*');
             }
 
+            // Top-level functions and arrow declarations always bind to
+            // an ordinary identifier, so the sanitizer is enough — there
+            // is no private-method / string-literal-key path here.
+            let name_text = sanitize_function_name(&func.name);
             if func.is_arrow_expression {
                 // Wrap a single-expression arrow body in an explicit
                 // `return` so it ends up shaped like a block-bodied

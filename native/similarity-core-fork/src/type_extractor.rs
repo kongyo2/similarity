@@ -54,41 +54,123 @@ fn ts_type_span(ts_type: &TSType) -> (u32, u32) {
 }
 
 /// Collapse runs of whitespace down to a single space, but leave whitespace
-/// inside string literals (`"…"`, `'…'`) and template literals (`` `…` ``)
-/// untouched. Pure `split_whitespace().join(" ")` would equate
-/// `type A = "a b"` with `type A = "a  b"` (different cooked string values)
-/// because it doesn't respect literal boundaries, so we walk the bytes by
-/// hand and only collapse outside quoted regions. Escape sequences (`\"`,
-/// `\\`, …) inside strings are also preserved verbatim.
+/// inside string and template literals untouched. Pure
+/// `split_whitespace().join(" ")` would equate `type A = "a b"` with
+/// `type A = "a  b"` (different cooked string values) because it ignores
+/// literal boundaries, so we walk the bytes by hand and only collapse
+/// outside quoted regions.
+///
+/// Behavior notes:
+/// * Single- and double-quoted strings preserve every byte verbatim,
+///   honoring `\"`, `\\`, … escapes.
+/// * Backtick template literals preserve whitespace inside the literal
+///   sections but collapse whitespace inside `${...}` interpolations,
+///   because a template type's interpolated expression is a normal type
+///   expression where formatting shouldn't change identity.
+/// * Line (`// …`) and block (`/* … */`) comments are dropped and
+///   replaced with a single space, so a comment-only edit doesn't
+///   register as a body-signature difference.
 fn collapse_whitespace_outside_strings(text: &str) -> String {
+    enum Mode {
+        Code,
+        // Single / double quoted string: collapse nothing inside.
+        QuotedString(char),
+        // Template literal text segment between backticks (outside any
+        // `${...}` interpolation): preserve whitespace.
+        TemplateText,
+        // Template literal expression: collapse whitespace, with a depth
+        // counter so nested braces don't end the interpolation prematurely.
+        TemplateExpr(u32),
+    }
+
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
-    let mut quote: Option<char> = None;
+    // Stack so a template inside `${...}` inside another template is
+    // tracked correctly. The bottom of the stack is always `Code`.
+    let mut stack: Vec<Mode> = vec![Mode::Code];
     let mut last_was_space = false;
 
     while let Some(ch) = chars.next() {
-        match quote {
-            Some(q) => {
+        let top = stack.last_mut().expect("stack always has at least one mode");
+        match top {
+            Mode::QuotedString(q) => {
                 out.push(ch);
                 if ch == '\\' {
                     if let Some(next) = chars.next() {
                         out.push(next);
                     }
-                } else if ch == q {
-                    quote = None;
+                } else if ch == *q {
+                    stack.pop();
                 }
                 last_was_space = false;
             }
-            None => {
-                if ch == '"' || ch == '\'' || ch == '`' {
-                    quote = Some(ch);
+            Mode::TemplateText => {
+                out.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                } else if ch == '`' {
+                    stack.pop();
+                } else if ch == '$' && chars.peek() == Some(&'{') {
+                    let brace = chars.next().unwrap();
+                    out.push(brace);
+                    stack.push(Mode::TemplateExpr(1));
+                }
+                last_was_space = false;
+            }
+            Mode::TemplateExpr(depth) => {
+                if ch == '{' {
+                    *depth += 1;
                     out.push(ch);
                     last_was_space = false;
-                } else if ch.is_whitespace() {
-                    if !last_was_space && !out.is_empty() {
-                        out.push(' ');
-                        last_was_space = true;
+                } else if ch == '}' {
+                    *depth -= 1;
+                    if *depth == 0 {
+                        stack.pop();
                     }
+                    out.push(ch);
+                    last_was_space = false;
+                } else if ch == '"' || ch == '\'' {
+                    out.push(ch);
+                    stack.push(Mode::QuotedString(ch));
+                    last_was_space = false;
+                } else if ch == '`' {
+                    out.push(ch);
+                    stack.push(Mode::TemplateText);
+                    last_was_space = false;
+                } else if ch == '/' && chars.peek() == Some(&'/') {
+                    consume_line_comment(&mut chars);
+                    push_space_if_needed(&mut out, &mut last_was_space);
+                } else if ch == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    consume_block_comment(&mut chars);
+                    push_space_if_needed(&mut out, &mut last_was_space);
+                } else if ch.is_whitespace() {
+                    push_space_if_needed(&mut out, &mut last_was_space);
+                } else {
+                    out.push(ch);
+                    last_was_space = false;
+                }
+            }
+            Mode::Code => {
+                if ch == '"' || ch == '\'' {
+                    out.push(ch);
+                    stack.push(Mode::QuotedString(ch));
+                    last_was_space = false;
+                } else if ch == '`' {
+                    out.push(ch);
+                    stack.push(Mode::TemplateText);
+                    last_was_space = false;
+                } else if ch == '/' && chars.peek() == Some(&'/') {
+                    consume_line_comment(&mut chars);
+                    push_space_if_needed(&mut out, &mut last_was_space);
+                } else if ch == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    consume_block_comment(&mut chars);
+                    push_space_if_needed(&mut out, &mut last_was_space);
+                } else if ch.is_whitespace() {
+                    push_space_if_needed(&mut out, &mut last_was_space);
                 } else {
                     out.push(ch);
                     last_was_space = false;
@@ -102,6 +184,39 @@ fn collapse_whitespace_outside_strings(text: &str) -> String {
     }
 
     out
+}
+
+fn consume_line_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    // Already past the first `/`; consume the second `/` and everything up
+    // to the next newline (exclusive — the newline gets folded by the
+    // caller's whitespace handling).
+    chars.next();
+    while let Some(&next) = chars.peek() {
+        if next == '\n' {
+            break;
+        }
+        chars.next();
+    }
+}
+
+fn consume_block_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    // Already past `/`; the `*` is consumed by the caller. Walk forward
+    // until we see `*/`. Unterminated comments fall through to EOF — we
+    // never look past `text` so the worst case is dropping the trailing
+    // partial comment, which matches typical formatter behavior.
+    while let Some(c) = chars.next() {
+        if c == '*' && chars.peek() == Some(&'/') {
+            chars.next();
+            break;
+        }
+    }
+}
+
+fn push_space_if_needed(out: &mut String, last_was_space: &mut bool) {
+    if !*last_was_space && !out.is_empty() {
+        out.push(' ');
+        *last_was_space = true;
+    }
 }
 use std::collections::HashMap;
 
@@ -559,10 +674,27 @@ impl TypeExtractor {
                 }
             }
             Statement::ExportDefaultDeclaration(export) => {
-                if let oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(func) =
-                    &export.declaration
-                {
-                    self.extract_from_function(func, type_literals);
+                // Default-exported function declarations were already
+                // unwrapped, but `export default (arg: { id: string }) => ...`
+                // and `export default function (arg: { id: string }) {...}`
+                // are expression forms that fell through the old match arm
+                // and skipped type-literal extraction. Route any expression
+                // default-export through the initializer walker so its
+                // parameters, body, and return type still feed the
+                // comparison pool.
+                match &export.declaration {
+                    oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+                        self.extract_from_function(func, type_literals);
+                    }
+                    other => {
+                        if let Some(expr) = other.as_expression() {
+                            self.extract_type_literals_from_initializer(
+                                expr,
+                                "default",
+                                type_literals,
+                            );
+                        }
+                    }
                 }
             }
             _ => {}
@@ -699,6 +831,21 @@ impl TypeExtractor {
                 }
             }
             Expression::FunctionExpression(func) => {
+                // Function expressions assigned to a variable carry the
+                // same shape information as a function declaration: an
+                // explicit return type literal (`function (): { id: string }
+                // { ... }`) needs to feed the comparison pool too. The
+                // arrow form already did this through its return type, so
+                // catching it here keeps arrow and function-expression
+                // coverage symmetric.
+                if let Some(return_type) = &func.return_type {
+                    if let Some(type_literal) = self.extract_type_literal_from_ts_type(
+                        &return_type.type_annotation,
+                        TypeLiteralContext::FunctionReturn(var_name.to_string()),
+                    ) {
+                        type_literals.push(type_literal);
+                    }
+                }
                 for param in &func.params.items {
                     if let Some(param_name) = self.get_parameter_name(param) {
                         if let Some(type_annotation) = &param.type_annotation {
