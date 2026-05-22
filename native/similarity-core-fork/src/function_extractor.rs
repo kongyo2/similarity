@@ -492,20 +492,29 @@ fn compare_function_trees(
     // skipped entirely.
     let size1 = tree1.get_subtree_size() as f64;
     let size2 = tree2.get_subtree_size() as f64;
-    // Pre-filter by size ratio. APTED's edit distance is at minimum
-    // `|size1 - size2|` (one tree has to consume the size gap via
-    // deletes or inserts), so the base TSED is bounded above by
-    // `1 - |size1 - size2| / max_size = size_ratio`. Every penalty
-    // applied afterwards can only reduce the score, so we can safely
-    // skip the APTED run when `size_ratio < threshold` — the pair
-    // cannot reach the user's threshold no matter what the tree
-    // contents look like. This bound holds for both `size_penalty`
-    // modes (the post-penalty layer only divides further), so no
-    // toggle is required.
+    // Pre-filter by size ratio. APTED's minimum edit distance is at least
+    // `|size1 - size2| * min(delete_cost, insert_cost)` (one tree has to
+    // consume the size gap via deletes or inserts at that per-op rate),
+    // so the base TSED is bounded above by
+    //   `1 - |size1 - size2| * min_op_cost / max_size`.
+    // When `delete_cost = insert_cost = 1.0` (the only configuration the
+    // WASM CLI ever sets and the documented default) this collapses to
+    // `size_ratio`, which gives us a clean `size_ratio < threshold` gate.
+    //
+    // Direct callers can override `apted_options` though, and with
+    // smaller per-op costs the bound is looser — pairs that the simple
+    // `size_ratio` formula would discard might still legitimately clear
+    // the threshold. Skip the prune entirely in that case rather than
+    // attempt a more elaborate bound; the threshold-aware APTED cutoff
+    // below still keeps the worst case bounded.
     if threshold > 0.0 && size1 > 0.0 && size2 > 0.0 {
-        let size_ratio = size1.min(size2) / size1.max(size2);
-        if size_ratio < threshold {
-            return Ok(0.0);
+        let delete_cost = options.apted_options.delete_cost;
+        let insert_cost = options.apted_options.insert_cost;
+        if delete_cost >= 1.0 && insert_cost >= 1.0 {
+            let size_ratio = size1.min(size2) / size1.max(size2);
+            if size_ratio < threshold {
+                return Ok(0.0);
+            }
         }
     }
 

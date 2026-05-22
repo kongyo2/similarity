@@ -100,18 +100,31 @@ fn normalize_type(type_str: &str) -> String {
 /// Strip parameter names and class-shaped tokens so two methods that have
 /// the same structural signature but sit in renamed classes can still be
 /// recognised as matching. Used only by the fuzzy method-pairing pass.
+///
+/// `ClassMethod.parameters` is populated by the class extractor as a
+/// one-element `Vec<String>` containing the whole comma-separated
+/// parameter list (e.g. `["a: A, b: B"]`), so we have to split on `,`
+/// before stripping `name:` from each piece — otherwise a naive `find(':')`
+/// only removes the first parameter's name and the rest of the list keeps
+/// its identifier prefixes, which then defeats the renamed-method
+/// fast-path on any signature with two or more parameters.
 fn normalize_signature_for_fuzzy(method: &ClassMethod) -> String {
-    let stripped_params: Vec<String> = method
-        .parameters
-        .iter()
-        .map(|p| {
-            if let Some(idx) = p.find(':') {
-                p[idx + 1..].trim().to_string()
-            } else {
-                p.clone()
-            }
-        })
-        .collect();
+    let joined = method.parameters.join(", ");
+    let stripped_params: Vec<String> = if joined.trim().is_empty() {
+        Vec::new()
+    } else {
+        joined
+            .split(',')
+            .map(|piece| {
+                let trimmed = piece.trim();
+                if let Some(idx) = trimmed.find(':') {
+                    trimmed[idx + 1..].trim().to_string()
+                } else {
+                    trimmed.to_string()
+                }
+            })
+            .collect()
+    };
     // Replace CamelCase identifiers in the return type with a placeholder so
     // a method returning `UserBuilder` matches one returning `CustomerBuilder`
     // when nothing else differs.

@@ -85,11 +85,29 @@ fn node_rename_cost(node1: &TreeNode, node2: &TreeNode, options: &APTEDOptions) 
         if is_identifier_like_kind(&node1.value) {
             options.rename_cost
         } else {
-            (options.rename_cost * 2.0).min(options.delete_cost + options.insert_cost - 0.01)
+            (options.rename_cost * 2.0).min(within_kind_rename_cap(options))
         }
     } else {
-        (options.rename_cost * 3.0).min(options.delete_cost + options.insert_cost - 0.01)
+        (options.rename_cost * 3.0).min(cross_kind_rename_cap(options))
     }
+}
+
+/// Maximum cost we allow a within-kind rename to charge. Capped below
+/// `delete + insert` so APTED never prefers delete-then-insert over a
+/// straight rename when the rename would otherwise be cheaper. The
+/// `.max(0.0)` guard keeps the cap non-negative for callers that pass
+/// very small `delete_cost`/`insert_cost` values — without it the cap
+/// could go negative and produce edit distances below zero, which
+/// would then normalise to similarity scores above 1.0 and break
+/// downstream thresholds and ranking.
+fn within_kind_rename_cap(options: &APTEDOptions) -> f64 {
+    (options.delete_cost + options.insert_cost - 0.01).max(0.0)
+}
+
+/// Same idea for cross-kind substitutions. Kept as a separate function
+/// so the intent reads clearly at the call sites.
+fn cross_kind_rename_cap(options: &APTEDOptions) -> f64 {
+    (options.delete_cost + options.insert_cost - 0.01).max(0.0)
 }
 
 #[must_use]
