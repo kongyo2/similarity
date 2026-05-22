@@ -1,6 +1,6 @@
 {
   "name": "@kongyo2/similarity-ts",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "CLI and library for TypeScript code similarity analysis",
   "type": "module",
   "bin": {

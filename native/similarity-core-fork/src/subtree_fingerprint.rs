@@ -303,6 +303,91 @@ pub fn detect_partial_overlaps(
     #[cfg(test)]
     eprintln!("Bloom filter passed for {} vs {}", source_func.name, target_func.name);
 
+    // Pass 1: natural subtree × natural subtree.
+    //
+    // The window-based pass below is good at finding non-aligned matches
+    // (code that appears at different positions in two functions), but
+    // it never produces exact-hash matches because window fingerprints
+    // are hashed-of-hashes while natural subtree fingerprints are
+    // hashed-from-the-AST — different inputs even for identical code.
+    // So we explicitly compare natural subtrees against natural subtrees
+    // first: this is the path that detects "the same `if (!x) throw` block
+    // appears in both functions" with similarity 1.0, which the windowed
+    // pass would otherwise reduce to a Jaccard estimate that rarely tops
+    // 0.7 on small blocks.
+    let min_natural = options.min_window_size;
+    let max_natural = options.max_window_size;
+    let source_natural = source_func.get_subtrees_in_size_range(min_natural, max_natural);
+    let target_natural_by_hash: std::collections::HashMap<u64, Vec<&SubtreeFingerprint>> = {
+        let mut map: std::collections::HashMap<u64, Vec<&SubtreeFingerprint>> =
+            std::collections::HashMap::new();
+        for fp in target_func.get_subtrees_in_size_range(min_natural, max_natural) {
+            map.entry(fp.hash).or_default().push(fp);
+        }
+        map
+    };
+
+    // Multiplicity signal: count how many DISTINCT source-subtree hashes
+    // have at least one exact-hash match in the target. A single small
+    // match between two unrelated functions is likely coincidence (a
+    // shared 5-node `obj.method(arg)` shape), but multiple distinct
+    // matching shapes between the same pair is itself a duplication
+    // signal — e.g. three different validation-block hashes that happen
+    // to recur across two endpoints' error-checking preludes.
+    //
+    // Counting distinct hashes rather than raw occurrences keeps this
+    // honest: a function that repeats the same trivial shape 50 times
+    // would otherwise inflate the count and disable suppression even
+    // though only one shape actually overlaps.
+    let mut distinct_match_hashes: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
+    for src in &source_natural {
+        if src.weight >= options.min_window_size
+            && target_natural_by_hash.contains_key(&src.hash)
+        {
+            distinct_match_hashes.insert(src.hash);
+        }
+    }
+    let strong_multiplicity_signal = distinct_match_hashes.len() >= 3;
+
+    for src in &source_natural {
+        if let Some(matches) = target_natural_by_hash.get(&src.hash) {
+            for tgt in matches {
+                // Respect the user's min_window_size — they explicitly asked
+                // to look for matches at that granularity.
+                if src.weight < options.min_window_size {
+                    continue;
+                }
+                // Tiny-subtree suppression. Aligned with the windowed
+                // pass when there's no multiplicity signal, relaxed when
+                // many small matches exist between the same pair.
+                if src.weight < 8 {
+                    let source_total = source_func.root_fingerprint.weight.max(1);
+                    let target_total = target_func.root_fingerprint.weight.max(1);
+                    let smaller_total = source_total.min(target_total);
+                    if smaller_total >= 30 && !strong_multiplicity_signal {
+                        let coverage = src.weight as f64 / smaller_total as f64;
+                        if coverage < 0.25 {
+                            continue;
+                        }
+                    }
+                }
+                overlaps.push(PartialOverlap {
+                    source_function: source_func.name.clone(),
+                    target_function: target_func.name.clone(),
+                    source_lines: (source_func.start_line, source_func.end_line),
+                    target_lines: (target_func.start_line, target_func.end_line),
+                    similarity: 1.0,
+                    node_count: src.weight,
+                    node_type: tgt.node_type.clone(),
+                });
+            }
+        }
+    }
+
+    // Pass 2: window × natural subtree (the original algorithm). This
+    // catches matches where the duplicated stretch doesn't start at a
+    // single natural subtree boundary on the source side.
     // For each window size
     for window_size in options.min_window_size..=options.max_window_size {
         // Get source windows

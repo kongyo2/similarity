@@ -1,4 +1,6 @@
-use crate::apted::{compute_edit_distance, APTEDOptions};
+use crate::apted::{
+    compute_edit_distance, compute_edit_distance_with_cutoff, APTEDOptions, DISTANCE_EXCEEDED,
+};
 use crate::tree::TreeNode;
 use std::rc::Rc;
 
@@ -30,85 +32,144 @@ impl Default for TSEDOptions {
 
 /// Calculate TSED (Tree Structure Edit Distance) similarity between two trees
 /// Returns a value between 0.0 and 1.0, where 1.0 means identical
+///
+/// # Penalty design
+///
+/// The raw `1 - distance / max_size` is a structural similarity, but for
+/// refactoring use the raw number is misleading on short functions: two
+/// trivial 1-liners differing only in operator will read as ~0.95 even
+/// though they share no real refactoring opportunity. The penalty layer
+/// below shapes the score so that:
+///
+/// * trivial trees (`max_size < 8`) with any structural distance get a
+///   strong discount (case `() => a+b` vs `() => a-b` should not register
+///   at default 0.85 threshold)
+/// * short functions (10–30 nodes) get a softener that's mostly waived
+///   when the edit distance is small (rename-only refactor between two
+///   ~5-line helpers should still surface) and reapplied when distance
+///   is meaningful (operator/shape change in a short loop body should
+///   pull the score back down)
+/// * functions ≥30 nodes pay no short-function penalty — APTED's
+///   normalized distance is already well-calibrated there.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn calculate_tsed(tree1: &Rc<TreeNode>, tree2: &Rc<TreeNode>, options: &TSEDOptions) -> f64 {
     let distance = compute_edit_distance(tree1, tree2, &options.apted_options);
-
     let size1 = tree1.get_subtree_size() as f64;
     let size2 = tree2.get_subtree_size() as f64;
+    finalize_tsed_similarity(distance, size1, size2, options)
+}
 
-    // TSED normalization: Use the larger tree size
-    // This ensures that when comparing trees of different sizes,
-    // the similarity reflects how much of the larger tree matches
+/// Variant of [`calculate_tsed`] that aborts early when the maximum
+/// achievable similarity is provably below `threshold`. Returns `0.0` in
+/// that case. When the budget isn't exceeded the result is the same as
+/// `calculate_tsed` to within floating-point noise — so this is purely a
+/// performance hint with no accuracy impact.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn calculate_tsed_with_threshold(
+    tree1: &Rc<TreeNode>,
+    tree2: &Rc<TreeNode>,
+    options: &TSEDOptions,
+    threshold: f64,
+) -> f64 {
+    let size1 = tree1.get_subtree_size() as f64;
+    let size2 = tree2.get_subtree_size() as f64;
     let max_size = size1.max(size2);
+    if max_size == 0.0 {
+        return 1.0;
+    }
+    // Maximum APTED distance that could still yield similarity ≥ threshold:
+    //   similarity = 1 - distance / max_size ≥ threshold
+    //   ⇒ distance ≤ max_size × (1 − threshold)
+    // The penalty layer can only further reduce the similarity, so any
+    // distance beyond this guarantees the final score will fall below
+    // `threshold`. Add a tiny epsilon so the cutoff doesn't reject the
+    // borderline case where distance is exactly on the boundary.
+    let max_distance = (max_size * (1.0 - threshold) + 1e-9).max(0.0);
 
-    // Calculate base TSED similarity
-    let tsed_similarity = if max_size > 0.0 { (1.0 - distance / max_size).max(0.0) } else { 1.0 };
+    let distance =
+        compute_edit_distance_with_cutoff(tree1, tree2, &options.apted_options, max_distance);
+    if distance >= DISTANCE_EXCEEDED {
+        return 0.0;
+    }
+    finalize_tsed_similarity(distance, size1, size2, options)
+}
 
-    // If distance is 0 but trees have different sizes, check more carefully
-    // This can happen when compare_values is false and structure is similar
+/// Shared core of the size/penalty layer used by both `calculate_tsed` and
+/// `calculate_tsed_with_threshold`. Keeping this single source of truth
+/// matters because the penalty profile is calibrated against the test
+/// suite and any drift between the two paths would silently corrupt the
+/// threshold-based fast path.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn finalize_tsed_similarity(
+    distance: f64,
+    size1: f64,
+    size2: f64,
+    options: &TSEDOptions,
+) -> f64 {
+    let max_size = size1.max(size2);
+    let tsed_similarity =
+        if max_size > 0.0 { (1.0 - distance / max_size).max(0.0) } else { 1.0 };
+
     let tsed_similarity = if distance == 0.0 && size1 != size2 {
         let size_ratio = size1.min(size2) / size1.max(size2);
         let size_diff = (size1 - size2).abs();
-
-        // Apply penalty based on both ratio and absolute difference
         if size_diff > 10.0 {
-            // Strong penalty for large absolute differences
             tsed_similarity * 0.5
         } else if size_ratio < 0.95 || size_diff > 3.0 {
-            // Moderate penalty for noticeable differences
             tsed_similarity * size_ratio.powf(0.5)
         } else {
-            tsed_similarity // Very minor differences are OK
+            tsed_similarity
         }
     } else {
         tsed_similarity
     };
 
-    // Apply additional penalties for structural differences
     let mut similarity = tsed_similarity;
-
-    // Size ratio penalty: penalize when trees have very different sizes
     let size_ratio = size1.min(size2) / size1.max(size2);
+    let min_size = size1.min(size2);
+    let normalized_distance = if max_size > 0.0 { distance / max_size } else { 0.0 };
 
     if options.size_penalty {
-        // The short-function penalty guards against coincidental matches on
-        // trivial code (e.g. `() => 0` vs `() => 1`). It should scale with
-        // how much real structural churn exists — pure rename-only diffs
-        // already fall out of the APTED distance via the low rename cost,
-        // so we shouldn't compound them with a large short-function discount.
-        let min_size = size1.min(size2);
-        let normalized_distance = if max_size > 0.0 { distance / max_size } else { 0.0 };
+        if max_size < 8.0 && distance > 0.0 {
+            similarity *= 0.55;
+        } else if max_size < 16.0 && distance > 0.0 {
+            similarity *= 0.92;
+        }
 
-        if min_size < 30.0 {
-            // Base short-function factor: shorter trees get more suspicious
-            // of small similarity signals.
-            let base_factor = (min_size / 30.0).powf(0.5);
-            // Softener moves the penalty toward 1.0 as normalized distance
-            // approaches zero. At normalized_distance >= ~0.33 the full
-            // base_factor is applied; at 0 no penalty is applied.
-            let softener = (1.0 - normalized_distance * 3.0).clamp(0.0, 1.0);
+        if min_size < 10.0 {
+            let base_factor = (min_size / 10.0).powf(0.7).max(0.25);
+            similarity *= base_factor;
+            if normalized_distance > 0.04 {
+                similarity *= 0.6;
+            }
+        } else if min_size < 20.0 {
+            let softener = (1.0 - normalized_distance * 4.0).clamp(0.0, 1.0);
+            let base_factor = 0.92;
             let effective_factor = base_factor + (1.0 - base_factor) * softener;
             similarity *= effective_factor;
-
-            // Keep a mild extra discount when trees are both tiny AND the
-            // structural distance is meaningful, which preserves the intent
-            // of filtering trivial lookalikes without squashing rename-only
-            // matches on ~10-node functions.
-            if normalized_distance > 0.15 {
-                if min_size < 10.0 {
-                    similarity *= 0.6;
-                } else if min_size < 20.0 {
-                    similarity *= 0.8;
-                }
+            if normalized_distance > 0.18 {
+                similarity *= 0.85;
+            }
+        } else if min_size < 30.0 {
+            let softener = (1.0 - normalized_distance * 4.0).clamp(0.0, 1.0);
+            let base_factor = 0.95;
+            let effective_factor = base_factor + (1.0 - base_factor) * softener;
+            similarity *= effective_factor;
+            if normalized_distance > 0.13 {
+                similarity *= 0.88;
             }
         }
 
-        // Size difference penalty
+        if normalized_distance > 0.16 {
+            let excess = normalized_distance - 0.16;
+            let penalty_factor = (1.0 - excess * 4.0).max(0.3);
+            similarity *= penalty_factor;
+        }
+
         if size_ratio < 0.5 {
-            // If one tree is less than half the size of the other,
-            // they're likely fundamentally different
             similarity *= size_ratio.powf(0.5);
         }
     }
