@@ -2,7 +2,7 @@ use oxc_ast::ast::*;
 use oxc_span::{GetSpan, Span};
 
 use crate::ignore_directive::has_similarity_ignore_directive;
-use crate::parser::parse_and_convert_to_tree;
+use crate::parser::{parse_and_convert_to_tree, parse_and_convert_to_tree_canonical};
 use crate::tsed::{calculate_tsed, TSEDOptions};
 
 type CrossFileSimilarityResult = Vec<(String, SimilarityResult, String)>;
@@ -777,8 +777,33 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
 
     match func.function_type {
         FunctionType::Method | FunctionType::Constructor => {
-            // Class methods can't be parsed in isolation, so keep the
-            // synthetic class wrapper. Preserve `static`, getter/setter,
+            // Plain instance methods normalize to a standalone `function`
+            // fragment so "extract method to function" refactors (and the
+            // reverse) compare by body instead of by declaration shape —
+            // the class wrapper used to dominate the structural distance
+            // for method-vs-function pairs. Static methods, accessors,
+            // constructors and non-identifier keys keep the class wrapper:
+            // their runtime contracts are tied to the class shape and the
+            // existing relative scoring for those forms is calibrated
+            // against it.
+            if matches!(func.function_type, FunctionType::Method)
+                && matches!(func.method_kind, MethodKind::Normal)
+                && !func.is_static
+            {
+                if let Some(name_text) = method_fragment_name(&func.display_name) {
+                    let mut prefix = String::new();
+                    if func.is_async {
+                        prefix.push_str("async ");
+                    }
+                    prefix.push_str("function");
+                    if func.is_generator {
+                        prefix.push('*');
+                    }
+                    return format!("{prefix} {name_text}{params_text} {body_text}");
+                }
+            }
+            // Remaining method shapes can't be parsed in isolation, so keep
+            // the synthetic class wrapper. Preserve `static`, getter/setter,
             // `async` and generator modifiers — runtime-distinct methods
             // like `static foo` vs `foo` or `get foo` vs `foo` must not
             // collapse onto the same tree even when their bodies agree.
@@ -851,19 +876,94 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
     }
 }
 
-fn sanitize_function_name(name: &str) -> String {
-    let valid_ident = !name.is_empty()
+fn is_plain_identifier(name: &str) -> bool {
+    !name.is_empty()
         && name.chars().enumerate().all(|(idx, ch)| {
             if idx == 0 {
                 ch.is_alphabetic() || ch == '_' || ch == '$'
             } else {
                 ch.is_alphanumeric() || ch == '_' || ch == '$'
             }
-        });
-    if valid_ident {
+        })
+}
+
+fn sanitize_function_name(name: &str) -> String {
+    if is_plain_identifier(name) {
         name.to_string()
     } else {
         "__sim__".to_string()
+    }
+}
+
+/// Words that cannot appear as a `function <name>` in a strict-mode
+/// module even though they are perfectly valid method keys (`delete(key)`
+/// on a cache class being the canonical example).
+fn is_reserved_function_name(name: &str) -> bool {
+    matches!(
+        name,
+        "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "implements"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "interface"
+            | "let"
+            | "new"
+            | "null"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "return"
+            | "static"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
+/// Name to bind a plain instance method to when normalizing it into a
+/// standalone `function` fragment. Returns `None` for non-identifier keys
+/// (string literals, computed keys, `#private` names) — those keep the
+/// class wrapper so their key shape stays visible to the comparison.
+/// Reserved words get a stable prefix so e.g. a `delete(key)` method still
+/// produces a valid, name-distinct function fragment.
+fn method_fragment_name(name: &str) -> Option<String> {
+    if !is_plain_identifier(name) {
+        return None;
+    }
+    if is_reserved_function_name(name) {
+        Some(format!("__m_{name}"))
+    } else {
+        Some(name.to_string())
     }
 }
 
@@ -879,16 +979,16 @@ fn parse_function_fragment(
     match function_type {
         FunctionType::Method | FunctionType::Constructor => {
             let wrapped = format!("class __C__ {{ {body_text} }}");
-            parse_and_convert_to_tree(filename, &wrapped)
+            parse_and_convert_to_tree_canonical(filename, &wrapped)
         }
         FunctionType::Function | FunctionType::Arrow => {
             // Try direct parse first; fall back to class-wrapping for method-like
             // snippets that snuck through (e.g. rare extractor edge cases).
-            match parse_and_convert_to_tree(filename, body_text) {
+            match parse_and_convert_to_tree_canonical(filename, body_text) {
                 Ok(tree) => Ok(tree),
                 Err(_) => {
                     let wrapped = format!("class __C__ {{ {body_text} }}");
-                    parse_and_convert_to_tree(filename, &wrapped)
+                    parse_and_convert_to_tree_canonical(filename, &wrapped)
                 }
             }
         }
@@ -897,14 +997,16 @@ fn parse_function_fragment(
 
 /// Parse a function for structural comparison, using `build_normalized_fragment`
 /// so arrow vs regular vs method declarations all end up shape-equivalent
-/// when their bodies agree.
+/// when their bodies agree, and the canonical parse so style-only rewrites
+/// (template literals, `.then` vs `await`, `forEach` vs `for-of`, …)
+/// compare as equal trees.
 fn parse_function_for_comparison(
     filename: &str,
     func: &FunctionDefinition,
     source: &str,
 ) -> Result<std::rc::Rc<crate::tree::TreeNode>, String> {
     let fragment = build_normalized_fragment(func, source);
-    match parse_and_convert_to_tree(filename, &fragment) {
+    match parse_and_convert_to_tree_canonical(filename, &fragment) {
         Ok(tree) => Ok(tree),
         Err(_) => {
             // Fallback to the legacy whole-function parse path so we don't
