@@ -379,7 +379,13 @@ fn calculate_structural_similarity(
         if let Some(method2) = class2.methods.get(*name) {
             let sig1 = format!("({}) => {}", method1.parameters.join(", "), method1.return_type);
             let sig2 = format!("({}) => {}", method2.parameters.join(", "), method2.return_type);
-            if sig1 == sig2 {
+            // Parameter renames (`findById(id)` vs `findById(key)`) are
+            // neutral refactors — when the name matches and the
+            // name-stripped signatures agree, credit a full match instead
+            // of the partial-mismatch rate.
+            if sig1 == sig2
+                || normalize_signature_for_fuzzy(method1) == normalize_signature_for_fuzzy(method2)
+            {
                 method_score += 2.0;
             } else {
                 method_score += 1.4;

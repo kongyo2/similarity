@@ -41,7 +41,9 @@ pub use function_extractor::{
     compare_functions, extract_functions, find_similar_functions_across_files,
     find_similar_functions_in_file, FunctionDefinition, FunctionType, SimilarityResult,
 };
-pub use parser::{ast_to_tree_node, parse_and_convert_to_tree};
+pub use parser::{
+    ast_to_tree_node, parse_and_convert_to_tree, parse_and_convert_to_tree_canonical,
+};
 pub use tree::TreeNode;
 pub use tsed::{calculate_tsed, calculate_tsed_from_code, TSEDOptions};
 
