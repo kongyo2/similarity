@@ -39,9 +39,11 @@ written differently" score as equal:
 - interfaces ⇔ structurally identical type aliases, reordered members
 
 Rewrites that change behavior (logical assignments, `then(onFulfilled,
-onRejected)`, fall-through `switch` cases, `Object.assign` with a mutated
-target, string prepend vs append folds, `async` vs sync contracts) keep
-their distinct shapes on purpose.
+onRejected)`, a statement-position `then` callback containing `return`,
+fall-through `switch` cases, `Object.assign` with a mutated target, string
+prepend vs append folds, templates that stringify adjacent values like
+`` `${a}${b}` `` vs numeric `a + b`, `async` vs sync contracts) keep their
+distinct shapes on purpose.
 
 ## Accuracy
 

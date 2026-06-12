@@ -97,6 +97,45 @@ describe("runCli", () => {
     });
   });
 
+  it("prints the package version for --version without exiting the process", async () => {
+    const packageJson = JSON.parse(
+      await fs.readFile(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version: string };
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const exitCode = await runCli(["--version"], {
+      log: (message) => logs.push(message),
+      error: (message) => errors.push(message),
+    });
+    expect(exitCode).toBe(0);
+    expect(errors).toHaveLength(0);
+    expect(logs).toEqual([packageJson.version]);
+  });
+
+  it("prints usage for --help and reports success", async () => {
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const exitCode = await runCli(["--help"], {
+      log: (message) => logs.push(message),
+      error: (message) => errors.push(message),
+    });
+    expect(exitCode).toBe(0);
+    expect(errors).toHaveLength(0);
+    expect(logs.join("\n")).toContain("Usage: similarity-ts");
+  });
+
+  it("reports unknown options on stderr with a non-zero exit code", async () => {
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const exitCode = await runCli([".", "--no-such-flag"], {
+      log: (message) => logs.push(message),
+      error: (message) => errors.push(message),
+    });
+    expect(exitCode).toBe(1);
+    expect(logs).toHaveLength(0);
+    expect(errors.join("\n")).toContain("unknown option '--no-such-flag'");
+  });
+
   it("returns non-zero on invalid flag combinations", async () => {
     const logs: string[] = [];
     const errors: string[] = [];

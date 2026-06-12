@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Command, Option } from "commander";
+import { Command, CommanderError, Option } from "commander";
 import { z } from "zod";
 import { analyzeProject } from "./analyze.js";
 import {
@@ -49,6 +50,11 @@ interface ParsedCliOptions {
   failOnWarnings: boolean;
 }
 
+// Both `src/cli.ts` (dev/test) and the bundled `dist/cli.js` sit one level
+// below the package root, so the same relative specifier resolves to the
+// package manifest from either location.
+const packageJson = createRequire(import.meta.url)("../package.json") as { version: string };
+
 const modeSchema = z.enum(["functions", "types", "classes", "overlap"]);
 
 function parseCommaList(rawValue: string): string[] {
@@ -76,11 +82,12 @@ function parseExtensions(rawExtensions: string): string[] {
   return [...new Set(parsed)];
 }
 
-function buildProgram(): Command {
+function buildProgram(io: CliIO): Command {
   const program = new Command();
   program
     .name("similarity-ts")
     .description("TypeScript code similarity analyzer")
+    .version(packageJson.version)
     .argument("<paths...>", "Files and directories to analyze")
     .option(
       "--modes <list>",
@@ -130,6 +137,15 @@ function buildProgram(): Command {
       false,
     )
     .showHelpAfterError(true);
+  // Route commander's own output (`--help`, `--version`, parse errors)
+  // through the injected io and surface terminations as return codes
+  // instead of `process.exit`, keeping `runCli` side-effect free for
+  // library and test callers.
+  program.exitOverride();
+  program.configureOutput({
+    writeOut: (text) => io.log(text.replace(/\n$/, "")),
+    writeErr: (text) => io.error(text.replace(/\n$/, "")),
+  });
   return program;
 }
 
@@ -206,7 +222,7 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
 
 export async function runCli(argv: string[], io: CliIO = console): Promise<number> {
   try {
-    const program = buildProgram();
+    const program = buildProgram(io);
     program.parse(argv, { from: "user" });
 
     const paths = program.args.map(String);
@@ -252,6 +268,12 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
     }
     return 0;
   } catch (error) {
+    if (error instanceof CommanderError) {
+      // Commander already wrote the relevant text (help, version or the
+      // parse error plus usage) through `configureOutput`; only the exit
+      // code remains to be propagated.
+      return error.exitCode;
+    }
     io.error((error as Error).message);
     return 1;
   }
