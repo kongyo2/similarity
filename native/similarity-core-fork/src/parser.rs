@@ -1349,6 +1349,19 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
                 // numeric `a + b` / bare `a`, which compute different
                 // values. Seed those chains with the explicit `""` head the
                 // equivalent hand-written concatenation carries.
+                //
+                // Hint-sensitive coercion (`Symbol.toPrimitive` / `valueOf`
+                // observing the "string" vs "default" hint) can still tell
+                // `${x}` apart from `"" + x` at runtime. That caveat applies
+                // equally to every template⇔concatenation pairing this
+                // lowering produces (`` `Hello ${name}` `` vs
+                // `"Hello " + name` included) and is accepted by design: a
+                // syntactic analyzer cannot see types, and the pairing
+                // mirrors the `prefer-template` rewrite, which treats the
+                // two spellings as interchangeable for ordinary values. The
+                // line drawn is: collapse pairs that agree on every
+                // primitive, keep pairs apart that diverge on primitives
+                // (numeric `a + b` vs `` `${a}${b}` ``).
                 let first_quasi_empty = tpl
                     .quasis
                     .first()
