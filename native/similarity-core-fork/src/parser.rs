@@ -165,7 +165,21 @@ fn statement_to_tree_nodes(stmt: &Statement, id_counter: &mut usize) -> Vec<Rc<T
                     effective = strip_parentheses(&await_expr.argument);
                 }
                 if let Some(parts) = match_then_call(effective) {
-                    return lower_then_call(&parts, ThenPosition::Statement, id_counter);
+                    // In statement position a `return` inside the callback
+                    // only exits the callback; inlined it would read as an
+                    // early exit of the enclosing function — a genuinely
+                    // different control flow. (In return position callback
+                    // returns map onto function returns exactly, so no
+                    // guard is needed there.)
+                    let callback_returns = match &parts.body {
+                        CallbackBody::Block(statements) => {
+                            statements_contain_own_return(statements)
+                        }
+                        CallbackBody::Expression(_) => false,
+                    };
+                    if !callback_returns {
+                        return lower_then_call(&parts, ThenPosition::Statement, id_counter);
+                    }
                 }
             }
             Statement::VariableDeclaration(var_decl) => {
@@ -263,6 +277,51 @@ fn match_then_call<'a, 'b>(expr: &'b Expression<'a>) -> Option<ThenCallParts<'a,
         _ => return None,
     };
     Some(ThenCallParts { object: &member.object, param, body })
+}
+
+/// Whether any statement in the list is a `return` belonging to the
+/// list's own function scope. Recurses through blocks, branches, loops,
+/// switch cases, try clauses and labels, but not into nested functions,
+/// arrows or classes — their `return`s exit the nested scope, not this
+/// one.
+fn statements_contain_own_return<'a>(
+    statements: &oxc_allocator::Vec<'a, Statement<'a>>,
+) -> bool {
+    statements.iter().any(statement_contains_own_return)
+}
+
+fn statement_contains_own_return(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::ReturnStatement(_) => true,
+        Statement::BlockStatement(block) => statements_contain_own_return(&block.body),
+        Statement::IfStatement(if_stmt) => {
+            statement_contains_own_return(&if_stmt.consequent)
+                || if_stmt.alternate.as_ref().is_some_and(statement_contains_own_return)
+        }
+        Statement::ForStatement(for_stmt) => statement_contains_own_return(&for_stmt.body),
+        Statement::ForInStatement(for_in) => statement_contains_own_return(&for_in.body),
+        Statement::ForOfStatement(for_of) => statement_contains_own_return(&for_of.body),
+        Statement::WhileStatement(while_stmt) => statement_contains_own_return(&while_stmt.body),
+        Statement::DoWhileStatement(do_stmt) => statement_contains_own_return(&do_stmt.body),
+        Statement::SwitchStatement(switch_stmt) => switch_stmt
+            .cases
+            .iter()
+            .any(|case| statements_contain_own_return(&case.consequent)),
+        Statement::TryStatement(try_stmt) => {
+            statements_contain_own_return(&try_stmt.block.body)
+                || try_stmt
+                    .handler
+                    .as_ref()
+                    .is_some_and(|handler| statements_contain_own_return(&handler.body.body))
+                || try_stmt
+                    .finalizer
+                    .as_ref()
+                    .is_some_and(|finalizer| statements_contain_own_return(&finalizer.body))
+        }
+        Statement::LabeledStatement(labeled) => statement_contains_own_return(&labeled.body),
+        Statement::WithStatement(with_stmt) => statement_contains_own_return(&with_stmt.body),
+        _ => false,
+    }
 }
 
 /// Lower `return E.then((v) => body)` (or the bare-statement form) into
@@ -1282,7 +1341,42 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
             // they appear; empty quasis (e.g. before a leading `${`)
             // contribute nothing to the concatenation and are dropped.
             if canonicalize_enabled() {
+                // `+` only guarantees string concatenation once a string
+                // operand has entered the left-associated chain. A template
+                // whose first two operands are both interpolations
+                // (`` `${a}${b}…` ``) — or a lone interpolation
+                // (`` `${a}` ``) — would otherwise produce the same tree as
+                // numeric `a + b` / bare `a`, which compute different
+                // values. Seed those chains with the explicit `""` head the
+                // equivalent hand-written concatenation carries.
+                //
+                // Hint-sensitive coercion (`Symbol.toPrimitive` / `valueOf`
+                // observing the "string" vs "default" hint) can still tell
+                // `${x}` apart from `"" + x` at runtime. That caveat applies
+                // equally to every template⇔concatenation pairing this
+                // lowering produces (`` `Hello ${name}` `` vs
+                // `"Hello " + name` included) and is accepted by design: a
+                // syntactic analyzer cannot see types, and the pairing
+                // mirrors the `prefer-template` rewrite, which treats the
+                // two spellings as interchangeable for ordinary values. The
+                // line drawn is: collapse pairs that agree on every
+                // primitive, keep pairs apart that diverge on primitives
+                // (numeric `a + b` vs `` `${a}${b}` ``).
+                let first_quasi_empty = tpl
+                    .quasis
+                    .first()
+                    .is_none_or(|q| q.value.cooked.as_deref().unwrap_or("").is_empty());
+                let second_quasi_empty = tpl
+                    .quasis
+                    .get(1)
+                    .is_none_or(|q| q.value.cooked.as_deref().unwrap_or("").is_empty());
+                let needs_empty_head =
+                    first_quasi_empty && !tpl.expressions.is_empty() && second_quasi_empty;
+
                 let mut operands: Vec<Rc<TreeNode>> = Vec::new();
+                if needs_empty_head {
+                    operands.push(leaf("\"\"", "StringLiteral", id_counter));
+                }
                 for (index, quasi) in tpl.quasis.iter().enumerate() {
                     let cooked: &str = quasi.value.cooked.as_deref().unwrap_or("");
                     if !cooked.is_empty() {
@@ -2187,6 +2281,50 @@ mod canonicalization_tests {
     }
 
     #[test]
+    fn adjacent_interpolations_stay_distinct_from_numeric_addition() {
+        // `` `${a}${b}` `` stringifies both values ("1" + "2" → "12");
+        // `a + b` adds them (3). The trees must not collapse.
+        assert_canonically_distinct(
+            "function f(a: number, b: number) { const t = `${a}${b}`; return t; }",
+            "function f(a: number, b: number) { const t = a + b; return t; }",
+        );
+    }
+
+    #[test]
+    fn adjacent_interpolations_equal_empty_string_headed_concatenation() {
+        assert_canonically_equal(
+            r#"function f(a: number, b: number) { const t = `${a}${b}`; return t; }"#,
+            r#"function f(a: number, b: number) { const t = "" + a + b; return t; }"#,
+        );
+    }
+
+    #[test]
+    fn lone_interpolation_stays_distinct_from_bare_value() {
+        assert_canonically_distinct(
+            "function f(v: number) { const out = `${v}`; return out; }",
+            "function f(v: number) { const out = v; return out; }",
+        );
+    }
+
+    #[test]
+    fn lone_interpolation_equals_empty_string_concatenation() {
+        assert_canonically_equal(
+            r#"function f(v: number) { const out = `${v}`; return out; }"#,
+            r#"function f(v: number) { const out = "" + v; return out; }"#,
+        );
+    }
+
+    #[test]
+    fn leading_interpolation_followed_by_text_still_equals_concatenation() {
+        // With a string in the second slot the chain is already guaranteed
+        // to concatenate, so no `""` head appears on either side.
+        assert_canonically_equal(
+            r#"function f(name: string) { return `${name} is ready`; }"#,
+            r#"function f(name: string) { return name + " is ready"; }"#,
+        );
+    }
+
+    #[test]
     fn template_literals_with_different_text_stay_distinct() {
         assert_canonically_distinct(
             r#"function f(name: string) { return `Hello ${name}`; }"#,
@@ -2292,6 +2430,53 @@ async function f(url: string) {
     throw new Error("bad");
   }
   return res.json();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn statement_then_without_return_still_lowers_to_await() {
+        assert_canonically_equal(
+            r#"
+async function f(p: Promise<number>) {
+  p.then((v) => {
+    console.log(v);
+  });
+  console.log("after");
+}
+"#,
+            r#"
+async function f(p: Promise<number>) {
+  const v = await p;
+  console.log(v);
+  console.log("after");
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn statement_then_with_returning_callback_stays_a_call() {
+        // The callback's `return` only exits the callback — `"after"` is
+        // always logged. In the await form the `return` exits `f` and
+        // skips it. Inlining would erase that difference.
+        assert_canonically_distinct(
+            r#"
+async function f(p: Promise<number>, flag: boolean) {
+  p.then((v) => {
+    if (flag) return;
+    console.log(v);
+  });
+  console.log("after");
+}
+"#,
+            r#"
+async function f(p: Promise<number>, flag: boolean) {
+  const v = await p;
+  if (flag) return;
+  console.log(v);
+  console.log("after");
 }
 "#,
         );
