@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
 use similarity_core::{
     extract_type_literals_from_files, extract_types_from_files, find_overlaps_across_files,
-    find_similar_classes_across_files, find_similar_functions_across_files,
-    find_similar_functions_in_file, find_similar_types, OverlapOptions, TSEDOptions,
-    TypeComparisonOptions, TypeKind,
+    find_similar_classes_across_files, find_similar_function_pairs, find_similar_types,
+    OverlapOptions, PairScope, TSEDOptions, TypeComparisonOptions, TypeKind,
 };
 use std::collections::HashMap;
 
@@ -21,6 +20,7 @@ pub struct AnalyzeInput {
     pub modes: Vec<String>,
     pub threshold: f64,
     pub min_lines: Option<u32>,
+    pub min_tokens: Option<u32>,
     pub size_penalty: Option<bool>,
     pub same_file_only: Option<bool>,
     pub cross_file_only: Option<bool>,
@@ -112,98 +112,65 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
         overlap: vec![],
     };
 
+    let mut skipped_files: Vec<String> = Vec::new();
+
     if input.modes.iter().any(|m| m == "functions") {
         let mut options = TSEDOptions::default();
         if let Some(min_lines) = input.min_lines {
             options.min_lines = min_lines;
         }
+        options.min_tokens = input.min_tokens;
         if let Some(size_penalty) = input.size_penalty {
             options.size_penalty = size_penalty;
         }
 
-        let mut function_pairs: Vec<SimilarityPair> = Vec::new();
+        let scope = if same_file_only {
+            PairScope::SameFileOnly
+        } else if cross_file_only {
+            PairScope::CrossFileOnly
+        } else {
+            PairScope::All
+        };
 
-        // Cross-file pairs. `find_similar_functions_across_files` intentionally
-        // skips same-file pairs, so we only consult it when cross-file results
-        // are still in scope.
-        if !same_file_only {
-            match find_similar_functions_across_files(&files, input.threshold, &options) {
-                Ok(pairs) => {
-                    for (left_file, res, right_file) in pairs {
-                        if res.similarity < input.threshold {
-                            continue;
-                        }
-                        function_pairs.push(SimilarityPair {
-                            mode: "functions".to_string(),
-                            similarity: res.similarity,
-                            left: AnalyzerLocation {
-                                file_path: left_file,
-                                start_line: res.func1.start_line as usize,
-                                end_line: res.func1.end_line as usize,
-                                symbol_name: res.func1.name,
-                                kind: format!("{:?}", res.func1.function_type).to_lowercase(),
-                            },
-                            right: AnalyzerLocation {
-                                file_path: right_file,
-                                start_line: res.func2.start_line as usize,
-                                end_line: res.func2.end_line as usize,
-                                symbol_name: res.func2.name,
-                                kind: format!("{:?}", res.func2.function_type).to_lowercase(),
-                            },
-                            details: Some(serde_json::json!({ "impact": res.impact })),
-                        });
-                    }
-                }
-                Err(err) => warnings.push(AnalyzeWarning {
-                    file_path: None,
-                    message: err,
-                }),
-            }
+        // Single unified scan: every function is extracted and parsed
+        // exactly once regardless of scope (the previous split into a
+        // cross-file pass plus per-file passes did all of that twice).
+        let (pairs, skipped) = find_similar_function_pairs(&files, input.threshold, &options, scope);
+        for (file_path, error) in skipped {
+            warnings.push(AnalyzeWarning {
+                file_path: Some(file_path.clone()),
+                message: format!("skipped: {error}"),
+            });
+            skipped_files.push(file_path);
         }
 
-        // Same-file pairs. The cross-file helper above skips these entirely,
-        // so we have to walk each file explicitly whenever same-file results
-        // are in scope.
-        if !cross_file_only {
-            for (filename, source) in &files {
-                match find_similar_functions_in_file(filename, source, input.threshold, &options) {
-                    Ok(pairs) => {
-                        for res in pairs {
-                            if res.similarity < input.threshold {
-                                continue;
-                            }
-                            function_pairs.push(SimilarityPair {
-                                mode: "functions".to_string(),
-                                similarity: res.similarity,
-                                left: AnalyzerLocation {
-                                    file_path: filename.clone(),
-                                    start_line: res.func1.start_line as usize,
-                                    end_line: res.func1.end_line as usize,
-                                    symbol_name: res.func1.name,
-                                    kind: format!("{:?}", res.func1.function_type).to_lowercase(),
-                                },
-                                right: AnalyzerLocation {
-                                    file_path: filename.clone(),
-                                    start_line: res.func2.start_line as usize,
-                                    end_line: res.func2.end_line as usize,
-                                    symbol_name: res.func2.name,
-                                    kind: format!("{:?}", res.func2.function_type).to_lowercase(),
-                                },
-                                details: Some(serde_json::json!({ "impact": res.impact })),
-                            });
-                        }
-                    }
-                    Err(err) => warnings.push(AnalyzeWarning {
-                        file_path: Some(filename.clone()),
-                        message: err,
-                    }),
-                }
-            }
-        }
+        let mut function_pairs: Vec<SimilarityPair> = pairs
+            .into_iter()
+            .filter(|(_, res, _)| res.similarity >= input.threshold)
+            .map(|(left_file, res, right_file)| SimilarityPair {
+                mode: "functions".to_string(),
+                similarity: res.similarity,
+                left: AnalyzerLocation {
+                    file_path: left_file,
+                    start_line: res.func1.start_line as usize,
+                    end_line: res.func1.end_line as usize,
+                    symbol_name: res.func1.name,
+                    kind: format!("{:?}", res.func1.function_type).to_lowercase(),
+                },
+                right: AnalyzerLocation {
+                    file_path: right_file,
+                    start_line: res.func2.start_line as usize,
+                    end_line: res.func2.end_line as usize,
+                    symbol_name: res.func2.name,
+                    kind: format!("{:?}", res.func2.function_type).to_lowercase(),
+                },
+                details: Some(serde_json::json!({ "impact": res.impact })),
+            })
+            .collect();
 
-        // Cross-file and per-file scans each produce sorted output on their
-        // own, but after merging we have to re-sort so callers observing
-        // `byMode.functions` directly still see highest-similarity first.
+        // Highest similarity first for callers observing `byMode.functions`
+        // directly; ties keep the core's impact-descending order (the
+        // unified scan already sorted by impact, and this sort is stable).
         function_pairs.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
         by_mode.functions = function_pairs;
     }
@@ -390,8 +357,13 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
     results.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
 
     AnalyzeOutput {
-        analyzed_files: input.files.into_iter().map(|f| f.file_path).collect(),
-        skipped_files: vec![],
+        analyzed_files: input
+            .files
+            .into_iter()
+            .map(|f| f.file_path)
+            .filter(|path| !skipped_files.contains(path))
+            .collect(),
+        skipped_files,
         warnings,
         results: results.clone(),
         by_mode,

@@ -83,7 +83,12 @@ export function computeTotal(values: number[]): number {
     });
   });
 
-  it("filters moderate short-function matches at a high threshold", async () => {
+  it("separates rename twins from operator twins at a high threshold", async () => {
+    // `add`/`sum` differ only in local names — with alpha-renaming they
+    // are exactly equal trees and stay visible even at threshold 0.95
+    // (they ARE the same function). `add`/`subtract` share every token
+    // except the operator, which is the behavioral difference the
+    // atom cap exists to keep out of the report.
     await withTempProject(async (projectDir) => {
       await writeSource(
         projectDir,
@@ -96,22 +101,27 @@ export function add(a: number, b: number): number {
 export function sum(x: number, y: number): number {
   return x + y;
 }
+
+export function subtract(a: number, b: number): number {
+  return a - b;
+}
 `,
       );
 
-      const low = await analyzeTempProject(projectDir, ["functions"], {
-        threshold: 0.5,
-        minLines: 1,
-        noSizePenalty: true,
-      });
       const high = await analyzeTempProject(projectDir, ["functions"], {
         threshold: 0.95,
         minLines: 1,
         noSizePenalty: true,
       });
+      const moderate = await analyzeTempProject(projectDir, ["functions"], {
+        threshold: 0.8,
+        minLines: 1,
+        noSizePenalty: true,
+      });
 
-      expect(hasPair(low.byMode.functions, "add", "sum")).toBe(true);
-      expect(hasPair(high.byMode.functions, "add", "sum")).toBe(false);
+      expect(hasPair(high.byMode.functions, "add", "sum")).toBe(true);
+      expect(hasPair(moderate.byMode.functions, "add", "subtract")).toBe(false);
+      expect(hasPair(moderate.byMode.functions, "sum", "subtract")).toBe(false);
     });
   });
 
@@ -298,7 +308,12 @@ export type TUser = {
     });
   });
 
-  it("does not report broad generic interfaces as similar by default", async () => {
+  it("separates full skeleton twins from contract-changing lookalikes", async () => {
+    // Response and ApiResult are the same wrapper with every member
+    // renamed — the exact shape the rename-tolerant matcher exists to
+    // surface. ServerResponse changes the CONTRACT (`error?` is optional
+    // where the others require `message`/`description`), so those pairs
+    // must stay out of the report.
     await withTempProject(async (projectDir) => {
       await writeSource(
         projectDir,
@@ -325,10 +340,12 @@ export interface ServerResponse<T> {
       );
 
       const report = await analyzeTempProject(projectDir, ["types"], {
-        threshold: 0.7,
+        threshold: 0.8,
       });
 
-      expect(report.byMode.types).toHaveLength(0);
+      expect(hasPair(report.byMode.types, "Response", "ApiResult")).toBe(true);
+      expect(hasPair(report.byMode.types, "Response", "ServerResponse")).toBe(false);
+      expect(hasPair(report.byMode.types, "ApiResult", "ServerResponse")).toBe(false);
     });
   });
 

@@ -1,6 +1,6 @@
 [package]
 name = "similarity-core"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 description = "Core library for code similarity detection using AST-based comparison (fork without non-TS tree-sitter grammars)"
@@ -13,12 +13,4 @@ oxc_span = "0.124.0"
 oxc_allocator = "0.124.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "1"
-rayon = "1.10"
-ignore = "0.4"
-anyhow = "1.0"
-
-[dev-dependencies]
-# Required by config_loader.rs tests which write temporary config files to
-# disk; otherwise `cargo test` fails to compile.
-tempfile = "3"
+oxc_semantic = "0.124.0"

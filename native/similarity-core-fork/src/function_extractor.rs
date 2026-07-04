@@ -2,7 +2,7 @@ use oxc_ast::ast::*;
 use oxc_span::{GetSpan, Span};
 
 use crate::ignore_directive::has_similarity_ignore_directive;
-use crate::parser::{parse_and_convert_to_tree, parse_and_convert_to_tree_canonical};
+use crate::parser::parse_and_convert_to_tree_canonical;
 use crate::tsed::{calculate_tsed, TSEDOptions};
 
 type CrossFileSimilarityResult = Vec<(String, SimilarityResult, String)>;
@@ -76,7 +76,6 @@ pub struct FunctionDefinition {
     pub end_line: u32,
     pub class_name: Option<String>,
     pub parent_function: Option<String>,
-    pub node_count: Option<u32>,
     pub has_ignore_directive: bool,
 }
 
@@ -160,9 +159,11 @@ pub fn extract_functions(
     }
 
     let mut functions = Vec::new();
+    let line_offsets = build_line_offsets(source_text);
     let mut context = ExtractionContext {
         functions: &mut functions,
         source_text,
+        line_offsets: &line_offsets,
         class_name: None,
         parent_function: None,
     };
@@ -174,8 +175,36 @@ pub fn extract_functions(
 struct ExtractionContext<'a> {
     functions: &'a mut Vec<FunctionDefinition>,
     source_text: &'a str,
+    /// Byte offset of the start of each line, so span→line lookups are a
+    /// binary search instead of an O(file) rescan per call.
+    line_offsets: &'a [u32],
     class_name: Option<String>,
     parent_function: Option<String>,
+}
+
+impl ExtractionContext<'_> {
+    fn line_number(&self, offset: u32) -> u32 {
+        line_number_for_offset(self.line_offsets, offset)
+    }
+}
+
+/// 1-based line number for a byte offset, given the per-line start
+/// offsets (always non-empty; index 0 is line 1 at offset 0).
+fn line_number_for_offset(line_offsets: &[u32], offset: u32) -> u32 {
+    let index = line_offsets.partition_point(|&start| start <= offset);
+    index.max(1) as u32
+}
+
+/// Byte offsets at which each line starts.
+fn build_line_offsets(source_text: &str) -> Vec<u32> {
+    let mut offsets = Vec::with_capacity(source_text.len() / 24 + 1);
+    offsets.push(0);
+    for (position, byte) in source_text.bytes().enumerate() {
+        if byte == b'\n' {
+            offsets.push(position as u32 + 1);
+        }
+    }
+    offsets
 }
 
 fn extract_from_program(program: &Program, ctx: &mut ExtractionContext) {
@@ -190,7 +219,7 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
             if let Some(name) = &func.id {
                 let func_name = name.name.to_string();
                 let params = extract_parameters(&func.params);
-                let start_line = get_line_number(func.span.start, ctx.source_text);
+                let start_line = ctx.line_number(func.span.start);
                 ctx.functions.push(FunctionDefinition {
                     name: func_name.clone(),
                     function_type: FunctionType::Function,
@@ -205,10 +234,9 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     method_kind: MethodKind::Normal,
                     display_name: func_name.clone(),
                     start_line,
-                    end_line: get_line_number(func.span.end, ctx.source_text),
+                    end_line: ctx.line_number(func.span.end),
                     class_name: None,
                     parent_function: ctx.parent_function.clone(),
-                    node_count: count_function_nodes(func.span, ctx.source_text),
                     has_ignore_directive: has_similarity_ignore_directive(
                         ctx.source_text,
                         start_line as usize,
@@ -263,7 +291,7 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     } else {
                         method_name.clone()
                     };
-                    let start_line = get_line_number(method.span.start, ctx.source_text);
+                    let start_line = ctx.line_number(method.span.start);
 
                     ctx.functions.push(FunctionDefinition {
                         name: method_name.clone(),
@@ -284,10 +312,9 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                         method_kind,
                         display_name: method_display_name.clone(),
                         start_line,
-                        end_line: get_line_number(method.span.end, ctx.source_text),
+                        end_line: ctx.line_number(method.span.end),
                         class_name: class_name.clone(),
                         parent_function: ctx.parent_function.clone(),
-                        node_count: count_function_nodes(method.span, ctx.source_text),
                         has_ignore_directive: has_similarity_ignore_directive(
                             ctx.source_text,
                             start_line as usize,
@@ -312,7 +339,7 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     if let BindingPattern::BindingIdentifier(ident) = &decl.id {
                         let params = extract_parameters(&arrow.params);
                         let arrow_name = ident.name.to_string();
-                        let start_line = get_line_number(arrow.span.start, ctx.source_text);
+                        let start_line = ctx.line_number(arrow.span.start);
                         ctx.functions.push(FunctionDefinition {
                             name: arrow_name.clone(),
                             function_type: FunctionType::Arrow,
@@ -327,10 +354,9 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                             method_kind: MethodKind::Normal,
                             display_name: arrow_name.clone(),
                             start_line,
-                            end_line: get_line_number(arrow.span.end, ctx.source_text),
+                            end_line: ctx.line_number(arrow.span.end),
                             class_name: None,
                             parent_function: ctx.parent_function.clone(),
-                            node_count: count_function_nodes(arrow.span, ctx.source_text),
                             has_ignore_directive: has_similarity_ignore_directive(
                                 ctx.source_text,
                                 start_line as usize,
@@ -362,7 +388,7 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     .unwrap_or_else(|| "default".to_string());
                 let params = extract_parameters(&func.params);
                 let func_name = name.clone();
-                let start_line = get_line_number(func.span.start, ctx.source_text);
+                let start_line = ctx.line_number(func.span.start);
                 ctx.functions.push(FunctionDefinition {
                     name: func_name.clone(),
                     function_type: FunctionType::Function,
@@ -377,10 +403,9 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
                     method_kind: MethodKind::Normal,
                     display_name: func_name.clone(),
                     start_line,
-                    end_line: get_line_number(func.span.end, ctx.source_text),
+                    end_line: ctx.line_number(func.span.end),
                     class_name: None,
                     parent_function: ctx.parent_function.clone(),
-                    node_count: count_function_nodes(func.span, ctx.source_text),
                     has_ignore_directive: has_similarity_ignore_directive(
                         ctx.source_text,
                         start_line as usize,
@@ -406,7 +431,7 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
             if let Some(name) = &func.id {
                 let func_name = name.name.to_string();
                 let params = extract_parameters(&func.params);
-                let start_line = get_line_number(func.span.start, ctx.source_text);
+                let start_line = ctx.line_number(func.span.start);
                 ctx.functions.push(FunctionDefinition {
                     name: func_name.clone(),
                     function_type: FunctionType::Function,
@@ -421,10 +446,9 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                     method_kind: MethodKind::Normal,
                     display_name: func_name.clone(),
                     start_line,
-                    end_line: get_line_number(func.span.end, ctx.source_text),
+                    end_line: ctx.line_number(func.span.end),
                     class_name: None,
                     parent_function: ctx.parent_function.clone(),
-                    node_count: count_function_nodes(func.span, ctx.source_text),
                     has_ignore_directive: has_similarity_ignore_directive(
                         ctx.source_text,
                         start_line as usize,
@@ -479,7 +503,7 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                     } else {
                         method_name.clone()
                     };
-                    let start_line = get_line_number(method.span.start, ctx.source_text);
+                    let start_line = ctx.line_number(method.span.start);
 
                     ctx.functions.push(FunctionDefinition {
                         name: method_name.clone(),
@@ -500,10 +524,9 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                         method_kind,
                         display_name: method_display_name.clone(),
                         start_line,
-                        end_line: get_line_number(method.span.end, ctx.source_text),
+                        end_line: ctx.line_number(method.span.end),
                         class_name: class_name.clone(),
                         parent_function: ctx.parent_function.clone(),
-                        node_count: count_function_nodes(method.span, ctx.source_text),
                         has_ignore_directive: has_similarity_ignore_directive(
                             ctx.source_text,
                             start_line as usize,
@@ -528,7 +551,7 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                     if let BindingPattern::BindingIdentifier(ident) = &decl.id {
                         let params = extract_parameters(&arrow.params);
                         let arrow_name = ident.name.to_string();
-                        let start_line = get_line_number(arrow.span.start, ctx.source_text);
+                        let start_line = ctx.line_number(arrow.span.start);
                         ctx.functions.push(FunctionDefinition {
                             name: arrow_name.clone(),
                             function_type: FunctionType::Arrow,
@@ -543,10 +566,9 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                             method_kind: MethodKind::Normal,
                             display_name: arrow_name.clone(),
                             start_line,
-                            end_line: get_line_number(arrow.span.end, ctx.source_text),
+                            end_line: ctx.line_number(arrow.span.end),
                             class_name: None,
                             parent_function: ctx.parent_function.clone(),
-                            node_count: count_function_nodes(arrow.span, ctx.source_text),
                             has_ignore_directive: has_similarity_ignore_directive(
                                 ctx.source_text,
                                 start_line as usize,
@@ -585,22 +607,6 @@ fn extract_from_function_body(body: &FunctionBody, ctx: &mut ExtractionContext) 
     }
 }
 
-fn get_line_number(offset: u32, source_text: &str) -> u32 {
-    let mut line = 1;
-    let mut current_offset = 0;
-
-    for ch in source_text.chars() {
-        if current_offset >= offset as usize {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-        }
-        current_offset += ch.len_utf8();
-    }
-
-    line
-}
 
 /// Compare similarity between two functions
 pub fn compare_functions(
@@ -734,7 +740,227 @@ fn compare_function_trees(
         }
     }
 
+    // Behavioral-atom twin cap. Alpha-renaming makes true rename clones
+    // exactly equal, so a pair that is near-identical EXCEPT for a couple
+    // of behavior-carrying atoms — a different callee (`sendEmail` vs
+    // `sendSms`), a flipped operator (`*` vs `/`, `&&` vs `||`), a
+    // different builtin (`find` vs `findLast`), a for-of turned for-in —
+    // is precisely the "twins that do different things" false-positive
+    // shape. The direction of the difference matters:
+    //
+    //   * SUBSTITUTIONS (each side has atoms the other lacks) rewrite
+    //     behavior and cap hard;
+    //   * one-sided ADDITIONS (one function is the other plus extra
+    //     work, e.g. an added logging line) are the classic
+    //     copy-paste-and-extend duplicate and stay reportable;
+    //   * any CONTROL-flow atom difference (loop kind, `break`,
+    //     `continue`) caps hard even one-sided — an added `break`
+    //     changes what the loop computes, unlike an added call.
+    //
+    // Plain string/number/boolean literals are deliberately NOT atoms:
+    // twins differing only in data constants are parameterizable
+    // duplicates (the corpus's F-P02 precedent).
+    if similarity > 0.6 {
+        let difference = behavioral_atom_difference(tree1, tree2);
+        if difference.control > 0 {
+            similarity = similarity.min(0.72);
+        } else if difference.missing_in_left > 0 && difference.missing_in_right > 0 {
+            let total = difference.missing_in_left + difference.missing_in_right;
+            #[allow(clippy::cast_precision_loss)]
+            let cap = (0.75 - 0.03 * (total.saturating_sub(2)) as f64).max(0.55);
+            similarity = similarity.min(cap);
+        } else if difference.missing_in_left + difference.missing_in_right >= 4 {
+            similarity = similarity.min(0.85);
+        }
+    }
+
+    // Statement-order factor: two bodies made of the same statements in a
+    // different order share all their atoms and most of their tree. When
+    // the reordered statements touch the same identifiers, order is
+    // behavior (`total += fee; total *= rate;` vs the reverse) and the
+    // pair gets a distinctness multiplier; independent statements (two
+    // unrelated `const`s swapped) reorder freely and stay untouched.
+    if similarity >= 0.8 && dependent_statements_permuted(tree1, tree2) {
+        similarity *= 0.85;
+    }
+
     Ok(similarity)
+}
+
+#[derive(Debug, Default)]
+struct AtomSets {
+    /// Value-level atoms: free identifiers, operators, member/call
+    /// optionality markers, null, regexes.
+    value_atoms: std::collections::HashSet<String>,
+    /// Control-flow atoms: loop kinds and loop jumps.
+    control_atoms: std::collections::HashSet<String>,
+}
+
+struct AtomDifference {
+    missing_in_left: usize,
+    missing_in_right: usize,
+    control: usize,
+}
+
+/// Collect behavior-carrying labels: free identifiers (anything
+/// alpha-renaming left intact — call targets, property names, globals),
+/// operator labels, optional-chaining markers, `null`, regex literals,
+/// plus loop kinds and loop jumps as a separate control class.
+///
+/// Destructuring-pattern KEYS are skipped: `function f({ x, y })` vs
+/// `function f({ left, top })` renames the parameter contract the same
+/// way renaming two positional parameters does, and the corpus treats
+/// those as duplicates.
+fn collect_behavioral_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) {
+    let is_value_atom = match node.value.as_str() {
+        "Identifier" | "BindingIdentifier" | "PrivateIdentifier" => {
+            !node.label.starts_with('§')
+        }
+        "BinaryExpression" | "LogicalExpression" | "UnaryExpression" | "UpdateExpression"
+        | "AssignmentExpression" | "RegExpLiteral" | "StaticMemberExpression"
+        | "ComputedMemberExpression" | "PrivateFieldExpression" | "CallExpression"
+        | "NullLiteral" => true,
+        _ => false,
+    };
+    if is_value_atom {
+        atoms.value_atoms.insert(node.label.clone());
+    }
+    match node.value.as_str() {
+        "ForOfStatement" | "ForInStatement" | "ForStatement" | "WhileStatement"
+        | "DoWhileStatement" | "BreakStatement" | "ContinueStatement" => {
+            atoms.control_atoms.insert(node.label.clone());
+        }
+        _ => {}
+    }
+    let skip_pattern_key = node.value == "BindingProperty";
+    for (index, child) in node.children.iter().enumerate() {
+        if skip_pattern_key && index == 0 {
+            continue;
+        }
+        collect_behavioral_atoms(child, atoms);
+    }
+}
+
+fn behavioral_atom_difference(
+    tree1: &std::rc::Rc<crate::tree::TreeNode>,
+    tree2: &std::rc::Rc<crate::tree::TreeNode>,
+) -> AtomDifference {
+    let mut atoms1 = AtomSets::default();
+    let mut atoms2 = AtomSets::default();
+    collect_behavioral_atoms(tree1, &mut atoms1);
+    collect_behavioral_atoms(tree2, &mut atoms2);
+    AtomDifference {
+        missing_in_right: atoms1.value_atoms.difference(&atoms2.value_atoms).count(),
+        missing_in_left: atoms2.value_atoms.difference(&atoms1.value_atoms).count(),
+        control: atoms1
+            .control_atoms
+            .symmetric_difference(&atoms2.control_atoms)
+            .count(),
+    }
+}
+
+fn structural_node_hash(node: &crate::tree::TreeNode) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn walk(node: &crate::tree::TreeNode, hasher: &mut impl Hasher) {
+        node.label.hash(hasher);
+        node.value.hash(hasher);
+        node.children.len().hash(hasher);
+        for child in &node.children {
+            walk(child, hasher);
+        }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    walk(node, &mut hasher);
+    hasher.finish()
+}
+
+/// Whether the two fragments' top-level body statements are the same
+/// multiset in a different order, AND at least one out-of-order pair
+/// touches a shared identifier (a data dependency — reordering those is
+/// behavioral; reordering independent statements is style).
+fn dependent_statements_permuted(
+    tree1: &std::rc::Rc<crate::tree::TreeNode>,
+    tree2: &std::rc::Rc<crate::tree::TreeNode>,
+) -> bool {
+    fn body_statements(
+        tree: &crate::tree::TreeNode,
+    ) -> Option<&Vec<std::rc::Rc<crate::tree::TreeNode>>> {
+        let function = tree.children.iter().find(|child| {
+            child.value == "FunctionDeclaration" || child.value == "ClassDeclaration"
+        })?;
+        let block = function.children.iter().find(|child| child.value == "BlockStatement")?;
+        Some(&block.children)
+    }
+    fn identifier_labels(
+        node: &crate::tree::TreeNode,
+        labels: &mut std::collections::HashSet<String>,
+    ) {
+        if matches!(node.value.as_str(), "Identifier" | "BindingIdentifier") {
+            labels.insert(node.label.clone());
+        }
+        for child in &node.children {
+            identifier_labels(child, labels);
+        }
+    }
+
+    let (Some(statements1), Some(statements2)) = (body_statements(tree1), body_statements(tree2))
+    else {
+        return false;
+    };
+    if statements1.len() < 2 || statements1.len() != statements2.len() {
+        return false;
+    }
+    let hashes1: Vec<u64> = statements1.iter().map(|s| structural_node_hash(s)).collect();
+    let hashes2: Vec<u64> = statements2.iter().map(|s| structural_node_hash(s)).collect();
+    if hashes1 == hashes2 {
+        return false;
+    }
+    let mut sorted1 = hashes1.clone();
+    let mut sorted2 = hashes2.clone();
+    sorted1.sort_unstable();
+    sorted2.sort_unstable();
+    if sorted1 != sorted2 {
+        return false;
+    }
+
+    // Same multiset, different order: find statement pairs whose relative
+    // order flipped and check whether any such pair shares an identifier.
+    let position_in_2: std::collections::HashMap<u64, Vec<usize>> = {
+        let mut map: std::collections::HashMap<u64, Vec<usize>> = Default::default();
+        for (position, hash) in hashes2.iter().enumerate() {
+            map.entry(*hash).or_default().push(position);
+        }
+        map
+    };
+    // Map each statement of side 1 to a position on side 2 (first unused
+    // occurrence for duplicate hashes).
+    let mut used: std::collections::HashMap<u64, usize> = Default::default();
+    let mapped: Vec<usize> = hashes1
+        .iter()
+        .map(|hash| {
+            let index = used.entry(*hash).or_insert(0);
+            let positions = &position_in_2[hash];
+            let position = positions[(*index).min(positions.len() - 1)];
+            *index += 1;
+            position
+        })
+        .collect();
+
+    let mut labels: Vec<std::collections::HashSet<String>> = Vec::with_capacity(statements1.len());
+    for statement in statements1 {
+        let mut set = std::collections::HashSet::new();
+        identifier_labels(statement, &mut set);
+        labels.push(set);
+    }
+
+    for a in 0..mapped.len() {
+        for b in (a + 1)..mapped.len() {
+            if mapped[a] > mapped[b] && !labels[a].is_disjoint(&labels[b]) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn extract_body_text(func: &FunctionDefinition, source: &str) -> String {
@@ -1017,242 +1243,166 @@ fn parse_function_for_comparison(
     }
 }
 
-/// Count the number of AST nodes in a function body
-fn count_function_nodes(body_span: Span, source_text: &str) -> Option<u32> {
-    let start = body_span.start as usize;
-    let end = body_span.end as usize;
-    if start >= end || end > source_text.len() {
-        return None;
+/// Pair-generation scope for [`find_similar_function_pairs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairScope {
+    All,
+    SameFileOnly,
+    CrossFileOnly,
+}
+
+/// A file the unified scan had to skip, with the parse error that caused
+/// it.
+pub type SkippedFile = (String, String);
+
+/// Unified similar-function scan across a set of files.
+///
+/// Extracts and pre-parses every function exactly once, then runs a
+/// single O(N²) pairwise loop restricted to `scope`. This replaces the
+/// previous split into a cross-file pass and a per-file pass, which
+/// extracted and parsed every function twice when both scopes were in
+/// play (the default).
+///
+/// Returns the similar pairs (ordered by impact desc, then similarity
+/// desc) plus the files that failed to parse and were skipped.
+pub fn find_similar_function_pairs(
+    files: &[(String, String)],
+    threshold: f64,
+    options: &TSEDOptions,
+    scope: PairScope,
+) -> (CrossFileSimilarityResult, Vec<SkippedFile>) {
+    struct Candidate {
+        file_index: usize,
+        func: FunctionDefinition,
+        tree: Option<std::rc::Rc<crate::tree::TreeNode>>,
+        tree_size: u32,
     }
 
-    let body_text = &source_text[start..end];
+    let mut skipped = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (file_index, (filename, source)) in files.iter().enumerate() {
+        let functions = match extract_functions(filename, source) {
+            Ok(functions) => functions,
+            Err(error) => {
+                skipped.push((filename.clone(), error));
+                continue;
+            }
+        };
+        for func in functions {
+            if func.has_ignore_directive {
+                continue;
+            }
+            // Pre-parse once per function: parsing dominates the per-pair
+            // cost, and the tree also supplies the node count used by the
+            // `min_tokens` gate (measured on the same tree that gets
+            // compared, so the gate and the score agree).
+            let tree = parse_function_for_comparison(filename, &func, source).ok();
+            let tree_size = tree
+                .as_ref()
+                .map_or(0, |tree| u32::try_from(tree.get_subtree_size()).unwrap_or(u32::MAX));
+            candidates.push(Candidate { file_index, func, tree, tree_size });
+        }
+    }
 
-    // For now, try to parse the text as-is
-    // If it fails, try wrapping it in a way that makes it valid TypeScript
-    match parse_and_convert_to_tree("temp.ts", body_text) {
-        Ok(tree) => Some(tree.get_subtree_size() as u32),
-        Err(_) => {
-            // If direct parsing fails, try wrapping in a minimal context
-            // This handles cases like "constructor(private x: number) {}" or method definitions
-            let wrapped = if body_text.starts_with("constructor") {
-                format!("class C {{ {body_text} }}")
-            } else if body_text.contains("(") && body_text.contains(")") && body_text.contains("{")
-            {
-                // Likely a method or function - wrap it appropriately
-                if body_text.trim().starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '#')
-                {
-                    // Method-like syntax
-                    format!("class C {{ {body_text} }}")
-                } else {
-                    // Arrow function or other expression
-                    format!("const x = {body_text}")
+    let mut similar_pairs = Vec::new();
+    for i in 0..candidates.len() {
+        for j in (i + 1)..candidates.len() {
+            let (left, right) = (&candidates[i], &candidates[j]);
+            let same_file = left.file_index == right.file_index;
+            match scope {
+                PairScope::SameFileOnly if !same_file => continue,
+                PairScope::CrossFileOnly if same_file => continue,
+                _ => {}
+            }
+
+            if let Some(min_tokens) = options.min_tokens {
+                if left.tree_size < min_tokens || right.tree_size < min_tokens {
+                    continue;
                 }
-            } else {
-                // Default fallback
-                body_text.to_string()
+            } else if left.func.line_count() < options.min_lines
+                || right.func.line_count() < options.min_lines
+            {
+                continue;
+            }
+
+            // Nested-function containment is only meaningful within one
+            // file — across files the span/line comparison is between
+            // unrelated coordinate spaces and used to spuriously drop
+            // pairs whose ranges happened to nest.
+            if same_file && left.func.is_parent_child_relationship(&right.func) {
+                continue;
+            }
+
+            let (Some(left_tree), Some(right_tree)) = (&left.tree, &right.tree) else {
+                continue;
             };
 
-            match parse_and_convert_to_tree("temp.ts", &wrapped) {
-                Ok(tree) => {
-                    // Subtract nodes added by wrapping (approximation)
-                    let base_nodes = if wrapped.starts_with("class C") {
-                        3 // class node + body node + wrapping
-                    } else if wrapped.starts_with("const x") {
-                        2 // const declaration + wrapping
-                    } else {
-                        0
-                    };
-                    Some((tree.get_subtree_size().saturating_sub(base_nodes)) as u32)
-                }
-                Err(_) => {
-                    // If all else fails, make a rough estimate based on the text
-                    // Count common syntax elements as a fallback
-                    let node_count =
-                        body_text.matches(['{', '}', '(', ')', ';']).count() as u32 + 1;
-                    Some(node_count.max(1))
-                }
+            let Ok(similarity) = compare_function_trees(
+                left_tree,
+                right_tree,
+                &left.func,
+                &right.func,
+                options,
+                threshold,
+            ) else {
+                continue;
+            };
+
+            if similarity >= threshold {
+                similar_pairs.push((
+                    files[left.file_index].0.clone(),
+                    SimilarityResult::new(left.func.clone(), right.func.clone(), similarity),
+                    files[right.file_index].0.clone(),
+                ));
             }
         }
     }
+
+    // Sort by impact (descending), then by similarity (descending).
+    similar_pairs.sort_by(|a, b| {
+        b.1.impact
+            .cmp(&a.1.impact)
+            .then(b.1.similarity.total_cmp(&a.1.similarity))
+    });
+
+    (similar_pairs, skipped)
 }
 
-/// Find similar functions within the same file
+/// Find similar functions within the same file.
+///
+/// # Errors
+///
+/// Returns an error when the file fails to parse.
 pub fn find_similar_functions_in_file(
     filename: &str,
     source_text: &str,
     threshold: f64,
     options: &TSEDOptions,
 ) -> Result<Vec<SimilarityResult>, String> {
-    let mut functions = extract_functions(filename, source_text)?;
-    functions.retain(|function| !function.has_ignore_directive);
-
-    // Pre-parse each function's body once so the O(N²) pairwise compare
-    // doesn't re-parse the same body N times. Parsing dominates the
-    // per-pair cost; doing it once per function alone takes the perf
-    // sweep on the TypeScript compiler's `src/services` folder from
-    // ~4 minutes down to roughly upstream parity.
-    let mut trees: Vec<Option<std::rc::Rc<crate::tree::TreeNode>>> =
-        Vec::with_capacity(functions.len());
-    for func in &functions {
-        trees.push(parse_function_for_comparison(filename, func, source_text).ok());
+    let files = [(filename.to_string(), source_text.to_string())];
+    let (pairs, skipped) =
+        find_similar_function_pairs(&files, threshold, options, PairScope::SameFileOnly);
+    if let Some((_, error)) = skipped.into_iter().next() {
+        return Err(error);
     }
-
-    let mut similar_pairs = Vec::new();
-
-    // Compare all pairs
-    for i in 0..functions.len() {
-        for j in (i + 1)..functions.len() {
-            // Skip if either function is too short
-            if let Some(min_tokens) = options.min_tokens {
-                // If min_tokens is specified, use token count instead of line count
-                let tokens_i = functions[i].node_count.unwrap_or(0);
-                let tokens_j = functions[j].node_count.unwrap_or(0);
-                if tokens_i < min_tokens || tokens_j < min_tokens {
-                    continue;
-                }
-            } else {
-                // Otherwise use line count
-                if functions[i].line_count() < options.min_lines
-                    || functions[j].line_count() < options.min_lines
-                {
-                    continue;
-                }
-            }
-
-            // Skip if functions have parent-child relationship
-            if functions[i].is_parent_child_relationship(&functions[j]) {
-                continue;
-            }
-
-            let (Some(tree_i), Some(tree_j)) = (&trees[i], &trees[j]) else {
-                continue;
-            };
-
-            let similarity = match compare_function_trees(
-                tree_i,
-                tree_j,
-                &functions[i],
-                &functions[j],
-                options,
-                threshold,
-            ) {
-                Ok(sim) => sim,
-                Err(_) => continue,
-            };
-
-            if similarity >= threshold {
-                similar_pairs.push(SimilarityResult::new(
-                    functions[i].clone(),
-                    functions[j].clone(),
-                    similarity,
-                ));
-            }
-        }
-    }
-
-    // Sort by impact (descending), then by similarity (descending)
-    similar_pairs.sort_by(|a, b| {
-        b.impact
-            .cmp(&a.impact)
-            .then(b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal))
-    });
-
-    Ok(similar_pairs)
+    Ok(pairs.into_iter().map(|(_, result, _)| result).collect())
 }
 
-/// Find similar functions across multiple files
+/// Find similar functions across multiple files (cross-file pairs only;
+/// same-file pairs are the domain of [`find_similar_functions_in_file`]).
+///
+/// # Errors
+///
+/// Currently infallible — files that fail to parse are skipped — but the
+/// signature keeps `Result` for backwards compatibility.
 pub fn find_similar_functions_across_files(
     files: &[(String, String)], // (filename, source_text)
     threshold: f64,
     options: &TSEDOptions,
 ) -> Result<CrossFileSimilarityResult, String> {
-    let mut all_functions = Vec::new();
-
-    // Extract functions from all files, skipping files that fail to parse
-    // rather than aborting the whole batch.
-    for (filename, source) in files {
-        let mut functions = match extract_functions(filename, source) {
-            Ok(funcs) => funcs,
-            Err(_) => continue,
-        };
-        functions.retain(|function| !function.has_ignore_directive);
-        for func in functions {
-            all_functions.push((filename.clone(), source.clone(), func));
-        }
-    }
-
-    // Pre-parse function bodies once so the pairwise loop avoids the
-    // dominant parse-per-pair cost. See the comment on the same-file
-    // variant for why this matters — at 1000+ functions the parse work
-    // alone dwarfs the APTED computation.
-    let trees: Vec<Option<std::rc::Rc<crate::tree::TreeNode>>> = all_functions
-        .iter()
-        .map(|(filename, source, func)| parse_function_for_comparison(filename, func, source).ok())
-        .collect();
-
-    let mut similar_pairs = Vec::new();
-
-    // Compare all pairs across files
-    for i in 0..all_functions.len() {
-        for j in (i + 1)..all_functions.len() {
-            let (first_file, _source1, func1) = &all_functions[i];
-            let (second_file, _source2, func2) = &all_functions[j];
-
-            // Skip if same file (already handled by find_similar_functions_in_file)
-            if first_file == second_file {
-                continue;
-            }
-
-            // Skip if either function is too short
-            if let Some(min_tokens) = options.min_tokens {
-                // If min_tokens is specified, use token count instead of line count
-                let tokens1 = func1.node_count.unwrap_or(0);
-                let tokens2 = func2.node_count.unwrap_or(0);
-                if tokens1 < min_tokens || tokens2 < min_tokens {
-                    continue;
-                }
-            } else {
-                // Otherwise use line count
-                if func1.line_count() < options.min_lines || func2.line_count() < options.min_lines
-                {
-                    continue;
-                }
-            }
-
-            // Skip if functions have parent-child relationship (across files)
-            if func1.is_parent_child_relationship(func2) {
-                continue;
-            }
-
-            let (Some(tree1), Some(tree2)) = (&trees[i], &trees[j]) else {
-                continue;
-            };
-
-            let similarity = match compare_function_trees(
-                tree1, tree2, func1, func2, options, threshold,
-            ) {
-                Ok(sim) => sim,
-                Err(_) => continue,
-            };
-
-            if similarity >= threshold {
-                similar_pairs.push((
-                    first_file.clone(),
-                    SimilarityResult::new(func1.clone(), func2.clone(), similarity),
-                    second_file.clone(),
-                ));
-            }
-        }
-    }
-
-    // Sort by impact (descending), then by similarity (descending)
-    similar_pairs.sort_by(|a, b| {
-        b.1.impact
-            .cmp(&a.1.impact)
-            .then(b.1.similarity.partial_cmp(&a.1.similarity).unwrap_or(std::cmp::Ordering::Equal))
-    });
-
-    Ok(similar_pairs)
+    let (pairs, _skipped) =
+        find_similar_function_pairs(files, threshold, options, PairScope::CrossFileOnly);
+    Ok(pairs)
 }
 
 #[cfg(test)]
@@ -1310,50 +1460,41 @@ mod tests {
         assert_eq!(constructor.function_type, FunctionType::Constructor);
         assert_eq!(constructor.class_name, Some("Calculator".to_string()));
 
-        // Check that node_count is populated for all functions
-        for func in &functions {
-            assert!(
-                func.node_count.is_some(),
-                "Function {} should have node_count populated",
-                func.name
-            );
-            // Node count should be reasonable (greater than 0)
-            assert!(
-                func.node_count.unwrap() > 0,
-                "Function {} should have positive node_count",
-                func.name
-            );
-        }
     }
 
     #[test]
-    fn test_node_count_calculation() {
-        let code = r#"
-            function simple() {
+    fn min_tokens_gate_uses_comparison_tree_size() {
+        let code = r"
+            function tinyA() {
                 return 42;
             }
-            
-            function complex(a: number, b: number): number {
-                if (a > b) {
-                    return a - b;
-                } else {
-                    return a + b;
-                }
+
+            function tinyB() {
+                return 42;
             }
-        "#;
+        ";
+        let mut options = TSEDOptions::default();
+        options.min_lines = 1;
+        options.size_penalty = false;
 
-        let functions = extract_functions("test.ts", code).unwrap();
+        // Without a token gate the identical pair is reported…
+        let (pairs, _) = find_similar_function_pairs(
+            &[("test.ts".to_string(), code.to_string())],
+            0.9,
+            &options,
+            PairScope::SameFileOnly,
+        );
+        assert_eq!(pairs.len(), 1);
 
-        let simple = functions.iter().find(|f| f.name == "simple").unwrap();
-        let complex = functions.iter().find(|f| f.name == "complex").unwrap();
-
-        println!("Simple function node count: {:?}", simple.node_count);
-        println!("Complex function node count: {:?}", complex.node_count);
-
-        // Simple function should have fewer nodes than complex
-        assert!(simple.node_count.is_some());
-        assert!(complex.node_count.is_some());
-        assert!(simple.node_count.unwrap() < complex.node_count.unwrap());
+        // …and a high min_tokens threshold filters it out.
+        options.min_tokens = Some(500);
+        let (pairs, _) = find_similar_function_pairs(
+            &[("test.ts".to_string(), code.to_string())],
+            0.9,
+            &options,
+            PairScope::SameFileOnly,
+        );
+        assert!(pairs.is_empty());
     }
 
     #[test]
@@ -1445,21 +1586,23 @@ mod tests {
         let similar_pairs =
             find_similar_functions_across_files(&[file1, file2], 0.7, &options).unwrap();
 
-        // Should find that processUser/handleUser and validateUser/checkUser are similar
-        assert!(similar_pairs.len() >= 2);
-
-        // Check specific pairs
-        let process_handle = similar_pairs.iter().find(|(_, result, _)| {
-            (result.func1.name == "processUser" && result.func2.name == "handleUser")
-                || (result.func1.name == "handleUser" && result.func2.name == "processUser")
-        });
-        assert!(process_handle.is_some());
-
+        // validateUser/checkUser are genuine rename duplicates (same free
+        // atoms, renamed locals) and must be reported.
         let validate_check = similar_pairs.iter().find(|(_, result, _)| {
             (result.func1.name == "validateUser" && result.func2.name == "checkUser")
                 || (result.func1.name == "checkUser" && result.func2.name == "validateUser")
         });
         assert!(validate_check.is_some());
+
+        // processUser/handleUser share only the three-call skeleton — the
+        // callees are entirely different sets, which the behavioral-atom
+        // cap treats as different work (mirroring the corpus's skeleton
+        // negatives), so the pair stays below the 0.7 threshold.
+        let process_handle = similar_pairs.iter().find(|(_, result, _)| {
+            (result.func1.name == "processUser" && result.func2.name == "handleUser")
+                || (result.func1.name == "handleUser" && result.func2.name == "processUser")
+        });
+        assert!(process_handle.is_none());
     }
 
     #[test]

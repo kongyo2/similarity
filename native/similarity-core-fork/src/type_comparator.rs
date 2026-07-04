@@ -48,8 +48,14 @@ pub struct TypeComparisonOptions {
 impl Default for TypeComparisonOptions {
     fn default() -> Self {
         Self {
-            structural_weight: 0.6,
-            naming_weight: 0.4,
+            // Structural evidence dominates: naming overlap is redundant
+            // with the exact-name matching phase and used to prop up
+            // coincidental matches (any shared property name guaranteed a
+            // 0.8+ naming term). 0.85/0.15 keeps full-rename skeleton
+            // matches above the default threshold while same-name/
+            // different-type lookalikes fall well below it.
+            structural_weight: 0.85,
+            naming_weight: 0.15,
             property_match_threshold: 0.7,
             allow_cross_kind_comparison: true,
             normalization_options: NormalizationOptions::default(),
@@ -297,7 +303,7 @@ pub fn find_similar_types(
     }
 
     // Sort by similarity (descending)
-    similar_pairs.sort_by(|a, b| b.result.similarity.partial_cmp(&a.result.similarity).unwrap());
+    similar_pairs.sort_by(|a, b| b.result.similarity.total_cmp(&a.result.similarity));
 
     similar_pairs
 }
@@ -430,7 +436,7 @@ pub fn find_similar_type_literals(
     }
 
     // Sort by similarity (descending)
-    similar_pairs.sort_by(|a, b| b.result.similarity.partial_cmp(&a.result.similarity).unwrap());
+    similar_pairs.sort_by(|a, b| b.result.similarity.total_cmp(&a.result.similarity));
 
     similar_pairs
 }
@@ -542,9 +548,18 @@ mod tests {
         let options = TypeComparisonOptions::default();
         let result = compare_types(&type1, &type2, &options);
 
+        // `name` and `fullName` share the exact same type, so the
+        // rename-tolerant phase pairs them — at a small discount, keeping
+        // the renamed pair strictly below a byte-identical pair.
         assert!(result.similarity > 0.5);
-        assert!(result.similarity < 0.9);
-        assert_eq!(result.matched_properties.len(), 1); // Only "id" matches
+        assert_eq!(result.matched_properties.len(), 2);
+
+        let identical = create_test_type(
+            "Account",
+            vec![("id", "string", false, false), ("name", "string", false, false)],
+        );
+        let identical_result = compare_types(&type1, &identical, &options);
+        assert!(identical_result.similarity > result.similarity);
     }
 
     #[test]

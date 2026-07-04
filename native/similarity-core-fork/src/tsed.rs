@@ -178,13 +178,16 @@ fn finalize_tsed_similarity(
                     similarity *= 0.88;
                 }
             }
-        } else if min_size < 10.0 {
-            // Identical trees of < 10 nodes still get a mild discount so a
+        } else if min_size < 8.0 {
+            // Identical trees below ~8 nodes still get a mild discount so a
             // 1-token `() => 0` vs `() => 0` doesn't dominate the report,
-            // but the discount is bounded — for two distinct 4-line helpers
-            // with byte-identical bodies the score lands around 0.85, well
-            // above the default 0.8 threshold.
-            let base_factor = ((min_size + 4.0) / 14.0).clamp(0.7, 0.95);
+            // but the discount is bounded. Larger identical trees take no
+            // discount at all: the canonicalizer legitimately SHRINKS
+            // equivalent bodies (temp-return elimination, single-use
+            // inlining), and an exact structural match is the strongest
+            // duplicate signal there is — its score should not depend on
+            // how compact the canonical form happens to be.
+            let base_factor = ((min_size + 4.0) / 12.0).clamp(0.7, 0.95);
             similarity *= base_factor;
         }
 

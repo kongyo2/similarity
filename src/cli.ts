@@ -42,6 +42,8 @@ interface ParsedCliOptions {
    */
   allowCrossKind: boolean;
   typeLiterals: boolean;
+  minTokens?: string;
+  failOnDuplicates: boolean;
   overlapMinWindow: number;
   overlapMaxWindow: number;
   overlapSizeTolerance: number;
@@ -69,7 +71,9 @@ function parseModes(rawModes: string): AnalyzerMode[] {
   if (parsed.length === 0) {
     return DEFAULT_MODES;
   }
-  return parsed.map((mode) => modeSchema.parse(mode));
+  // De-duplicate so `--modes functions,functions` doesn't render the same
+  // report section twice.
+  return [...new Set(parsed.map((mode) => modeSchema.parse(mode)))];
 }
 
 function parseExtensions(rawExtensions: string): string[] {
@@ -96,6 +100,10 @@ function buildProgram(io: CliIO): Command {
     )
     .option("-t, --threshold <number>", "Similarity threshold (0-1)", String(DEFAULT_THRESHOLD))
     .option("--min-lines <number>", "Minimum function line count", String(DEFAULT_MIN_LINES))
+    .option(
+      "--min-tokens <number>",
+      "Minimum function size in AST nodes (replaces the line gate; ~50 recommended for noisy code)",
+    )
     .option("--no-size-penalty", "Disable line-count size penalty for function mode")
     .option("--same-file-only", "Only compare symbols from the same file", false)
     .option("--cross-file-only", "Only compare symbols across different files", false)
@@ -136,6 +144,11 @@ function buildProgram(io: CliIO): Command {
       "Exit with a non-zero code when the analysis emits any warning",
       false,
     )
+    .option(
+      "--fail-on-duplicates",
+      "Exit with a non-zero code when any similar pair is reported (for CI gates)",
+      false,
+    )
     .showHelpAfterError(true);
   // Route commander's own output (`--help`, `--version`, parse errors)
   // through the injected io and surface terminations as return codes
@@ -149,21 +162,27 @@ function buildProgram(io: CliIO): Command {
   return program;
 }
 
+// Only plain decimal notation is accepted: `Number("")` is 0 and
+// `Number("0x10")`/`Number("1e9")` silently succeed, which turned typos
+// into surprising thresholds and limits.
+const DECIMAL_NUMBER = /^-?(?:\d+|\d*\.\d+)$/;
+const DECIMAL_INTEGER = /^-?\d+$/;
+
 function parseNumber(value: string, field: string): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
+  const raw = value.trim();
+  if (!DECIMAL_NUMBER.test(raw)) {
     throw new Error(`${field} must be a valid number`);
   }
-  return parsed;
+  return Number(raw);
 }
 
 function parseInteger(value: unknown, field: string, minimum = 1): number {
   const raw = String(value).trim();
-  if (raw.length === 0) {
+  if (!DECIMAL_INTEGER.test(raw)) {
     throw new Error(`${field} must be an integer`);
   }
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+  if (!Number.isSafeInteger(parsed)) {
     throw new Error(`${field} must be an integer`);
   }
   if (parsed < minimum) {
@@ -175,6 +194,10 @@ function parseInteger(value: unknown, field: string, minimum = 1): number {
 function normalizeOptions(rawOptions: ParsedCliOptions) {
   const threshold = parseNumber(String(rawOptions.threshold), "threshold");
   const minLines = parseInteger(rawOptions.minLines, "min-lines");
+  const minTokens =
+    rawOptions.minTokens === undefined
+      ? undefined
+      : parseInteger(rawOptions.minTokens, "min-tokens");
   const overlapMinWindow = parseInteger(rawOptions.overlapMinWindow, "overlap-min-window");
   const overlapMaxWindow = parseInteger(rawOptions.overlapMaxWindow, "overlap-max-window");
   const overlapSizeTolerance = parseNumber(String(rawOptions.overlapSizeTolerance), "overlap-size-tolerance");
@@ -203,6 +226,7 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
     modes: parseModes(rawOptions.modes),
     threshold,
     minLines,
+    minTokens,
     noSizePenalty: !sizePenalty,
     sameFileOnly: rawOptions.sameFileOnly,
     crossFileOnly: rawOptions.crossFileOnly,
@@ -217,6 +241,7 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
     format: rawOptions.format,
     output: rawOptions.output,
     failOnWarnings: Boolean(rawOptions.failOnWarnings),
+    failOnDuplicates: Boolean(rawOptions.failOnDuplicates),
   };
 }
 
@@ -233,6 +258,7 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
       modes: options.modes,
       threshold: options.threshold,
       minLines: options.minLines,
+      minTokens: options.minTokens,
       noSizePenalty: options.noSizePenalty,
       sameFileOnly: options.sameFileOnly,
       crossFileOnly: options.crossFileOnly,
@@ -251,6 +277,9 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
       : formatPrettyReport(report, process.cwd(), options.modes);
 
     if (options.output) {
+      // The analysis is already done — don't lose it to a missing parent
+      // directory.
+      await fs.mkdir(path.dirname(path.resolve(options.output)), { recursive: true });
       await fs.writeFile(options.output, `${rendered}\n`, "utf8");
       io.log(`Report written: ${options.output}`);
     } else {
@@ -258,13 +287,18 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
     }
 
     const warnings = report.warnings;
-    if (warnings.length > 0) {
-      for (const warning of warnings) {
-        io.error(warning.filePath ? `${warning.filePath}: ${warning.message}` : warning.message);
-      }
-      if (report.stats.fileCount === 0 || options.failOnWarnings) {
-        return 1;
-      }
+    for (const warning of warnings) {
+      io.error(warning.filePath ? `${warning.filePath}: ${warning.message}` : warning.message);
+    }
+    // Zero analyzed files is only an error when something went wrong
+    // getting there (missing paths, unreadable files — i.e. a warning
+    // fired). An empty or fully-ignored target with a clean run is a
+    // legitimate no-op and exits 0.
+    if (warnings.length > 0 && (report.stats.fileCount === 0 || options.failOnWarnings)) {
+      return 1;
+    }
+    if (options.failOnDuplicates && report.stats.pairCount > 0) {
+      return 1;
     }
     return 0;
   } catch (error) {
@@ -274,7 +308,7 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
       // code remains to be propagated.
       return error.exitCode;
     }
-    io.error((error as Error).message);
+    io.error(error instanceof Error ? error.message : String(error));
     return 1;
   }
 }

@@ -121,11 +121,19 @@ impl IndexedFunction {
         min_size: u32,
         max_size: u32,
     ) -> Vec<&SubtreeFingerprint> {
-        self.size_index
+        let mut subtrees: Vec<&SubtreeFingerprint> = self
+            .size_index
             .iter()
             .filter(|(size, _)| **size >= min_size && **size <= max_size)
             .flat_map(|(_, subtrees)| subtrees.iter())
-            .collect()
+            .collect();
+        // HashMap iteration order is nondeterministic; sort so reported
+        // overlaps (and which duplicate survives dedup) are stable.
+        subtrees.sort_by(|a, b| {
+            (a.start_line, a.end_line, a.weight, a.hash)
+                .cmp(&(b.start_line, b.end_line, b.weight, b.hash))
+        });
+        subtrees
     }
 
     /// Update bloom filter with subtree fingerprint
@@ -187,16 +195,65 @@ impl Default for OverlapOptions {
     }
 }
 
-/// Generate fingerprint for a tree node and all its subtrees
+/// Byte-offset → 1-based line lookup for one source snippet. Built once
+/// per indexed function so fingerprints can report real line ranges.
+#[derive(Debug, Clone)]
+pub struct LineIndex {
+    line_starts: Vec<u32>,
+}
+
+impl LineIndex {
+    #[must_use]
+    pub fn new(text: &str) -> Self {
+        let mut line_starts = Vec::with_capacity(text.len() / 24 + 1);
+        line_starts.push(0);
+        for (position, byte) in text.bytes().enumerate() {
+            if byte == b'\n' {
+                #[allow(clippy::cast_possible_truncation)]
+                line_starts.push(position as u32 + 1);
+            }
+        }
+        Self { line_starts }
+    }
+
+    #[must_use]
+    pub fn line_of(&self, byte_offset: u32) -> u32 {
+        #[allow(clippy::cast_possible_truncation)]
+        let index = self.line_starts.partition_point(|&start| start <= byte_offset);
+        index.max(1) as u32
+    }
+}
+
+/// Generate fingerprint for a tree node and all its subtrees.
+///
+/// `base_line` is the 1-based line of the snippet's first line in the
+/// original file. When `lines` is provided and a node carries a real
+/// `source_span`, the fingerprint's `start_line`/`end_line` are the
+/// node's actual source lines; nodes without span information inherit
+/// their nearest spanned ancestor's range (`fallback_span`).
 pub fn generate_subtree_fingerprints(
     node: &Rc<TreeNode>,
     depth: u32,
-    parent_line_offset: u32,
+    base_line: u32,
+    lines: Option<&LineIndex>,
+) -> (SubtreeFingerprint, Vec<SubtreeFingerprint>) {
+    generate_subtree_fingerprints_inner(node, depth, base_line, lines, (0, 0))
+}
+
+fn generate_subtree_fingerprints_inner(
+    node: &Rc<TreeNode>,
+    depth: u32,
+    base_line: u32,
+    lines: Option<&LineIndex>,
+    fallback_span: (u32, u32),
 ) -> (SubtreeFingerprint, Vec<SubtreeFingerprint>) {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut all_fingerprints = Vec::new();
     let mut child_hashes = Vec::new();
     let mut total_weight = 1u32; // Current node counts as 1
+
+    let effective_span =
+        if node.source_span.1 > 0 { node.source_span } else { fallback_span };
 
     // Hash the node type/label
     node.label.hash(&mut hasher);
@@ -204,7 +261,7 @@ pub fn generate_subtree_fingerprints(
     // Process children
     for child in &node.children {
         let (child_fp, child_subtrees) =
-            generate_subtree_fingerprints(child, depth + 1, parent_line_offset);
+            generate_subtree_fingerprints_inner(child, depth + 1, base_line, lines, effective_span);
 
         // Add child's hash to our list
         child_hashes.push(child_fp.hash);
@@ -225,9 +282,19 @@ pub fn generate_subtree_fingerprints(
 
     let hash = hasher.finish();
 
-    // Calculate line numbers (simplified - using node id as proxy for line numbers)
-    let start_line = parent_line_offset + node.id as u32;
-    let end_line = start_line + total_weight;
+    #[allow(clippy::cast_possible_truncation)]
+    let (start_line, end_line) = match lines {
+        Some(index) if effective_span.1 > 0 => (
+            base_line.saturating_sub(1) + index.line_of(effective_span.0),
+            base_line.saturating_sub(1) + index.line_of(effective_span.1.saturating_sub(1)),
+        ),
+        // Legacy proxy when no span data is available: node ids are
+        // monotone within a parse, so ranges at least nest consistently.
+        _ => {
+            let start = base_line + node.id as u32;
+            (start, start + total_weight)
+        }
+    };
 
     let fingerprint = SubtreeFingerprint {
         weight: total_weight,
@@ -375,8 +442,8 @@ pub fn detect_partial_overlaps(
                 overlaps.push(PartialOverlap {
                     source_function: source_func.name.clone(),
                     target_function: target_func.name.clone(),
-                    source_lines: (source_func.start_line, source_func.end_line),
-                    target_lines: (target_func.start_line, target_func.end_line),
+                    source_lines: (src.start_line, src.end_line),
+                    target_lines: (tgt.start_line, tgt.end_line),
                     similarity: 1.0,
                     node_count: src.weight,
                     node_type: tgt.node_type.clone(),
@@ -470,17 +537,27 @@ pub fn detect_partial_overlaps(
                             }
                         }
 
-                        // The internal fingerprint start/end lines are synthesized
-                        // from node ids inside the per-function AST and do not map
-                        // to real source positions (they can exceed the file's
-                        // actual line count). Report the enclosing function's real
-                        // line range instead so downstream consumers always get
-                        // valid, in-bounds locations.
+                        // Window/subtree fingerprints now carry real source
+                        // lines (when span data is available); clamp to the
+                        // enclosing function's range as a safety net for the
+                        // legacy id-proxy fallback.
+                        let clamp = |lines: (u32, u32), func: &IndexedFunction| {
+                            (
+                                lines.0.clamp(func.start_line, func.end_line),
+                                lines.1.clamp(func.start_line, func.end_line),
+                            )
+                        };
                         overlaps.push(PartialOverlap {
                             source_function: source_func.name.clone(),
                             target_function: target_func.name.clone(),
-                            source_lines: (source_func.start_line, source_func.end_line),
-                            target_lines: (target_func.start_line, target_func.end_line),
+                            source_lines: clamp(
+                                (source_window.start_line, source_window.end_line),
+                                source_func,
+                            ),
+                            target_lines: clamp(
+                                (target_subtree.start_line, target_subtree.end_line),
+                                target_func,
+                            ),
                             similarity,
                             node_count: source_window.weight,
                             node_type: target_subtree.node_type.clone(),
@@ -491,8 +568,15 @@ pub fn detect_partial_overlaps(
         }
     }
 
-    // Sort by similarity and remove duplicates
-    overlaps.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    // Sort by similarity (desc), then position, so dedup keeps the best
+    // representative deterministically.
+    overlaps.sort_by(|a, b| {
+        b.similarity
+            .total_cmp(&a.similarity)
+            .then_with(|| a.source_lines.cmp(&b.source_lines))
+            .then_with(|| a.target_lines.cmp(&b.target_lines))
+            .then_with(|| b.node_count.cmp(&a.node_count))
+    });
     deduplicate_overlaps(overlaps)
 }
 

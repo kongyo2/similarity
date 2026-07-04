@@ -27,6 +27,12 @@ export interface AnalyzeProjectOptions {
   modes?: AnalyzerMode[];
   threshold?: number;
   minLines?: number;
+  /**
+   * Minimum function size in AST nodes (measured on the same normalized
+   * tree the comparison scores). When set it replaces the line-count
+   * gate; ~50 is a good starting point for noisy codebases.
+   */
+  minTokens?: number;
   noSizePenalty?: boolean;
   sameFileOnly?: boolean;
   crossFileOnly?: boolean;
