@@ -581,7 +581,7 @@ pub fn find_property_matches(
             if matched2.contains(*prop2) {
                 continue;
             }
-            let type2_annotation = &type2.properties[**prop2];
+            let type2_annotation = &type2.properties[*prop2];
             if type1_annotation == type2_annotation {
                 let name_similarity = calculate_property_similarity(prop1, prop2);
                 if best.is_none_or(|(_, current)| name_similarity > current) {
