@@ -739,6 +739,111 @@ describe("runCli", () => {
       expect(errors.some((message) => message.includes("Parse errors"))).toBe(true);
     });
   });
+
+  it("rejects hex, exponent, and empty numeric option values", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.writeFile(path.join(projectDir, "a.ts"), "export const x = 1;\n", "utf8");
+      for (const args of [
+        ["--threshold", ""],
+        ["--threshold", "0x1"],
+        ["--min-lines", "1e2"],
+        ["--min-lines", "0x5"],
+      ]) {
+        const errors: string[] = [];
+        const exitCode = await runCli([projectDir, ...args], {
+          log: () => {},
+          error: (message) => errors.push(message),
+        });
+        expect(exitCode, args.join(" ")).toBe(1);
+        expect(errors.some((m) => m.includes("must be")), args.join(" ")).toBe(true);
+      }
+    });
+  });
+
+  it("de-duplicates repeated --modes so sections render once", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.writeFile(path.join(projectDir, "a.ts"), "export const x = 1;\n", "utf8");
+      const logs: string[] = [];
+      const exitCode = await runCli(
+        [projectDir, "--modes", "functions,functions", "--format", "pretty"],
+        { log: (message) => logs.push(message), error: () => {} },
+      );
+      expect(exitCode).toBe(0);
+      const rendered = logs.join("\n");
+      expect(rendered.match(/=== Function Similarity ===/g)).toHaveLength(1);
+    });
+  });
+
+  it("filters small functions with --min-tokens", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.writeFile(
+        path.join(projectDir, "a.ts"),
+        `
+export function tinyA(): number {
+  const next = 1 + 1;
+  return next;
+}
+
+export function tinyB(): number {
+  const next = 1 + 1;
+  return next;
+}
+`,
+        "utf8",
+      );
+      const run = async (extra: string[]) => {
+        const logs: string[] = [];
+        const exitCode = await runCli(
+          [projectDir, "--modes", "functions", "--format", "json", ...extra],
+          { log: (message) => logs.push(message), error: () => {} },
+        );
+        expect(exitCode).toBe(0);
+        return JSON.parse(logs[0]) as { stats: { pairCount: number } };
+      };
+
+      const without = await run([]);
+      const withGate = await run(["--min-tokens", "500"]);
+      expect(without.stats.pairCount).toBeGreaterThan(0);
+      expect(withGate.stats.pairCount).toBe(0);
+    });
+  });
+
+  it("exits non-zero with --fail-on-duplicates when pairs are reported", async () => {
+    await withTempProject(async (projectDir) => {
+      await fs.writeFile(
+        path.join(projectDir, "a.ts"),
+        `
+export function alphaSum(values: number[]): number {
+  let total = 0;
+  for (const value of values) {
+    total += value;
+  }
+  return total;
+}
+
+export function betaSum(items: number[]): number {
+  let sum = 0;
+  for (const item of items) {
+    sum += item;
+  }
+  return sum;
+}
+`,
+        "utf8",
+      );
+      const gated = await runCli(
+        [projectDir, "--modes", "functions", "--fail-on-duplicates", "--format", "json"],
+        { log: () => {}, error: () => {} },
+      );
+      expect(gated).toBe(1);
+
+      const ungated = await runCli(
+        [projectDir, "--modes", "functions", "--format", "json"],
+        { log: () => {}, error: () => {} },
+      );
+      expect(ungated).toBe(0);
+    });
+  });
 });
 
 describe("isCliEntrypoint", () => {

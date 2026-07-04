@@ -14,6 +14,11 @@
  * (threshold 0.8, minLines 3) in the mode the case targets.
  */
 
+import { classAndScenarioCases } from "./cases/classes-and-scenarios.js";
+import { functionNegativeCases } from "./cases/functions-negative.js";
+import { functionPositiveCases } from "./cases/functions-positive.js";
+import { typeCases } from "./cases/types.js";
+
 export type BenchMode = "functions" | "types" | "classes";
 
 export interface BenchCase {
@@ -26,7 +31,16 @@ export interface BenchCase {
   forbidPairs?: [string, string][];
 }
 
-export const benchCases: BenchCase[] = [
+/**
+ * Core corpus (F-/T-/C- ids): the original 71 labeled pairs that gated
+ * v0.4.0. The extended corpora in `bench/cases/` (XF-/XT-/XC-/XS- ids)
+ * push into much harder territory — consistent whole-function renames,
+ * guard/negation/ternary spellings, loop-form rewrites, destructuring,
+ * nullish sugar, and realistic cross-file copy-paste — plus matching
+ * negative traps for each equivalence family. `benchCases` (exported at
+ * the bottom) is the concatenation; the accuracy benchmark runs it all.
+ */
+const coreCases: BenchCase[] = [
   // -------------------------------------------------------------------
   // functions — positives: semantic duplicates a refactor plan must see
   // -------------------------------------------------------------------
@@ -1431,8 +1445,13 @@ export interface ServerResponse<T> {
 }
 `,
     },
+    // Response↔ApiResult are full skeleton twins (same member types,
+    // every name changed) — exactly the consistently-renamed shape the
+    // rename-tolerant matcher exists to surface, so it is expected.
+    // ServerResponse differs in contract (`error?` optional vs required
+    // message) and stays forbidden.
+    expectPairs: [["Response", "ApiResult"]],
     forbidPairs: [
-      ["Response", "ApiResult"],
       ["ApiResult", "ServerResponse"],
       ["Response", "ServerResponse"],
     ],
@@ -1737,4 +1756,12 @@ export class TextPipeline {
     },
     forbidPairs: [["InputValidator", "TextPipeline"]],
   },
+];
+
+export const benchCases: BenchCase[] = [
+  ...coreCases,
+  ...functionPositiveCases,
+  ...functionNegativeCases,
+  ...typeCases,
+  ...classAndScenarioCases,
 ];

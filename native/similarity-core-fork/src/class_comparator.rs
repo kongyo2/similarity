@@ -68,6 +68,7 @@ pub fn normalize_class(class: &ClassDefinition) -> NormalizedClass {
             is_async: method.is_async,
             is_generator: method.is_generator,
             kind: method.kind.clone(),
+            body_fingerprint: method.body_fingerprint,
         };
         methods.insert(method.name.clone(), normalized_method);
     }
@@ -233,15 +234,39 @@ fn calculate_name_similarity(name1: &str, name2: &str) -> f64 {
         return 1.0;
     }
 
-    // Calculate Levenshtein distance
+    // Calculate Levenshtein distance (char-based, like the distance).
     let distance = levenshtein_distance(name1, name2);
-    let max_len = name1.len().max(name2.len()) as f64;
+    let max_len = name1.chars().count().max(name2.chars().count()) as f64;
 
     if max_len > 0.0 {
         1.0 - (distance as f64 / max_len)
     } else {
         1.0
     }
+}
+
+/// Multiplier applied to a matched method pair's credit reflecting how
+/// much the two methods actually agree beyond their names/signatures:
+///
+/// * canonical body fingerprints disagree → bodies compute different
+///   things (`0.55`) — signatures alone used to hide this entirely;
+/// * `static` mismatch → different runtime surface (`0.4`);
+/// * accessor-kind mismatch (getter/setter vs plain method) → different
+///   call contract (`0.5`).
+fn method_agreement_factor(method1: &ClassMethod, method2: &ClassMethod) -> f64 {
+    let mut factor = 1.0;
+    if let (Some(fp1), Some(fp2)) = (method1.body_fingerprint, method2.body_fingerprint) {
+        if fp1 != fp2 {
+            factor *= 0.55;
+        }
+    }
+    if method1.is_static != method2.is_static {
+        factor *= 0.4;
+    }
+    if method1.kind != method2.kind {
+        factor *= 0.5;
+    }
+    factor
 }
 
 fn calculate_structural_similarity(
@@ -279,7 +304,16 @@ fn calculate_structural_similarity(
     for name in &class1_property_names {
         let prop1 = &class1.properties[*name];
         if let Some(prop2) = class2.properties.get(*name) {
-            if prop1.type_annotation == prop2.type_annotation {
+            // Class-reference types tolerate renames: `repo: InvoiceRepo`
+            // and `repo: ReceiptRepo` are the same dependency slot in two
+            // renamed class families (the same placeholdering the fuzzy
+            // method matcher applies to signatures). Primitive types are
+            // untouched — `count: number` vs `count: string` stays a
+            // genuine mismatch.
+            if prop1.type_annotation == prop2.type_annotation
+                || replace_camelcase_identifiers(&prop1.type_annotation)
+                    == replace_camelcase_identifiers(&prop2.type_annotation)
+            {
                 // Strict match — credit both class1 and class2 sides.
                 property_score += 2.0;
             } else {
@@ -383,12 +417,20 @@ fn calculate_structural_similarity(
             // neutral refactors — when the name matches and the
             // name-stripped signatures agree, credit a full match instead
             // of the partial-mismatch rate.
+            let agreement = method_agreement_factor(method1, method2);
             if sig1 == sig2
                 || normalize_signature_for_fuzzy(method1) == normalize_signature_for_fuzzy(method2)
             {
-                method_score += 2.0;
+                method_score += 2.0 * agreement;
+                if agreement < 1.0 {
+                    method_signature_mismatches.push(MethodMismatch {
+                        name: (*name).to_string(),
+                        signature1: sig1,
+                        signature2: sig2,
+                    });
+                }
             } else {
-                method_score += 1.4;
+                method_score += 1.4 * agreement;
                 method_signature_mismatches.push(MethodMismatch {
                     name: (*name).to_string(),
                     signature1: sig1,
@@ -449,7 +491,8 @@ fn calculate_structural_similarity(
             // structurally different method with a tangentially similar
             // name does not.
             if score >= 0.65 {
-                method_score += 2.0 * score;
+                let method2 = &class2.methods[name2];
+                method_score += 2.0 * score * method_agreement_factor(method1, method2);
                 method_leftover_consumed.insert(name2.to_string());
                 continue;
             }
@@ -468,8 +511,19 @@ fn calculate_structural_similarity(
     let total_elements = property_total_count + method_total_count;
     let matched_elements = property_score + method_score;
 
-    let structural_similarity =
-        if total_elements > 0.0 { (matched_elements / total_elements).min(1.0) } else { 1.0 };
+    let structural_similarity = if total_elements > 0.0 {
+        (matched_elements / total_elements).min(1.0)
+    } else {
+        // Two member-less classes: everything they DO comes from their
+        // heritage, so "identical" is only justified when the heritage
+        // matches (`class NotFoundError extends HttpError {}` vs
+        // `class RateLimitError extends OtherBase {}` share nothing).
+        if class1.extends == class2.extends && class1.implements == class2.implements {
+            0.85
+        } else {
+            0.3
+        }
+    };
 
     let differences = ClassDifferences {
         missing_properties,
@@ -484,27 +538,36 @@ fn calculate_structural_similarity(
 }
 
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
-    let len1 = s1.len();
-    let len2 = s2.len();
-    let mut matrix = vec![vec![0; len2 + 1]; len1 + 1];
+    // Operate on CHAR counts throughout. Sizing the matrix by byte length
+    // while filling it by char iteration used to leave the bottom-right
+    // cell untouched for multibyte names, so any two non-ASCII class
+    // names compared as distance 0 (similarity 1.0).
+    let chars1: Vec<char> = s1.chars().collect();
+    let chars2: Vec<char> = s2.chars().collect();
+    let len1 = chars1.len();
+    let len2 = chars2.len();
 
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..=len1 {
-        matrix[i][0] = i;
+    if len1 == 0 {
+        return len2;
+    }
+    if len2 == 0 {
+        return len1;
     }
 
-    #[allow(clippy::needless_range_loop)]
-    for j in 0..=len2 {
-        matrix[0][j] = j;
+    let mut matrix = vec![vec![0usize; len2 + 1]; len1 + 1];
+    for (i, row) in matrix.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in matrix[0].iter_mut().enumerate() {
+        *cell = j;
     }
 
-    for (i, c1) in s1.chars().enumerate() {
-        for (j, c2) in s2.chars().enumerate() {
-            let cost = if c1 == c2 { 0 } else { 1 };
-            matrix[i + 1][j + 1] = std::cmp::min(
-                std::cmp::min(matrix[i][j + 1] + 1, matrix[i + 1][j] + 1),
-                matrix[i][j] + cost,
-            );
+    for i in 1..=len1 {
+        for j in 1..=len2 {
+            let cost = usize::from(chars1[i - 1] != chars2[j - 1]);
+            matrix[i][j] = (matrix[i - 1][j] + 1)
+                .min(matrix[i][j - 1] + 1)
+                .min(matrix[i - 1][j - 1] + cost);
         }
     }
 

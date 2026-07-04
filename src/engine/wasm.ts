@@ -1,11 +1,50 @@
-import type { LoadedFile } from '../types.js';
-import { access } from 'node:fs/promises';
+import { access } from "node:fs/promises";
+import { z } from "zod";
+import type { LoadedFile } from "../types.js";
+
+const locationSchema = z.object({
+  filePath: z.string(),
+  startLine: z.number(),
+  endLine: z.number(),
+  symbolName: z.string(),
+  kind: z.string(),
+});
+
+const pairSchema = z.object({
+  mode: z.string(),
+  similarity: z.number(),
+  left: locationSchema,
+  right: locationSchema,
+  details: z.record(z.string(), z.unknown()).optional(),
+});
+
+// Structural check on the WASM boundary: version skew between the JS
+// wrapper and the engine otherwise surfaces as `undefined` accesses far
+// from the cause.
+const reportSchema = z.object({
+  analyzedFiles: z.array(z.string()),
+  skippedFiles: z.array(z.string()),
+  warnings: z.array(z.object({ filePath: z.string().optional(), message: z.string() })),
+  results: z.array(pairSchema),
+  byMode: z.object({
+    functions: z.array(pairSchema),
+    types: z.array(pairSchema),
+    classes: z.array(pairSchema),
+    overlap: z.array(pairSchema),
+  }),
+  stats: z.object({
+    fileCount: z.number(),
+    pairCount: z.number(),
+    elapsedMs: z.number(),
+  }),
+});
 
 interface WasmAnalyzeInput {
   files: LoadedFile[];
   modes: string[];
   threshold: number;
   minLines: number;
+  minTokens?: number;
   sizePenalty: boolean;
   sameFileOnly: boolean;
   crossFileOnly: boolean;
@@ -61,6 +100,17 @@ async function loadWasmModule(): Promise<WasmModule> {
 
 export async function analyzeWithWasm(input: WasmAnalyzeInput): Promise<WasmAnalyzeOutput> {
   const wasm = await loadWasmModule();
+  if (typeof wasm.analyze_project !== "function") {
+    throw new Error("WASM module does not export analyze_project — rebuild with `npm run build:wasm`.");
+  }
   const outputJson = wasm.analyze_project(JSON.stringify(input));
-  return JSON.parse(outputJson) as WasmAnalyzeOutput;
+  const parsed: unknown = JSON.parse(outputJson);
+  const validated = reportSchema.safeParse(parsed);
+  if (!validated.success) {
+    throw new Error(
+      `WASM engine returned an unexpected report shape: ${validated.error.issues[0]?.message ?? "unknown"}. ` +
+        "The engine and JS wrapper are likely out of sync — rebuild with `npm run build:wasm`.",
+    );
+  }
+  return validated.data;
 }

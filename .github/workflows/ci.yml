@@ -27,3 +27,58 @@ jobs:
 
       - name: Type check
         run: npm run typecheck
+
+  rust-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/similarity-core-fork
+
+      - name: Run core engine tests
+        run: cargo test --manifest-path native/similarity-core-fork/Cargo.toml
+
+  # Builds the real WASM engine and runs the full vitest suite against it,
+  # including the labeled-corpus accuracy gate (261 pairs): the error rate
+  # must stay at or below one tenth of the v0.4.1 baseline and the
+  # original 71-pair core corpus must stay at 100%.
+  tests-and-accuracy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/similarity-wasm
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build WASM engine
+        run: npm run build:wasm
+
+      - name: Run tests (includes accuracy benchmark gate)
+        run: npm test

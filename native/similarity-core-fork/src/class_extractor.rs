@@ -40,6 +40,12 @@ pub struct ClassMethod {
     pub is_async: bool,
     pub is_generator: bool,
     pub kind: MethodKind,
+    /// Structural hash of the method's canonicalized params+body tree
+    /// (name excluded, locals alpha-renamed). Two methods with the same
+    /// fingerprint have behaviorally-equivalent bodies up to the
+    /// canonicalizer's equivalences; `None` when the body could not be
+    /// parsed standalone.
+    pub body_fingerprint: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -303,6 +309,32 @@ impl ClassExtractor {
                         _ => continue,
                     };
 
+                    // `handle = (event) => { … }` class fields are methods
+                    // in everything but declaration syntax; extract them as
+                    // methods so the arrow-field and method spellings of the
+                    // same class compare member-for-member.
+                    if let Some(oxc_ast::ast::Expression::ArrowFunctionExpression(arrow)) =
+                        &prop.value
+                    {
+                        let return_type = arrow
+                            .return_type
+                            .as_ref()
+                            .map(|rt| self.extract_type_string_from_ts_type(&rt.type_annotation))
+                            .unwrap_or_else(|| "void".to_string());
+                        methods.push(ClassMethod {
+                            name,
+                            parameters: vec![self.extract_function_params(&arrow.params)],
+                            return_type,
+                            is_static: prop.r#static,
+                            is_private: false,
+                            is_async: arrow.r#async,
+                            is_generator: false,
+                            kind: MethodKind::Method,
+                            body_fingerprint: self.arrow_body_fingerprint(arrow),
+                        });
+                        continue;
+                    }
+
                     let type_annotation = prop
                         .type_annotation
                         .as_ref()
@@ -359,7 +391,42 @@ impl ClassExtractor {
                         MethodDefinitionKind::Set => MethodKind::Setter,
                     };
 
-                    if kind != MethodKind::Constructor {
+                    if kind == MethodKind::Constructor {
+                        // Constructor parameter properties (`constructor(
+                        // private readonly repo: Repo)`) declare real
+                        // fields; surface them so the shorthand and the
+                        // explicit field-plus-assignment spelling extract
+                        // the same shape.
+                        for param in &method.value.params.items {
+                            let is_property = param.accessibility.is_some()
+                                || param.readonly
+                                || param.r#override;
+                            if !is_property {
+                                continue;
+                            }
+                            let oxc_ast::ast::BindingPattern::BindingIdentifier(ident) =
+                                &param.pattern
+                            else {
+                                continue;
+                            };
+                            let type_annotation = param
+                                .type_annotation
+                                .as_ref()
+                                .map(|ta| self.extract_type_string(ta))
+                                .unwrap_or_else(|| "any".to_string());
+                            properties.push(ClassProperty {
+                                name: ident.name.as_str().to_string(),
+                                type_annotation,
+                                is_static: false,
+                                is_private: matches!(
+                                    param.accessibility,
+                                    Some(oxc_ast::ast::TSAccessibility::Private)
+                                ),
+                                is_readonly: param.readonly,
+                                is_optional: false,
+                            });
+                        }
+                    } else {
                         let parameters = self.extract_function_params(&method.value.params);
                         let return_type = method
                             .value
@@ -377,6 +444,7 @@ impl ClassExtractor {
                             is_async: method.value.r#async,
                             is_generator: method.value.generator,
                             kind,
+                            body_fingerprint: self.method_body_fingerprint(&method.value),
                         });
                     }
                 }
@@ -397,6 +465,134 @@ impl ClassExtractor {
             is_abstract: class.r#abstract,
             has_ignore_directive: has_similarity_ignore_directive(&self.source_text, start_line),
         }
+    }
+
+    /// Canonical structural hash of a method's params+body (the method
+    /// NAME is deliberately excluded so consistently-renamed methods with
+    /// equal bodies fingerprint identically).
+    fn method_body_fingerprint(&self, function: &oxc_ast::ast::Function) -> Option<u64> {
+        use crate::parser::parse_and_convert_to_tree_canonical;
+        use std::hash::{Hash, Hasher};
+
+        let body = function.body.as_ref()?;
+        let slice = |span: oxc_span::Span| -> Option<&str> {
+            let start = span.start as usize;
+            let end = span.end as usize;
+            if start < end && end <= self.source_text.len() {
+                Some(&self.source_text[start..end])
+            } else {
+                None
+            }
+        };
+        let params_text = slice(function.params.span)?;
+        let body_text = slice(body.span)?;
+        let mut prefix = String::new();
+        if function.r#async {
+            prefix.push_str("async ");
+        }
+        prefix.push_str("function");
+        if function.generator {
+            prefix.push('*');
+        }
+        let wrapped = format!("{prefix} __m__{params_text} {body_text}");
+        let tree = parse_and_convert_to_tree_canonical("method.ts", &wrapped).ok()?;
+
+        fn hash_tree(node: &crate::tree::TreeNode, hasher: &mut impl Hasher) {
+            node.label.hash(hasher);
+            node.value.hash(hasher);
+            node.children.len().hash(hasher);
+            // `this.<field>` / `this.#<field>` accesses hash the field
+            // position as a placeholder: renaming private storage fields
+            // is the class-level analogue of renaming locals, and two
+            // methods that differ only in field names must fingerprint
+            // identically. Field names still matter for the property-set
+            // comparison, so the signal isn't lost — it's just not
+            // double-counted against the method bodies.
+            let this_member = matches!(node.value.as_str(),
+                "StaticMemberExpression" | "PrivateFieldExpression")
+                && node.children.first().is_some_and(|obj| obj.value == "ThisExpression");
+            for (index, child) in node.children.iter().enumerate() {
+                if this_member
+                    && index == 1
+                    && matches!(child.value.as_str(), "Identifier" | "PrivateIdentifier")
+                {
+                    "§field".hash(hasher);
+                    child.value.hash(hasher);
+                    0usize.hash(hasher);
+                } else {
+                    hash_tree(child, hasher);
+                }
+            }
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash_tree(&tree, &mut hasher);
+        Some(hasher.finish())
+    }
+
+    /// Fingerprint for an arrow-function class field, shaped exactly like
+    /// [`Self::method_body_fingerprint`] so `handle = () => {…}` and
+    /// `handle() {…}` with equal bodies hash identically.
+    fn arrow_body_fingerprint(
+        &self,
+        arrow: &oxc_ast::ast::ArrowFunctionExpression,
+    ) -> Option<u64> {
+        let slice = |span: oxc_span::Span| -> Option<&str> {
+            let start = span.start as usize;
+            let end = span.end as usize;
+            if start < end && end <= self.source_text.len() {
+                Some(&self.source_text[start..end])
+            } else {
+                None
+            }
+        };
+        let params_text = slice(arrow.params.span)?;
+        let params_text = if params_text.starts_with('(') {
+            params_text.to_string()
+        } else {
+            format!("({params_text})")
+        };
+        let body_text = slice(arrow.body.span)?;
+        let body_text = if arrow.expression {
+            format!("{{ return {body_text}; }}")
+        } else {
+            body_text.to_string()
+        };
+        let prefix = if arrow.r#async { "async function" } else { "function" };
+        let wrapped = format!("{prefix} __m__{params_text} {body_text}");
+        Self::fingerprint_wrapped_function(&wrapped)
+    }
+
+    /// Parse a synthesized standalone function and hash its canonical
+    /// tree with `this.<field>` names positionally normalized.
+    fn fingerprint_wrapped_function(wrapped: &str) -> Option<u64> {
+        use crate::parser::parse_and_convert_to_tree_canonical;
+        use std::hash::{Hash, Hasher};
+
+        let tree = parse_and_convert_to_tree_canonical("method.ts", wrapped).ok()?;
+
+        fn hash_tree(node: &crate::tree::TreeNode, hasher: &mut impl Hasher) {
+            node.label.hash(hasher);
+            node.value.hash(hasher);
+            node.children.len().hash(hasher);
+            let this_member = matches!(node.value.as_str(),
+                "StaticMemberExpression" | "PrivateFieldExpression")
+                && node.children.first().is_some_and(|obj| obj.value == "ThisExpression");
+            for (index, child) in node.children.iter().enumerate() {
+                if this_member
+                    && index == 1
+                    && matches!(child.value.as_str(), "Identifier" | "PrivateIdentifier")
+                {
+                    "§field".hash(hasher);
+                    child.value.hash(hasher);
+                    0usize.hash(hasher);
+                } else {
+                    hash_tree(child, hasher);
+                }
+            }
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash_tree(&tree, &mut hasher);
+        Some(hasher.finish())
     }
 
     pub fn extract_classes(&self) -> Result<Vec<ClassDefinition>, String> {

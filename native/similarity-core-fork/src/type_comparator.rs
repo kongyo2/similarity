@@ -48,8 +48,14 @@ pub struct TypeComparisonOptions {
 impl Default for TypeComparisonOptions {
     fn default() -> Self {
         Self {
-            structural_weight: 0.6,
-            naming_weight: 0.4,
+            // Structural evidence dominates: naming overlap is redundant
+            // with the exact-name matching phase and used to prop up
+            // coincidental matches (any shared property name guaranteed a
+            // 0.8+ naming term). 0.85/0.15 keeps full-rename skeleton
+            // matches above the default threshold while same-name/
+            // different-type lookalikes fall well below it.
+            structural_weight: 0.85,
+            naming_weight: 0.15,
             property_match_threshold: 0.7,
             allow_cross_kind_comparison: true,
             normalization_options: NormalizationOptions::default(),
@@ -120,7 +126,19 @@ fn calculate_structural_similarity(
     let total_props2 = type2.properties.len();
 
     if total_props1 == 0 && total_props2 == 0 {
-        return 1.0; // Both empty
+        // Two property-less shapes carry no structural evidence at all —
+        // a flat 1.0 here would make every pair of empty marker types
+        // score ≥ structural_weight and flood the report. Require naming
+        // agreement to stand in for the missing structure: identically
+        // named empties (the interface ⇔ alias cross-kind case) still
+        // reach ~1.0, related names (EmptyA/EmptyB) stay above the
+        // default threshold, unrelated names fall well below it.
+        let name_similarity =
+            crate::type_normalizer::calculate_property_similarity(
+                &type1.original_name,
+                &type2.original_name,
+            );
+        return 0.6 + 0.4 * name_similarity;
     }
 
     if total_props1 == 0 || total_props2 == 0 {
@@ -297,7 +315,7 @@ pub fn find_similar_types(
     }
 
     // Sort by similarity (descending)
-    similar_pairs.sort_by(|a, b| b.result.similarity.partial_cmp(&a.result.similarity).unwrap());
+    similar_pairs.sort_by(|a, b| b.result.similarity.total_cmp(&a.result.similarity));
 
     similar_pairs
 }
@@ -430,7 +448,7 @@ pub fn find_similar_type_literals(
     }
 
     // Sort by similarity (descending)
-    similar_pairs.sort_by(|a, b| b.result.similarity.partial_cmp(&a.result.similarity).unwrap());
+    similar_pairs.sort_by(|a, b| b.result.similarity.total_cmp(&a.result.similarity));
 
     similar_pairs
 }
@@ -542,9 +560,18 @@ mod tests {
         let options = TypeComparisonOptions::default();
         let result = compare_types(&type1, &type2, &options);
 
+        // `name` and `fullName` share the exact same type, so the
+        // rename-tolerant phase pairs them — at a small discount, keeping
+        // the renamed pair strictly below a byte-identical pair.
         assert!(result.similarity > 0.5);
-        assert!(result.similarity < 0.9);
-        assert_eq!(result.matched_properties.len(), 1); // Only "id" matches
+        assert_eq!(result.matched_properties.len(), 2);
+
+        let identical = create_test_type(
+            "Account",
+            vec![("id", "string", false, false), ("name", "string", false, false)],
+        );
+        let identical_result = compare_types(&type1, &identical, &options);
+        assert!(identical_result.similarity > result.similarity);
     }
 
     #[test]
@@ -605,5 +632,25 @@ mod tests {
         let similar_pairs = find_similar_types(&[active, ignored], 0.7, &options);
 
         assert!(similar_pairs.is_empty());
+    }
+
+    #[test]
+    fn unrelated_empty_types_stay_below_threshold() {
+        let type1 = create_test_type("FeatureGate", vec![]);
+        let type2 = create_test_type("RetryBudget", vec![]);
+        let options = TypeComparisonOptions::default();
+        let result = compare_types(&type1, &type2, &options);
+        assert!(
+            result.similarity < 0.8,
+            "unrelated empty markers must not auto-match, got {}",
+            result.similarity
+        );
+
+        // Same-named empties (the interface ⇔ alias cross-kind case)
+        // still clear a high threshold.
+        let type3 = create_test_type("Empty", vec![]);
+        let type4 = create_test_type("Empty", vec![]);
+        let same = compare_types(&type3, &type4, &options);
+        assert!(same.similarity >= 0.9, "identical empty names must match, got {}", same.similarity);
     }
 }

@@ -62,7 +62,9 @@ export function formatPrettyReport(report: AnalyzeReport, cwd: string, modes: An
   lines.push("");
 
   for (const mode of modes) {
-    lines.push(renderMode(mode, report.byMode[mode], cwd));
+    // Guard against engine/report drift: a requested mode missing from
+    // `byMode` renders as an empty section instead of crashing.
+    lines.push(renderMode(mode, report.byMode[mode] ?? [], cwd));
   }
 
   if (report.warnings.length > 0) {

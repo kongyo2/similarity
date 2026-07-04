@@ -6,6 +6,19 @@ use oxc_ast::ast::{
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
+/// Render a possibly-qualified type name (`React.FC`, `A.B.C`) as its
+/// full dotted path — collapsing to the rightmost segment would let
+/// `React.FC` compare equal to any other namespace's `FC`.
+fn render_ts_type_name(name: &oxc_ast::ast::TSTypeName) -> String {
+    match name {
+        oxc_ast::ast::TSTypeName::IdentifierReference(ident) => ident.name.as_str().to_string(),
+        oxc_ast::ast::TSTypeName::QualifiedName(qualified) => {
+            format!("{}.{}", render_ts_type_name(&qualified.left), qualified.right.name.as_str())
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
 /// Return the byte span (start, end) of any `TSType` variant. The variants
 /// each carry their own `span` field but there is no shared accessor; pattern
 /// matching every variant explicitly keeps us insulated from changes to oxc's
@@ -367,13 +380,54 @@ impl TypeExtractor {
         Ok(type_literals)
     }
 
+
+    /// Replace each generic parameter name with a positional `#N` token
+    /// (whole identifiers only) in every property annotation, so two
+    /// declarations that differ only in type-parameter names compare as
+    /// equal while concrete instantiations (`Array<string>` vs
+    /// `Array<number>`) keep their distinct arguments.
+    fn substitute_generic_params(properties: &mut [PropertyDefinition], generics: &[String]) {
+        if generics.is_empty() {
+            return;
+        }
+        let replace_tokens = |input: &str| -> String {
+            let mut result = String::with_capacity(input.len());
+            let mut token = String::new();
+            let flush = |token: &mut String, result: &mut String| {
+                if token.is_empty() {
+                    return;
+                }
+                if let Some(position) = generics.iter().position(|generic| generic == token) {
+                    result.push_str(&format!("#{position}"));
+                } else {
+                    result.push_str(token);
+                }
+                token.clear();
+            };
+            for ch in input.chars() {
+                if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+                    token.push(ch);
+                } else {
+                    flush(&mut token, &mut result);
+                    result.push(ch);
+                }
+            }
+            flush(&mut token, &mut result);
+            result
+        };
+        for property in properties.iter_mut() {
+            property.type_annotation = replace_tokens(&property.type_annotation);
+        }
+    }
+
     fn extract_interface(&self, interface: &TSInterfaceDeclaration) -> Option<TypeDefinition> {
         let name = interface.id.name.as_str().to_string();
         let start_line = self.get_line_number(interface.span.start as usize);
         let end_line = self.get_line_number(interface.span.end as usize);
 
-        let properties = self.extract_interface_properties(&interface.body.body);
+        let mut properties = self.extract_interface_properties(&interface.body.body);
         let generics = self.extract_generics(interface.type_parameters.as_ref());
+        Self::substitute_generic_params(&mut properties, &generics);
         let extends = self.extract_extends(Some(&interface.extends));
 
         Some(TypeDefinition {
@@ -428,6 +482,10 @@ impl TypeExtractor {
                 });
             }
         }
+        // Substitute AFTER the fallback body exists so non-object generic
+        // aliases participate too: `type Box<T> = T[]` and
+        // `type Bag<U> = U[]` must both carry the body `#0[]`.
+        Self::substitute_generic_params(&mut properties, &generics);
 
         Some(TypeDefinition {
             name,
@@ -481,6 +539,28 @@ impl TypeExtractor {
                     if let Some(prop_def) = self.extract_method_from_signature(method_sig) {
                         properties.push(prop_def);
                     }
+                }
+                oxc_ast::ast::TSSignature::TSIndexSignature(index_sig) => {
+                    // `{ [key: string]: number }` — previously dropped
+                    // entirely, which made every index-signature interface
+                    // look empty (and therefore identical to every other
+                    // one). Surface it as a synthetic property keyed by
+                    // the index kind so the VALUE type participates in
+                    // comparison.
+                    let key_type = index_sig.parameters.first().map_or_else(
+                        || "string".to_string(),
+                        |parameter| {
+                            self.extract_type_string(&parameter.type_annotation.type_annotation)
+                        },
+                    );
+                    let value_type = self
+                        .extract_type_string(&index_sig.type_annotation.type_annotation);
+                    properties.push(PropertyDefinition {
+                        name: format!("[index: {key_type}]"),
+                        type_annotation: value_type,
+                        optional: false,
+                        readonly: index_sig.readonly,
+                    });
                 }
                 _ => {}
             }
@@ -561,16 +641,79 @@ impl TypeExtractor {
             TSType::TSVoidKeyword(_) => "void".to_string(),
             TSType::TSNullKeyword(_) => "null".to_string(),
             TSType::TSUndefinedKeyword(_) => "undefined".to_string(),
-            TSType::TSTypeReference(type_ref) => match &type_ref.type_name {
-                oxc_ast::ast::TSTypeName::IdentifierReference(ident) => {
-                    ident.name.as_str().to_string()
+            TSType::TSTypeReference(type_ref) => {
+                let base = match &type_ref.type_name {
+                    oxc_ast::ast::TSTypeName::IdentifierReference(ident) => {
+                        ident.name.as_str().to_string()
+                    }
+                    oxc_ast::ast::TSTypeName::QualifiedName(_) => {
+                        // Render the full dotted path — `React.FC` must not
+                        // compare equal to a bare `FC` or some other
+                        // namespace's `FC`.
+                        render_ts_type_name(&type_ref.type_name)
+                    }
+                    _ => "unknown".to_string(),
+                };
+                // Type arguments are part of the type's identity —
+                // `Array<string>` and `Array<number>` must not compare
+                // equal (they previously both rendered as just "Array").
+                match &type_ref.type_arguments {
+                    Some(args) if !args.params.is_empty() => {
+                        let rendered: Vec<String> =
+                            args.params.iter().map(|param| self.extract_type_string(param)).collect();
+                        format!("{base}<{}>", rendered.join(", "))
+                    }
+                    _ => base,
                 }
-                _ => "unknown".to_string(),
-            },
+            }
             TSType::TSArrayType(array_type) => {
                 let element_type = self.extract_type_string(&array_type.element_type);
                 format!("{element_type}[]")
             }
+            TSType::TSTupleType(tuple) => {
+                let rendered: Vec<String> = tuple
+                    .element_types
+                    .iter()
+                    .map(|element| match element {
+                        oxc_ast::ast::TSTupleElement::TSOptionalType(optional) => {
+                            format!("{}?", self.extract_type_string(&optional.type_annotation))
+                        }
+                        oxc_ast::ast::TSTupleElement::TSRestType(rest) => {
+                            format!("...{}", self.extract_type_string(&rest.type_annotation))
+                        }
+                        _ => element
+                            .as_ts_type()
+                            .map_or_else(|| "unknown".to_string(), |t| self.extract_type_string(t)),
+                    })
+                    .collect();
+                format!("[{}]", rendered.join(", "))
+            }
+            TSType::TSTypeOperatorType(operator) => {
+                let operand = self.extract_type_string(&operator.type_annotation);
+                match operator.operator {
+                    oxc_ast::ast::TSTypeOperatorOperator::Keyof => format!("keyof {operand}"),
+                    oxc_ast::ast::TSTypeOperatorOperator::Readonly => {
+                        // `readonly T[]` is the same runtime shape as
+                        // `ReadonlyArray<T>`; canonicalize the spelling.
+                        format!("ReadonlyArray<{}>",
+                            operand.strip_suffix("[]").unwrap_or(&operand))
+                    }
+                    oxc_ast::ast::TSTypeOperatorOperator::Unique => format!("unique {operand}"),
+                }
+            }
+            TSType::TSIndexedAccessType(indexed) => {
+                format!(
+                    "{}[{}]",
+                    self.extract_type_string(&indexed.object_type),
+                    self.extract_type_string(&indexed.index_type)
+                )
+            }
+            TSType::TSParenthesizedType(paren) => self.extract_type_string(&paren.type_annotation),
+            TSType::TSNeverKeyword(_) => "never".to_string(),
+            TSType::TSObjectKeyword(_) => "object".to_string(),
+            TSType::TSSymbolKeyword(_) => "symbol".to_string(),
+            TSType::TSBigIntKeyword(_) => "bigint".to_string(),
+            TSType::TSThisType(_) => "this".to_string(),
             TSType::TSUnionType(union_type) => {
                 let types: Vec<String> =
                     union_type.types.iter().map(|t| self.extract_type_string(t)).collect();
@@ -594,7 +737,25 @@ impl TypeExtractor {
                 let return_type = self.extract_type_string(&func_type.return_type.type_annotation);
                 format!("({}) => {}", params, return_type)
             }
-            TSType::TSTypeLiteral(_) => "object".to_string(),
+            TSType::TSTypeLiteral(literal) => {
+                // Render nested object types structurally (sorted members
+                // so property order never matters) instead of collapsing
+                // every one of them onto the same "object" token.
+                let mut members: Vec<String> = self
+                    .extract_interface_properties(&literal.members)
+                    .into_iter()
+                    .map(|property| {
+                        format!(
+                            "{}{}: {}",
+                            property.name,
+                            if property.optional { "?" } else { "" },
+                            property.type_annotation
+                        )
+                    })
+                    .collect();
+                members.sort();
+                format!("{{ {} }}", members.join("; "))
+            }
             _ => "unknown".to_string(),
         }
     }
@@ -1125,5 +1286,45 @@ type IgnoredAlias = {
 
         let ignored_alias = types.iter().find(|t| t.name == "IgnoredAlias").unwrap();
         assert!(ignored_alias.has_ignore_directive);
+    }
+
+    #[test]
+    fn qualified_type_references_keep_their_namespace() {
+        let code = r"
+export interface WithQualified {
+  view: React.FC;
+}
+
+export interface WithBare {
+  view: FC;
+}
+";
+        let types = extract_types_from_code(code, "test.ts").unwrap();
+        let qualified = types.iter().find(|t| t.name == "WithQualified").unwrap();
+        let bare = types.iter().find(|t| t.name == "WithBare").unwrap();
+        assert_eq!(qualified.properties[0].type_annotation, "React.FC");
+        assert_eq!(bare.properties[0].type_annotation, "FC");
+        assert_ne!(
+            qualified.properties[0].type_annotation,
+            bare.properties[0].type_annotation
+        );
+    }
+
+    #[test]
+    fn generic_aliases_substitute_params_into_fallback_bodies() {
+        // `type Box<T> = T[]` and `type Bag<U> = U[]` must extract the
+        // same positional body, not `T[]` vs `U[]`.
+        let code = r"
+export type Box<T> = T[];
+export type Bag<U> = U[];
+";
+        let types = extract_types_from_code(code, "test.ts").unwrap();
+        let bodies: Vec<&str> = types
+            .iter()
+            .map(|t| t.properties[0].type_annotation.as_str())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1], "positional substitution must unify {bodies:?}");
+        assert!(bodies[0].contains("#0"));
     }
 }

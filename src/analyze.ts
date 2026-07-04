@@ -25,6 +25,7 @@ export interface ResolvedAnalyzeOptions {
   modes: AnalyzerMode[];
   threshold: number;
   minLines: number;
+  minTokens?: number;
   sizePenalty: boolean;
   sameFileOnly: boolean;
   crossFileOnly: boolean;
@@ -73,6 +74,9 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
     throw new Error("overlapSizeTolerance must be between 0 and 1");
   }
   const minLines = requirePositiveInteger(input.minLines, DEFAULT_MIN_LINES, "minLines");
+  const minTokens = input.minTokens === undefined
+    ? undefined
+    : requirePositiveInteger(input.minTokens, 1, "minTokens");
   const overlapMinWindow = requirePositiveInteger(
     input.overlapMinWindow,
     DEFAULT_OVERLAP_MIN_WINDOW,
@@ -93,10 +97,16 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
     modes: uniqueModes(input.modes),
     threshold,
     minLines,
+    minTokens,
     sizePenalty: !input.noSizePenalty,
     sameFileOnly: Boolean(input.sameFileOnly),
     crossFileOnly: Boolean(input.crossFileOnly),
-    extensions: (input.extensions ?? DEFAULT_EXTENSIONS).map((extension) => extension.replace(/^\./, "").toLowerCase()),
+    // An explicitly-empty extension list behaves like "unspecified" (the
+    // CLI normalizes `--extensions ""` the same way) instead of silently
+    // matching zero files.
+    extensions: (input.extensions?.length ? input.extensions : DEFAULT_EXTENSIONS).map(
+      (extension) => extension.replace(/^\./, "").toLowerCase(),
+    ),
     exclude: input.exclude ?? [],
     typesOnly: input.typesOnly ?? "all",
     // Default to cross-kind comparison so an `interface User` and a
@@ -111,8 +121,10 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
   };
 }
 
-async function loadFiles(filePaths: string[]): Promise<{ files: LoadedFile[]; warnings: string[] }> {
-  const warnings: string[] = [];
+async function loadFiles(
+  filePaths: string[],
+): Promise<{ files: LoadedFile[]; warnings: { filePath: string; message: string }[] }> {
+  const warnings: { filePath: string; message: string }[] = [];
   const limiter = pLimit(Math.max(4, Math.min(32, os.cpus().length)));
   const loaded = await Promise.all(
     filePaths.map((filePath) =>
@@ -121,7 +133,10 @@ async function loadFiles(filePaths: string[]): Promise<{ files: LoadedFile[]; wa
           const content = await fs.readFile(filePath, "utf8");
           return { filePath, content } satisfies LoadedFile;
         } catch (error) {
-          warnings.push(`Failed to read ${filePath}: ${(error as Error).message}`);
+          warnings.push({
+            filePath,
+            message: `Failed to read ${filePath}: ${(error as Error).message}`,
+          });
           return null;
         }
       }),
@@ -133,7 +148,7 @@ async function loadFiles(filePaths: string[]): Promise<{ files: LoadedFile[]; wa
 export async function analyzeProject(input: AnalyzeProjectOptions): Promise<AnalyzeReport> {
   const startTime = Date.now();
   const options = resolveAnalyzeOptions(input);
-  const warnings: string[] = [];
+  const warnings: { filePath?: string; message: string }[] = [];
 
   const collected = await collectTypeScriptFiles({
     cwd: options.cwd,
@@ -141,7 +156,7 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
     extensions: options.extensions,
     exclude: options.exclude,
   });
-  warnings.push(...collected.warnings);
+  warnings.push(...collected.warnings.map((message) => ({ message })));
 
   const { files, warnings: readWarnings } = await loadFiles(collected.files);
   warnings.push(...readWarnings);
@@ -151,6 +166,7 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
     modes: options.modes,
     threshold: options.threshold,
     minLines: options.minLines,
+    minTokens: options.minTokens,
     sizePenalty: options.sizePenalty,
     sameFileOnly: options.sameFileOnly,
     crossFileOnly: options.crossFileOnly,
@@ -164,8 +180,8 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
 
   return {
     ...wasmReport,
-    skippedFiles: collected.skipped,
-    warnings: [...wasmReport.warnings, ...warnings.map((message) => ({ message }))],
+    skippedFiles: [...wasmReport.skippedFiles, ...collected.skipped],
+    warnings: [...wasmReport.warnings, ...warnings],
     stats: {
       ...wasmReport.stats,
       elapsedMs: Date.now() - startTime,

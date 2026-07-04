@@ -1,13 +1,15 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    AssignmentOperator, BindingPattern, BlockStatement, Class, ClassElement,
+    AssignmentOperator, BinaryOperator, BindingPattern, BlockStatement, Class, ClassElement,
     ConditionalExpression, Declaration, ExportDefaultDeclarationKind, Expression, FormalParameter,
-    Function, FunctionBody, Program, PropertyKey, Statement, SwitchStatement, UpdateOperator,
-    VariableDeclaration, VariableDeclarator,
+    Function, FunctionBody, LogicalOperator, Program, PropertyKey, Statement, SwitchStatement,
+    UnaryOperator, UpdateOperator, VariableDeclaration, VariableDeclarator,
 };
 use oxc_parser::Parser;
-use oxc_span::SourceType;
-use std::cell::Cell;
+use oxc_semantic::SemanticBuilder;
+use oxc_span::{GetSpan, SourceType, Span};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::tree::TreeNode;
@@ -41,8 +43,95 @@ pub fn parse_and_convert_to_tree(
         return Err(format!("Parse errors: {}", error_messages.join(", ")));
     }
 
+    // Alpha-renaming only applies in canonical mode: literal-shape
+    // consumers (overlap windows, class/type comparators) must keep the
+    // user's identifiers.
+    let _rename_guard = if canonicalize_enabled() {
+        Some(RenameGuard::install(build_rename_map(&ret.program)))
+    } else {
+        None
+    };
+
     let mut id_counter = 0;
-    Ok(ast_to_tree_node(&ret.program, &mut id_counter))
+    let tree = ast_to_tree_node(&ret.program, &mut id_counter);
+    if canonicalize_enabled() {
+        // Structural rewrites (push-loop → map, temp-return elimination,
+        // index-loop → for-of) can drop symbols entirely, which would
+        // leave gaps in the declaration-ordered `§N` numbering and make
+        // otherwise-identical trees differ by ordinal. Renumber by first
+        // occurrence in the FINAL tree so the numbering only depends on
+        // the shape being compared. The rebuild also assigns fresh
+        // contiguous node ids.
+        return Ok(relabel_canonical_ordinals(&tree));
+    }
+    Ok(tree)
+}
+
+/// Rebuild the tree, renumbering every `§N` token (in identifier-carrying
+/// labels) by first DFS occurrence and assigning fresh contiguous ids.
+fn relabel_canonical_ordinals(root: &Rc<TreeNode>) -> Rc<TreeNode> {
+    fn remap_label(label: &str, mapping: &mut HashMap<String, String>, next: &mut usize) -> String {
+        if !label.contains('§') {
+            return label.to_string();
+        }
+        let mut result = String::with_capacity(label.len());
+        let mut chars = label.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '§' {
+                result.push(ch);
+                continue;
+            }
+            let mut token = String::from("§");
+            while let Some(&digit) = chars.peek() {
+                if digit.is_ascii_digit() {
+                    token.push(digit);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if token.len() == 1 {
+                result.push('§');
+                continue;
+            }
+            let renamed = mapping.entry(token).or_insert_with(|| {
+                let fresh = format!("§{next}");
+                *next += 1;
+                fresh
+            });
+            result.push_str(renamed);
+        }
+        result
+    }
+
+    fn rebuild(
+        node: &TreeNode,
+        mapping: &mut HashMap<String, String>,
+        next: &mut usize,
+        ids: &mut usize,
+    ) -> TreeNode {
+        let relabel = matches!(
+            node.value.as_str(),
+            "Identifier" | "BindingIdentifier" | "FunctionDeclaration" | "ClassDeclaration"
+        );
+        let label = if relabel {
+            remap_label(&node.label, mapping, next)
+        } else {
+            node.label.clone()
+        };
+        let mut fresh = TreeNode::new(label, node.value.clone(), *ids);
+        *ids += 1;
+        fresh.source_span = node.source_span;
+        for child in &node.children {
+            fresh.add_child(Rc::new(rebuild(child, mapping, next, ids)));
+        }
+        fresh
+    }
+
+    let mut mapping = HashMap::new();
+    let mut next = 0usize;
+    let mut ids = 0usize;
+    Rc::new(rebuild(root, &mut mapping, &mut next, &mut ids))
 }
 
 pub fn ast_to_tree_node(program: &Program, id_counter: &mut usize) -> Rc<TreeNode> {
@@ -117,6 +206,94 @@ impl Drop for CanonicalizeGuard {
     }
 }
 
+thread_local! {
+    /// Span → canonical name for every symbol bound inside the fragment
+    /// being converted. Populated per canonical parse; empty otherwise.
+    static RENAMES: RefCell<HashMap<(u32, u32), Rc<str>>> = RefCell::new(HashMap::new());
+}
+
+/// Installs a rename map for the duration of one conversion and restores
+/// the previous map on drop, mirroring [`CanonicalizeGuard`].
+struct RenameGuard {
+    previous: HashMap<(u32, u32), Rc<str>>,
+}
+
+impl RenameGuard {
+    fn install(map: HashMap<(u32, u32), Rc<str>>) -> Self {
+        let previous = RENAMES.with(|cell| cell.replace(map));
+        RenameGuard { previous }
+    }
+}
+
+impl Drop for RenameGuard {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.previous);
+        RENAMES.with(|cell| cell.replace(previous));
+    }
+}
+
+/// Alpha-renaming map: every symbol *declared inside* the parsed fragment
+/// (parameters, local `let`/`const`/`var` bindings, inner function/class
+/// names, catch bindings, the fragment's own top-level name) is assigned a
+/// positional canonical name `§0`, `§1`, … in source-declaration order,
+/// and every resolved reference to it is renamed consistently.
+///
+/// This makes consistently-renamed duplicates (type-2 clones) compare as
+/// exactly equal trees instead of paying a rename cost per occurrence —
+/// the dominant reason rename-heavy duplicates used to fall below
+/// threshold. Free identifiers (imports, globals, outer-scope captures,
+/// property names) are *not* symbols of the fragment and keep their real
+/// names, so calling `sendEmail` vs `sendSms` still registers as a
+/// semantic difference.
+///
+/// `§` is not a valid identifier character in TypeScript, so canonical
+/// names can never collide with real code.
+fn build_rename_map(program: &Program) -> HashMap<(u32, u32), Rc<str>> {
+    let semantic = SemanticBuilder::new().build(program).semantic;
+    let scoping = semantic.scoping();
+    let nodes = semantic.nodes();
+
+    let mut symbols: Vec<_> = scoping.symbol_ids().collect();
+    symbols.sort_by_key(|&symbol_id| {
+        let span = scoping.symbol_span(symbol_id);
+        (span.start, span.end)
+    });
+
+    let mut map = HashMap::new();
+    for (ordinal, symbol_id) in symbols.into_iter().enumerate() {
+        let canonical: Rc<str> = Rc::from(format!("§{ordinal}"));
+        let declaration = scoping.symbol_span(symbol_id);
+        map.insert((declaration.start, declaration.end), Rc::clone(&canonical));
+        for &reference_id in scoping.get_resolved_reference_ids(symbol_id) {
+            let reference = scoping.get_reference(reference_id);
+            let span = nodes.get_node(reference.node_id()).kind().span();
+            map.insert((span.start, span.end), Rc::clone(&canonical));
+        }
+    }
+    map
+}
+
+/// Resolve the label for an identifier occurrence: the canonical `§N`
+/// name when the span belongs to a fragment-local symbol, the original
+/// name otherwise (free identifiers, property names, non-canonical mode).
+fn identifier_label(span: Span, original: &str) -> String {
+    if !canonicalize_enabled() {
+        return original.to_string();
+    }
+    RENAMES.with(|cell| {
+        cell.borrow()
+            .get(&(span.start, span.end))
+            .map_or_else(|| original.to_string(), |name| name.to_string())
+    })
+}
+
+/// Whether `name` (as it appears in source) resolves to a fragment-local
+/// binding at `span`. Used to guard builtin-global rewrites (`Boolean`,
+/// `Object.assign`) against local shadowing.
+fn is_locally_bound(span: Span) -> bool {
+    RENAMES.with(|cell| cell.borrow().contains_key(&(span.start, span.end)))
+}
+
 /// Variant of [`parse_and_convert_to_tree`] that applies the
 /// refactor-equivalence canonicalization described above. Used by the
 /// function comparator so style-only rewrites (template literals,
@@ -145,19 +322,31 @@ fn strip_parentheses<'a, 'b>(expr: &'b Expression<'a>) -> &'b Expression<'a> {
 /// list. Almost always a single node, but canonical lowering of
 /// `return p.then(cb)` / `p.then(cb);` and of declaration-initializing
 /// ternaries (`const x = c ? a : b`) expands one statement into several.
+/// Convert one statement into the nodes it contributes to a statement
+/// list, stamping each top-level node with the statement's source span so
+/// downstream consumers (the overlap fingerprints in particular) can
+/// report real line ranges.
 fn statement_to_tree_nodes(stmt: &Statement, id_counter: &mut usize) -> Vec<Rc<TreeNode>> {
+    let span = stmt.span();
+    let mut nodes = statement_to_tree_nodes_unstamped(stmt, id_counter);
+    for node in &mut nodes {
+        if node.source_span == (0, 0) {
+            if let Some(unique) = Rc::get_mut(node) {
+                unique.set_source_span(span.start, span.end);
+            }
+        }
+    }
+    nodes
+}
+
+fn statement_to_tree_nodes_unstamped(stmt: &Statement, id_counter: &mut usize) -> Vec<Rc<TreeNode>> {
     if canonicalize_enabled() {
         match stmt {
             Statement::ReturnStatement(ret_stmt) => {
-                if let Some(arg) = &ret_stmt.argument {
-                    let mut effective = strip_parentheses(arg);
-                    if let Expression::AwaitExpression(await_expr) = effective {
-                        effective = strip_parentheses(&await_expr.argument);
-                    }
-                    if let Some(parts) = match_then_call(effective) {
-                        return lower_then_call(&parts, ThenPosition::Return, id_counter);
-                    }
-                }
+                return canonical_return_nodes(ret_stmt.argument.as_ref(), id_counter);
+            }
+            Statement::IfStatement(if_stmt) => {
+                return canonical_if_nodes(if_stmt, id_counter);
             }
             Statement::ExpressionStatement(expr_stmt) => {
                 let mut effective = strip_parentheses(&expr_stmt.expression);
@@ -186,11 +375,51 @@ fn statement_to_tree_nodes(stmt: &Statement, id_counter: &mut usize) -> Vec<Rc<T
                 if let Some(nodes) = lower_declaration_ternary(var_decl, id_counter) {
                     return nodes;
                 }
+                if let Some(nodes) = lower_destructuring_declaration(var_decl, id_counter) {
+                    return nodes;
+                }
+            }
+            Statement::SwitchStatement(switch_stmt) => {
+                if let Some(nodes) = lower_switch_statement(switch_stmt, id_counter) {
+                    return nodes;
+                }
             }
             _ => {}
         }
     }
     statement_to_tree_node(stmt, id_counter).into_iter().collect()
+}
+
+/// Canonical conversion of `return <argument>`: strips `return await X`
+/// down to `return X`, inlines single-callback `.then()` chains, and
+/// lowers ternary returns into the `if`/`else` chain shape. Shared by the
+/// statement converter and the expression-bodied-arrow wrapper so
+/// `(x) => expr` and `function (x) { return expr; }` produce identical
+/// body trees.
+fn canonical_return_nodes(
+    argument: Option<&Expression>,
+    id_counter: &mut usize,
+) -> Vec<Rc<TreeNode>> {
+    let Some(argument) = argument else {
+        return vec![leaf("ReturnStatement", "ReturnStatement", id_counter)];
+    };
+    // `return await X` and `return X` resolve to the same value from the
+    // caller's perspective; strip the await so the two spellings align.
+    let mut effective = strip_parentheses(argument);
+    if let Expression::AwaitExpression(await_expr) = effective {
+        effective = strip_parentheses(&await_expr.argument);
+    }
+    if let Some(parts) = match_then_call(effective) {
+        return lower_then_call(&parts, ThenPosition::Return, id_counter);
+    }
+    if let Expression::ConditionalExpression(cond) = effective {
+        return lower_return_ternary(cond, id_counter);
+    }
+    let mut node = make_node("ReturnStatement", "ReturnStatement", id_counter);
+    if let Some(arg_node) = expression_to_tree_node(effective, id_counter) {
+        node.add_child(arg_node);
+    }
+    vec![Rc::new(node)]
 }
 
 fn append_statement_to_list(parent: &mut TreeNode, stmt: &Statement, id_counter: &mut usize) {
@@ -208,7 +437,11 @@ fn statement_to_block_node(stmt: &Statement, id_counter: &mut usize) -> Option<R
         return statement_to_tree_node(stmt, id_counter);
     }
     let mut block = make_node("BlockStatement", "BlockStatement", id_counter);
-    append_statement_to_list(&mut block, stmt, id_counter);
+    let mut statements = statement_to_tree_nodes(stmt, id_counter);
+    normalize_statement_nodes(&mut statements, id_counter);
+    for child in statements {
+        block.add_child(child);
+    }
     Some(Rc::new(block))
 }
 
@@ -383,26 +616,79 @@ fn lower_then_call(
     nodes
 }
 
+/// Split a ternary's pieces after negation normalization: a negated test
+/// (`!c ? a : b`, `x !== y ? a : b`) swaps its branches so the emitted
+/// `if` shows the positive condition, matching what [`canonical_if_nodes`]
+/// does for hand-written `if (!c) { … } else { … }`.
+struct NormalizedTernary<'a, 'b> {
+    /// Converts the (positive-form) test into a tree.
+    test_was_negated_binary: bool,
+    test: &'b Expression<'a>,
+    consequent: &'b Expression<'a>,
+    alternate: &'b Expression<'a>,
+}
+
+impl NormalizedTernary<'_, '_> {
+    fn render_test(&self, id_counter: &mut usize) -> Option<Rc<TreeNode>> {
+        if self.test_was_negated_binary {
+            // The swap flipped `!==`/`!=` to its positive complement.
+            negated_expression_to_tree_node(self.test, id_counter)
+        } else {
+            test_expression_to_tree_node(self.test, id_counter)
+        }
+    }
+}
+
+fn normalize_ternary<'a, 'b>(cond: &'b ConditionalExpression<'a>) -> NormalizedTernary<'a, 'b> {
+    let test = strip_parentheses(&cond.test);
+    let consequent = strip_parentheses(&cond.consequent);
+    let alternate = strip_parentheses(&cond.alternate);
+    match test {
+        Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+            NormalizedTernary {
+                test_was_negated_binary: false,
+                test: strip_parentheses(&unary.argument),
+                consequent: alternate,
+                alternate: consequent,
+            }
+        }
+        Expression::BinaryExpression(bin)
+            if matches!(
+                bin.operator,
+                BinaryOperator::StrictInequality | BinaryOperator::Inequality
+            ) =>
+        {
+            NormalizedTernary {
+                test_was_negated_binary: true,
+                test,
+                consequent: alternate,
+                alternate: consequent,
+            }
+        }
+        _ => NormalizedTernary { test_was_negated_binary: false, test, consequent, alternate },
+    }
+}
+
 /// Lower a ternary into an `if`/`else` chain. `make_leaf_statement`
-/// builds the statement that consumes each branch value (a `return` or an
-/// assignment); nested ternaries in the alternate position become
-/// `else if` arms, mirroring how the explicit chain is written by hand.
+/// builds the statement that consumes each branch value (an assignment);
+/// nested ternaries in the alternate position become `else if` arms,
+/// mirroring how the explicit chain is written by hand.
 fn lower_ternary_chain(
     cond: &ConditionalExpression,
     make_leaf_statement: &mut dyn FnMut(&Expression, &mut usize) -> Rc<TreeNode>,
     id_counter: &mut usize,
 ) -> Rc<TreeNode> {
+    let normalized = normalize_ternary(cond);
     let mut if_node = make_node("IfStatement", "IfStatement", id_counter);
-    if let Some(test_node) = expression_to_tree_node(&cond.test, id_counter) {
+    if let Some(test_node) = normalized.render_test(id_counter) {
         if_node.add_child(test_node);
     }
 
     let mut consequent_block = make_node("BlockStatement", "BlockStatement", id_counter);
-    consequent_block
-        .add_child(make_leaf_statement(strip_parentheses(&cond.consequent), id_counter));
+    consequent_block.add_child(make_leaf_statement(normalized.consequent, id_counter));
     if_node.add_child(Rc::new(consequent_block));
 
-    let alternate = strip_parentheses(&cond.alternate);
+    let alternate = normalized.alternate;
     if let Expression::ConditionalExpression(nested) = alternate {
         if_node.add_child(lower_ternary_chain(nested, make_leaf_statement, id_counter));
     } else {
@@ -411,6 +697,32 @@ fn lower_ternary_chain(
         if_node.add_child(Rc::new(alternate_block));
     }
     Rc::new(if_node)
+}
+
+/// Lower `return c ? a : b` into the flat guard form
+/// `if (c) { return a; } return b;` — the same shape hand-written
+/// early-return code and the `if`/`else` spelling (after jump
+/// flattening) normalize to. Branch values recurse through
+/// [`canonical_return_nodes`], so nested ternaries flatten into
+/// successive guards.
+fn lower_return_ternary(
+    cond: &ConditionalExpression,
+    id_counter: &mut usize,
+) -> Vec<Rc<TreeNode>> {
+    let normalized = normalize_ternary(cond);
+    let mut if_node = make_node("IfStatement", "IfStatement", id_counter);
+    if let Some(test_node) = normalized.render_test(id_counter) {
+        if_node.add_child(test_node);
+    }
+    let mut consequent_block = make_node("BlockStatement", "BlockStatement", id_counter);
+    for node in canonical_return_nodes(Some(normalized.consequent), id_counter) {
+        consequent_block.add_child(node);
+    }
+    if_node.add_child(Rc::new(consequent_block));
+
+    let mut nodes = vec![Rc::new(if_node)];
+    nodes.extend(canonical_return_nodes(Some(normalized.alternate), id_counter));
+    nodes
 }
 
 fn return_leaf_statement(expr: &Expression, id_counter: &mut usize) -> Rc<TreeNode> {
@@ -456,19 +768,46 @@ fn lower_declaration_ternary(
     let Expression::ConditionalExpression(cond) = strip_parentheses(init) else {
         return None;
     };
+    // Ternaries that contract to `||` / `&&` / `??` sugar are handled at
+    // the expression level; lowering them to `if`/`else` here would hide
+    // that equivalence.
+    {
+        let test = strip_parentheses(&cond.test);
+        let consequent = strip_parentheses(&cond.consequent);
+        let alternate = strip_parentheses(&cond.alternate);
+        match classify_nullish_test(test) {
+            Some(NullishTest::IsNullish(subject))
+                if pure_expressions_equal(subject, alternate) =>
+            {
+                return None;
+            }
+            Some(NullishTest::NotNullish(subject))
+                if pure_expressions_equal(subject, consequent) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        if is_side_effect_free(test)
+            && (pure_expressions_equal(test, consequent)
+                || pure_expressions_equal(test, alternate))
+        {
+            return None;
+        }
+    }
 
     // The lowered binding is mutated by the branches, so it canonicalizes
     // to `let` regardless of the source keyword.
+    let name = identifier_label(ident.span, &ident.name);
     let mut decl = make_node("LetDeclaration", "VariableDeclaration", id_counter);
     let mut declarator_node = make_node("VariableDeclarator", "VariableDeclarator", id_counter);
-    declarator_node.add_child(leaf(ident.name.as_str(), "BindingIdentifier", id_counter));
+    declarator_node.add_child(leaf(&name, "BindingIdentifier", id_counter));
     decl.add_child(Rc::new(declarator_node));
 
-    let name = ident.name.as_str();
     let if_node = lower_ternary_chain(
         cond,
         &mut |expr, ids| {
-            let target = Some(leaf(name, "Identifier", ids));
+            let target = Some(leaf(&name, "Identifier", ids));
             assignment_leaf_statement(target, expr, ids)
         },
         id_counter,
@@ -513,7 +852,7 @@ fn lower_foreach_statement(expr: &Expression, id_counter: &mut usize) -> Option<
             } else {
                 CallbackBody::Block(&arrow.body.statements)
             };
-            (ident.name.as_str(), body)
+            (identifier_label(ident.span, &ident.name), body)
         }
         Expression::FunctionExpression(func) if !func.r#async && !func.generator => {
             if func.params.rest.is_some() || func.params.items.len() != 1 {
@@ -523,7 +862,7 @@ fn lower_foreach_statement(expr: &Expression, id_counter: &mut usize) -> Option<
                 return None;
             };
             let body = func.body.as_ref()?;
-            (ident.name.as_str(), CallbackBody::Block(&body.statements))
+            (identifier_label(ident.span, &ident.name), CallbackBody::Block(&body.statements))
         }
         _ => return None,
     };
@@ -531,7 +870,7 @@ fn lower_foreach_statement(expr: &Expression, id_counter: &mut usize) -> Option<
     let mut for_node = make_node("ForOfStatement", "ForOfStatement", id_counter);
     let mut decl = make_node("ConstDeclaration", "VariableDeclaration", id_counter);
     let mut declarator = make_node("VariableDeclarator", "VariableDeclarator", id_counter);
-    declarator.add_child(leaf(param_name, "BindingIdentifier", id_counter));
+    declarator.add_child(leaf(&param_name, "BindingIdentifier", id_counter));
     decl.add_child(Rc::new(declarator));
     for_node.add_child(Rc::new(decl));
     if let Some(iterable) = expression_to_tree_node(&member.object, id_counter) {
@@ -566,14 +905,30 @@ fn is_switch_jump_statement(stmt: &Statement) -> bool {
     )
 }
 
+/// Case body minus the trailing unlabeled `break` (the switch's own exit,
+/// which has no analogue in an if-chain; labeled breaks target an outer
+/// statement and must stay).
+fn switch_case_statements<'a, 'b>(case: &'b oxc_ast::ast::SwitchCase<'a>) -> Vec<&'b Statement<'a>> {
+    let mut statements: Vec<&Statement> = case.consequent.iter().collect();
+    if let Some(Statement::BreakStatement(break_stmt)) = statements.last() {
+        if break_stmt.label.is_none() {
+            statements.pop();
+        }
+    }
+    statements
+}
+
 /// Lower a `switch` whose cases all end in a jump (no fallthrough, default
-/// last) into the equivalent `if (disc === t1) {…} else if (…) {…} else {…}`
-/// chain. Returns `None` — leaving the literal switch shape — whenever the
-/// rewrite wouldn't be behavior-preserving.
-fn lower_switch_to_if_chain(
+/// last) into the equivalent `if (disc === t1) {…}` chain — flat guards
+/// for cases whose bodies exit the function (`return`/`throw`/`continue`),
+/// mirroring what [`canonical_if_nodes`] does to hand-written chains, and
+/// a nested `if`/`else` tail for the remainder. Returns `None` — leaving
+/// the literal switch shape — whenever the rewrite wouldn't be
+/// behavior-preserving.
+fn lower_switch_statement(
     switch_stmt: &SwitchStatement,
     id_counter: &mut usize,
-) -> Option<Rc<TreeNode>> {
+) -> Option<Vec<Rc<TreeNode>>> {
     let cases = &switch_stmt.cases;
     if cases.is_empty() || cases.iter().all(|case| case.test.is_none()) {
         return None;
@@ -596,48 +951,95 @@ fn lower_switch_to_if_chain(
 
     let case_body_block = |case: &oxc_ast::ast::SwitchCase, ids: &mut usize| -> Rc<TreeNode> {
         let mut block = make_node("BlockStatement", "BlockStatement", ids);
-        let mut statements: Vec<&Statement> = case.consequent.iter().collect();
-        if let Some(Statement::BreakStatement(break_stmt)) = statements.last() {
-            // The trailing unlabeled `break` is the switch's own exit and
-            // has no analogue in the if-chain. Labeled breaks target an
-            // outer statement and must stay.
-            if break_stmt.label.is_none() {
-                statements.pop();
-            }
+        let mut statements = Vec::new();
+        for stmt in switch_case_statements(case) {
+            statements.extend(statement_to_tree_nodes(stmt, ids));
         }
-        for stmt in statements {
-            append_statement_to_list(&mut block, stmt, ids);
+        normalize_statement_nodes(&mut statements, ids);
+        for child in statements {
+            block.add_child(child);
         }
         Rc::new(block)
     };
 
-    let mut else_node: Option<Rc<TreeNode>> = None;
-    for case in cases.iter().rev() {
+    let guard_node = |case: &oxc_ast::ast::SwitchCase,
+                      test: &Expression,
+                      ids: &mut usize|
+     -> Rc<TreeNode> {
+        let mut if_node = make_node("IfStatement", "IfStatement", ids);
+        let mut equality = make_node("StrictEquality", "BinaryExpression", ids);
+        if let Some(disc) = expression_to_tree_node(&switch_stmt.discriminant, ids) {
+            equality.add_child(disc);
+        }
+        if let Some(test_node) = expression_to_tree_node(test, ids) {
+            equality.add_child(test_node);
+        }
+        if_node.add_child(Rc::new(equality));
+        if_node.add_child(case_body_block(case, ids));
+        Rc::new(if_node)
+    };
+
+    // Whether a case body (after break-stripping) still always exits —
+    // those cases become flat guards; break-terminated ones must keep the
+    // else-chain so control flow past the switch stays represented.
+    let case_flattens = |case: &oxc_ast::ast::SwitchCase| -> bool {
+        switch_case_statements(case)
+            .last()
+            .is_some_and(|stmt| statement_always_terminates(stmt))
+    };
+
+    let mut nodes: Vec<Rc<TreeNode>> = Vec::new();
+    let mut index = 0;
+    while index < cases.len() {
+        let case = &cases[index];
         match &case.test {
             None => {
-                else_node = Some(case_body_block(case, id_counter));
+                // Validated to be last: the default body continues after
+                // the guards, exactly like a hand-written chain's tail.
+                let statements = switch_case_statements(case);
+                let mut converted = Vec::new();
+                for stmt in statements {
+                    converted.extend(statement_to_tree_nodes(stmt, id_counter));
+                }
+                normalize_statement_nodes(&mut converted, id_counter);
+                nodes.extend(converted);
+                index += 1;
             }
-            Some(test) => {
-                let mut if_node = make_node("IfStatement", "IfStatement", id_counter);
-                let mut equality = make_node("StrictEquality", "BinaryExpression", id_counter);
-                if let Some(disc) =
-                    expression_to_tree_node(&switch_stmt.discriminant, id_counter)
-                {
-                    equality.add_child(disc);
+            Some(test) if case_flattens(case) => {
+                nodes.push(guard_node(case, test, id_counter));
+                index += 1;
+            }
+            Some(_) => {
+                // A break-terminated case: this and every remaining case
+                // form one nested if/else chain (matching the shape the
+                // equivalent hand-written chain keeps, since its branches
+                // don't exit).
+                let mut else_node: Option<Rc<TreeNode>> = None;
+                for case in cases[index..].iter().rev() {
+                    match &case.test {
+                        None => {
+                            else_node = Some(case_body_block(case, id_counter));
+                        }
+                        Some(test) => {
+                            let if_node = guard_node(case, test, id_counter);
+                            // `guard_node` returns an if without an else;
+                            // graft the accumulated alternate on.
+                            let mut if_inner = (*if_node).clone();
+                            if let Some(alternate) = else_node.take() {
+                                if_inner.add_child(alternate);
+                            }
+                            else_node = Some(Rc::new(if_inner));
+                        }
+                    }
                 }
-                if let Some(test_node) = expression_to_tree_node(test, id_counter) {
-                    equality.add_child(test_node);
+                if let Some(chain) = else_node {
+                    nodes.push(chain);
                 }
-                if_node.add_child(Rc::new(equality));
-                if_node.add_child(case_body_block(case, id_counter));
-                if let Some(alternate) = else_node.take() {
-                    if_node.add_child(alternate);
-                }
-                else_node = Some(Rc::new(if_node));
+                index = cases.len();
             }
         }
     }
-    else_node
+    Some(nodes)
 }
 
 /// Canonicalization for expressions whose value is discarded (statement
@@ -719,7 +1121,7 @@ fn lower_object_assign_to_spread(
     let Expression::Identifier(object_ident) = strip_parentheses(&member.object) else {
         return None;
     };
-    if object_ident.name.as_str() != "Object" {
+    if object_ident.name.as_str() != "Object" || is_locally_bound(object_ident.span) {
         return None;
     }
     let first = call_expr.arguments[0].as_expression().map(strip_parentheses)?;
@@ -760,6 +1162,1110 @@ fn make_node(label: &str, kind: &str, id_counter: &mut usize) -> TreeNode {
     let node = TreeNode::new(label.to_string(), kind.to_string(), *id_counter);
     *id_counter += 1;
     node
+}
+
+// ---------------------------------------------------------------------------
+// Shared predicates for the value-preserving canonicalizations below
+// ---------------------------------------------------------------------------
+
+/// Side-effect-free expressions the canonicalizations may duplicate or
+/// merge: literals, identifiers, `this`, and non-optional static member
+/// chains of those. Property getters can technically observe reads — that
+/// caveat is accepted by design, mirroring the common lint rewrites these
+/// canonicalizations model.
+fn is_side_effect_free(expr: &Expression) -> bool {
+    match strip_parentheses(expr) {
+        Expression::Identifier(_)
+        | Expression::ThisExpression(_)
+        | Expression::StringLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BigIntLiteral(_) => true,
+        Expression::StaticMemberExpression(member) => {
+            !member.optional && is_side_effect_free(&member.object)
+        }
+        _ => false,
+    }
+}
+
+/// Structural equality of two side-effect-free expressions: identifiers
+/// by name, literals by value, static member chains memberwise. Used to
+/// recognize `x ? x : y`, `arr[arr.length - 1]`, and the null-test pairs.
+fn pure_expressions_equal(a: &Expression, b: &Expression) -> bool {
+    use Expression as E;
+    match (strip_parentheses(a), strip_parentheses(b)) {
+        (E::Identifier(x), E::Identifier(y)) => x.name == y.name,
+        (E::ThisExpression(_), E::ThisExpression(_)) => true,
+        (E::NullLiteral(_), E::NullLiteral(_)) => true,
+        (E::StringLiteral(x), E::StringLiteral(y)) => x.value == y.value,
+        (E::NumericLiteral(x), E::NumericLiteral(y)) => x.value == y.value,
+        (E::BooleanLiteral(x), E::BooleanLiteral(y)) => x.value == y.value,
+        (E::StaticMemberExpression(x), E::StaticMemberExpression(y)) => {
+            !x.optional
+                && !y.optional
+                && x.property.name == y.property.name
+                && pure_expressions_equal(&x.object, &y.object)
+        }
+        _ => false,
+    }
+}
+
+/// `undefined` (as the global) or `void <pure>` — the two spellings of
+/// the undefined value.
+fn is_undefined_expr(expr: &Expression) -> bool {
+    match strip_parentheses(expr) {
+        Expression::Identifier(ident) => {
+            ident.name == "undefined" && !is_locally_bound(ident.span)
+        }
+        Expression::UnaryExpression(unary) => {
+            unary.operator == UnaryOperator::Void && is_side_effect_free(&unary.argument)
+        }
+        _ => false,
+    }
+}
+
+fn is_null_expr(expr: &Expression) -> bool {
+    matches!(strip_parentheses(expr), Expression::NullLiteral(_))
+}
+
+/// Literals eligible for the Yoda-order flip on symmetric equality
+/// operators (`5 === x` ⇔ `x === 5`).
+fn is_literal_operand(expr: &Expression) -> bool {
+    matches!(
+        strip_parentheses(expr),
+        Expression::StringLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::BigIntLiteral(_)
+    ) || is_undefined_expr(expr)
+}
+
+/// `subject === null` / `subject === undefined` (or the `!==` forms when
+/// `expect_equal` is false), in either operand order, with a
+/// side-effect-free subject. Returns the subject and whether the literal
+/// side was `null` (vs `undefined`).
+fn strict_null_comparison<'a, 'b>(
+    expr: &'b Expression<'a>,
+    expect_equal: bool,
+) -> Option<(&'b Expression<'a>, bool)> {
+    let Expression::BinaryExpression(bin) = strip_parentheses(expr) else {
+        return None;
+    };
+    let wanted = if expect_equal {
+        BinaryOperator::StrictEquality
+    } else {
+        BinaryOperator::StrictInequality
+    };
+    if bin.operator != wanted {
+        return None;
+    }
+    let (subject, literal) = if is_null_expr(&bin.right) || is_undefined_expr(&bin.right) {
+        (&bin.left, &bin.right)
+    } else if is_null_expr(&bin.left) || is_undefined_expr(&bin.left) {
+        (&bin.right, &bin.left)
+    } else {
+        return None;
+    };
+    if !is_side_effect_free(subject) {
+        return None;
+    }
+    Some((subject, is_null_expr(literal)))
+}
+
+/// A boolean expression that tests "subject is (not) null-or-undefined":
+/// the loose forms `x == null` / `x != null` (also spelled against
+/// `undefined` — loose equality makes them interchangeable) and the
+/// strict pairs `x === null || x === undefined` / `x !== null && x !==
+/// undefined`.
+enum NullishTest<'a, 'b> {
+    IsNullish(&'b Expression<'a>),
+    NotNullish(&'b Expression<'a>),
+}
+
+fn classify_nullish_test<'a, 'b>(expr: &'b Expression<'a>) -> Option<NullishTest<'a, 'b>> {
+    let expr = strip_parentheses(expr);
+    if let Expression::BinaryExpression(bin) = expr {
+        let equal = match bin.operator {
+            BinaryOperator::Equality => true,
+            BinaryOperator::Inequality => false,
+            _ => return None,
+        };
+        let subject = if is_null_expr(&bin.right) || is_undefined_expr(&bin.right) {
+            &bin.left
+        } else if is_null_expr(&bin.left) || is_undefined_expr(&bin.left) {
+            &bin.right
+        } else {
+            return None;
+        };
+        if !is_side_effect_free(subject) {
+            return None;
+        }
+        return Some(if equal {
+            NullishTest::IsNullish(subject)
+        } else {
+            NullishTest::NotNullish(subject)
+        });
+    }
+    if let Expression::LogicalExpression(log) = expr {
+        match log.operator {
+            LogicalOperator::Or => {
+                let (left_subject, left_is_null) = strict_null_comparison(&log.left, true)?;
+                let (right_subject, right_is_null) = strict_null_comparison(&log.right, true)?;
+                if left_is_null != right_is_null
+                    && pure_expressions_equal(left_subject, right_subject)
+                {
+                    return Some(NullishTest::IsNullish(left_subject));
+                }
+            }
+            LogicalOperator::And => {
+                let (left_subject, left_is_null) = strict_null_comparison(&log.left, false)?;
+                let (right_subject, right_is_null) = strict_null_comparison(&log.right, false)?;
+                if left_is_null != right_is_null
+                    && pure_expressions_equal(left_subject, right_subject)
+                {
+                    return Some(NullishTest::NotNullish(left_subject));
+                }
+            }
+            LogicalOperator::Coalesce => {}
+        }
+    }
+    None
+}
+
+/// Build the canonical tree for `subject == null` (`equal`) or
+/// `subject != null` — the target shape both the loose spelling and the
+/// strict two-comparison spelling collapse onto.
+fn nullish_comparison_node(
+    subject: &Expression,
+    equal: bool,
+    id_counter: &mut usize,
+) -> Option<Rc<TreeNode>> {
+    let label = if equal { "Equality" } else { "Inequality" };
+    let mut node = make_node(label, "BinaryExpression", id_counter);
+    node.add_child(expression_to_tree_node(subject, id_counter)?);
+    node.add_child(leaf("null", "NullLiteral", id_counter));
+    Some(Rc::new(node))
+}
+
+/// Convert the *negation* of `expr` to a tree. Equality-family operators
+/// flip to their exact complements (`!(a === b)` ⇔ `a !== b`); `&&`/`||`
+/// distribute via De Morgan (exact under JS truthiness); everything else
+/// keeps a literal `!` wrapper. Ordering comparisons (`<`, `>=`, …) are
+/// deliberately NOT flipped — `!(a < b)` and `a >= b` disagree on NaN.
+fn negated_expression_to_tree_node(
+    expr: &Expression,
+    id_counter: &mut usize,
+) -> Option<Rc<TreeNode>> {
+    let expr = strip_parentheses(expr);
+    if let Expression::BinaryExpression(bin) = expr {
+        let flipped = match bin.operator {
+            BinaryOperator::StrictEquality => Some("StrictInequality"),
+            BinaryOperator::StrictInequality => Some("StrictEquality"),
+            BinaryOperator::Equality => Some("Inequality"),
+            BinaryOperator::Inequality => Some("Equality"),
+            _ => None,
+        };
+        if let Some(label) = flipped {
+            let mut node = make_node(label, "BinaryExpression", id_counter);
+            let (first, second) = equality_operand_order(&bin.left, &bin.right);
+            if let Some(child) = expression_to_tree_node(first, id_counter) {
+                node.add_child(child);
+            }
+            if let Some(child) = expression_to_tree_node(second, id_counter) {
+                node.add_child(child);
+            }
+            return Some(Rc::new(node));
+        }
+    }
+    if let Expression::LogicalExpression(log) = expr {
+        let distributed = match log.operator {
+            LogicalOperator::And => Some("Or"),
+            LogicalOperator::Or => Some("And"),
+            LogicalOperator::Coalesce => None,
+        };
+        if let Some(label) = distributed {
+            let mut node = make_node(label, "LogicalExpression", id_counter);
+            if let Some(child) = negated_expression_to_tree_node(&log.left, id_counter) {
+                node.add_child(child);
+            }
+            if let Some(child) = negated_expression_to_tree_node(&log.right, id_counter) {
+                node.add_child(child);
+            }
+            return Some(Rc::new(node));
+        }
+    }
+    let mut node = make_node("LogicalNot", "UnaryExpression", id_counter);
+    if let Some(child) = expression_to_tree_node(expr, id_counter) {
+        node.add_child(child);
+    }
+    Some(Rc::new(node))
+}
+
+/// Yoda normalization for the symmetric equality operators: when exactly
+/// one operand is a literal, the literal goes second, so `5 === x` and
+/// `x === 5` produce the same tree. Literal-literal and expr-expr pairs
+/// keep their source order.
+fn equality_operand_order<'a, 'b>(
+    left: &'b Expression<'a>,
+    right: &'b Expression<'a>,
+) -> (&'b Expression<'a>, &'b Expression<'a>) {
+    if is_literal_operand(left) && !is_literal_operand(right) {
+        (right, left)
+    } else {
+        (left, right)
+    }
+}
+
+/// Boolean-context simplification: strip `!!` pairs and `Boolean(...)`
+/// wrappers from an expression consumed only for its truthiness (an
+/// `if`/`while`/`for`/ternary test). Value positions keep them — there
+/// `!!x` and `x` are different values.
+fn test_expression_to_tree_node(
+    expr: &Expression,
+    id_counter: &mut usize,
+) -> Option<Rc<TreeNode>> {
+    if !canonicalize_enabled() {
+        return expression_to_tree_node(expr, id_counter);
+    }
+    let mut current = strip_parentheses(expr);
+    loop {
+        if let Expression::UnaryExpression(outer) = current {
+            if outer.operator == UnaryOperator::LogicalNot {
+                if let Expression::UnaryExpression(inner) = strip_parentheses(&outer.argument) {
+                    if inner.operator == UnaryOperator::LogicalNot {
+                        current = strip_parentheses(&inner.argument);
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Some(inner) = match_boolean_call(current) {
+            current = strip_parentheses(inner);
+            continue;
+        }
+        break;
+    }
+    expression_to_tree_node(current, id_counter)
+}
+
+/// Match a call to the `Boolean` global with a single plain argument.
+fn match_boolean_call<'a, 'b>(expr: &'b Expression<'a>) -> Option<&'b Expression<'a>> {
+    let Expression::CallExpression(call) = strip_parentheses(expr) else {
+        return None;
+    };
+    if call.optional || call.arguments.len() != 1 {
+        return None;
+    }
+    let Expression::Identifier(ident) = strip_parentheses(&call.callee) else {
+        return None;
+    };
+    if ident.name.as_str() != "Boolean" || is_locally_bound(ident.span) {
+        return None;
+    }
+    call.arguments[0].as_expression()
+}
+
+/// Whether control flow can never continue past `stmt` (it returns,
+/// throws, breaks, continues, or is a block/if that always does). Used to
+/// decide when `if (c) { …jump } else { B }` can flatten to
+/// `if (c) { …jump } B`.
+fn statement_always_terminates(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::ReturnStatement(_)
+        | Statement::ThrowStatement(_)
+        | Statement::BreakStatement(_)
+        | Statement::ContinueStatement(_) => true,
+        Statement::BlockStatement(block) => {
+            block.body.last().is_some_and(statement_always_terminates)
+        }
+        Statement::IfStatement(if_stmt) => {
+            statement_always_terminates(&if_stmt.consequent)
+                && if_stmt.alternate.as_ref().is_some_and(|alt| statement_always_terminates(alt))
+        }
+        _ => false,
+    }
+}
+
+/// Append every statement of `stmt` (flattening a block) to `nodes` via
+/// the canonical statement conversion.
+fn flatten_statement_into(nodes: &mut Vec<Rc<TreeNode>>, stmt: &Statement, id_counter: &mut usize) {
+    if let Statement::BlockStatement(block) = stmt {
+        for inner in &block.body {
+            nodes.extend(statement_to_tree_nodes(inner, id_counter));
+        }
+    } else {
+        nodes.extend(statement_to_tree_nodes(stmt, id_counter));
+    }
+}
+
+/// Canonical conversion for `if` statements. Two normalizations compose
+/// here so every guard-style spelling of the same branch logic lands on
+/// one shape:
+///
+///   * negation swap — `if (!c) { A } else { B }` renders as
+///     `if (c) { B } else { A }`, and `if (a !== b) …` flips to the `===`
+///     form with swapped branches (exact complements; ordering operators
+///     are left alone because of NaN);
+///   * jump flattening — when one branch always exits (`return`/`throw`/
+///     `break`/`continue`), the other branch hoists out of the `else`:
+///     `if (c) { return x; } else { rest… }` ⇔
+///     `if (c) { return x; } rest…` ⇔ (via the ternary lowering)
+///     `return c ? x : …`.
+fn canonical_if_nodes(
+    if_stmt: &oxc_ast::ast::IfStatement,
+    id_counter: &mut usize,
+) -> Vec<Rc<TreeNode>> {
+    let mut consequent: &Statement = &if_stmt.consequent;
+    let mut alternate: Option<&Statement> = if_stmt.alternate.as_ref();
+    let mut test: &Expression = strip_parentheses(&if_stmt.test);
+
+    /// How the source spelled the (now positive-form) test, so the
+    /// renderers know whether "positive" means "as-is", "the unwrapped
+    /// operand", or "the flipped complement". Deriving this later by
+    /// re-matching the test's shape is WRONG: `!(a > b)` unwraps to a
+    /// binary expression and would masquerade as the flipped-equality
+    /// case.
+    enum NegationStyle {
+        Plain,
+        /// `if (!x) …` — `test` already holds the unwrapped operand.
+        Unwrapped,
+        /// `if (a !== b) …` — `test` still holds the source binary; the
+        /// positive form is its flipped complement.
+        FlippedBinary,
+    }
+
+    let mut negation = NegationStyle::Plain;
+
+    // Negation swap (only meaningful when there is an alternate to swap
+    // with). One unwrap is enough: `!!c` in test position is already
+    // simplified by `test_expression_to_tree_node`.
+    if let Some(alt) = alternate {
+        let negated_form = match test {
+            Expression::UnaryExpression(unary)
+                if unary.operator == UnaryOperator::LogicalNot =>
+            {
+                Some((strip_parentheses(&unary.argument), NegationStyle::Unwrapped))
+            }
+            Expression::BinaryExpression(bin)
+                if matches!(
+                    bin.operator,
+                    BinaryOperator::StrictInequality | BinaryOperator::Inequality
+                ) =>
+            {
+                Some((test, NegationStyle::FlippedBinary))
+            }
+            _ => None,
+        };
+        if let Some((positive, style)) = negated_form {
+            test = positive;
+            negation = style;
+            let previous_consequent = consequent;
+            consequent = alt;
+            alternate = Some(previous_consequent);
+        }
+    }
+
+    // Rendering helpers: `positive` is the test as the swapped `if`
+    // should show it; `negated` is its exact complement.
+    let render_positive = |ids: &mut usize| -> Option<Rc<TreeNode>> {
+        match negation {
+            NegationStyle::FlippedBinary => negated_expression_to_tree_node(test, ids),
+            NegationStyle::Plain | NegationStyle::Unwrapped => {
+                test_expression_to_tree_node(test, ids)
+            }
+        }
+    };
+    let render_negated = |ids: &mut usize| -> Option<Rc<TreeNode>> {
+        match negation {
+            NegationStyle::FlippedBinary => test_expression_to_tree_node(test, ids),
+            NegationStyle::Plain | NegationStyle::Unwrapped => {
+                negated_expression_to_tree_node(test, ids)
+            }
+        }
+    };
+
+    if let Some(alt) = alternate {
+        if statement_always_terminates(consequent) {
+            let mut if_node = make_node("IfStatement", "IfStatement", id_counter);
+            if let Some(test_node) = render_positive(id_counter) {
+                if_node.add_child(test_node);
+            }
+            if let Some(cons_node) = statement_to_block_node(consequent, id_counter) {
+                if_node.add_child(cons_node);
+            }
+            let mut nodes = vec![Rc::new(if_node)];
+            flatten_statement_into(&mut nodes, alt, id_counter);
+            return nodes;
+        }
+        if statement_always_terminates(alt) {
+            let mut if_node = make_node("IfStatement", "IfStatement", id_counter);
+            if let Some(test_node) = render_negated(id_counter) {
+                if_node.add_child(test_node);
+            }
+            if let Some(alt_node) = statement_to_block_node(alt, id_counter) {
+                if_node.add_child(alt_node);
+            }
+            let mut nodes = vec![Rc::new(if_node)];
+            flatten_statement_into(&mut nodes, consequent, id_counter);
+            return nodes;
+        }
+    }
+
+    // No flattening possible: plain if/else, with `else { if … }` blocks
+    // unwrapped so they align with bare `else if` chains.
+    let mut node = make_node("IfStatement", "IfStatement", id_counter);
+    if let Some(test_node) = render_positive(id_counter) {
+        node.add_child(test_node);
+    }
+    if let Some(cons_node) = statement_to_block_node(consequent, id_counter) {
+        node.add_child(cons_node);
+    }
+    if let Some(alt) = alternate {
+        let effective_alt: &Statement = match alt {
+            Statement::BlockStatement(block)
+                if block.body.len() == 1
+                    && matches!(block.body.first(), Some(Statement::IfStatement(_))) =>
+            {
+                block.body.first().map_or(alt, |inner| inner)
+            }
+            _ => alt,
+        };
+        if let Statement::IfStatement(inner_if) = effective_alt {
+            let mut alt_nodes = canonical_if_nodes(inner_if, id_counter);
+            if alt_nodes.len() == 1 {
+                if let Some(single) = alt_nodes.pop() {
+                    node.add_child(single);
+                }
+            } else {
+                // The nested chain flattened into several statements —
+                // hold them in a block, mirroring how the explicit
+                // `else { … }` spelling converts.
+                let mut block = make_node("BlockStatement", "BlockStatement", id_counter);
+                for alt_node in alt_nodes {
+                    block.add_child(alt_node);
+                }
+                node.add_child(Rc::new(block));
+            }
+        } else if let Some(alt_node) = statement_to_block_node(effective_alt, id_counter) {
+            node.add_child(alt_node);
+        }
+    }
+    vec![Rc::new(node)]
+}
+
+/// Lower `const { a, b: renamed } = source;` (side-effect-free source,
+/// plain identifier bindings, no defaults/rest/nesting) into the
+/// per-property member-access declarations it is equivalent to:
+/// `const a = source.a; const renamed = source.b;`.
+fn lower_destructuring_declaration(
+    var_decl: &VariableDeclaration,
+    id_counter: &mut usize,
+) -> Option<Vec<Rc<TreeNode>>> {
+    if var_decl.declarations.len() != 1 {
+        return None;
+    }
+    let declarator = &var_decl.declarations[0];
+    let BindingPattern::ObjectPattern(pattern) = &declarator.id else {
+        return None;
+    };
+    if pattern.rest.is_some() || pattern.properties.is_empty() {
+        return None;
+    }
+    let init = declarator.init.as_ref()?;
+    if !is_side_effect_free(init) {
+        return None;
+    }
+
+    enum KeyAccess {
+        Static(String),
+        Quoted(String),
+    }
+
+    let mut lowered = Vec::new();
+    for property in &pattern.properties {
+        if property.computed {
+            return None;
+        }
+        let key = match &property.key {
+            PropertyKey::StaticIdentifier(ident) => KeyAccess::Static(ident.name.to_string()),
+            PropertyKey::StringLiteral(lit) => KeyAccess::Quoted(lit.value.to_string()),
+            _ => return None,
+        };
+        let BindingPattern::BindingIdentifier(binding) = &property.value else {
+            return None;
+        };
+        lowered.push((key, identifier_label(binding.span, &binding.name)));
+    }
+
+    let kind_label = format!("{:?}Declaration", var_decl.kind);
+    let mut nodes = Vec::with_capacity(lowered.len());
+    for (key, binding_label) in lowered {
+        let mut decl = make_node(&kind_label, "VariableDeclaration", id_counter);
+        let mut declarator_node =
+            make_node("VariableDeclarator", "VariableDeclarator", id_counter);
+        declarator_node.add_child(leaf(&binding_label, "BindingIdentifier", id_counter));
+        let access: Rc<TreeNode> = match key {
+            KeyAccess::Static(name) => {
+                let mut member = make_node(".", "StaticMemberExpression", id_counter);
+                if let Some(object) = expression_to_tree_node(init, id_counter) {
+                    member.add_child(object);
+                }
+                member.add_child(leaf(&name, "Identifier", id_counter));
+                Rc::new(member)
+            }
+            KeyAccess::Quoted(value) => {
+                let mut member = make_node("[]", "ComputedMemberExpression", id_counter);
+                if let Some(object) = expression_to_tree_node(init, id_counter) {
+                    member.add_child(object);
+                }
+                member.add_child(leaf(&format!("\"{value}\""), "StringLiteral", id_counter));
+                Rc::new(member)
+            }
+        };
+        declarator_node.add_child(access);
+        decl.add_child(Rc::new(declarator_node));
+        nodes.push(Rc::new(decl));
+    }
+    Some(nodes)
+}
+
+// ---------------------------------------------------------------------------
+// Statement-list peepholes (TreeNode level)
+// ---------------------------------------------------------------------------
+//
+// These run over already-converted statement lists, where earlier
+// lowerings (forEach → for-of, `i++` → `i += 1`, ternaries → if/else)
+// have normalized their inputs — so one pattern here covers every source
+// spelling of the idiom.
+
+fn trees_equal(a: &TreeNode, b: &TreeNode) -> bool {
+    a.label == b.label
+        && a.value == b.value
+        && a.children.len() == b.children.len()
+        && a.children.iter().zip(b.children.iter()).all(|(x, y)| trees_equal(x, y))
+}
+
+fn tree_mentions_identifier(node: &TreeNode, label: &str) -> bool {
+    if (node.value == "Identifier" || node.value == "BindingIdentifier") && node.label == label {
+        return true;
+    }
+    node.children.iter().any(|child| tree_mentions_identifier(child, label))
+}
+
+/// The single binding introduced by a `<Kind>Declaration [VariableDeclarator
+/// [BindingIdentifier …]]` node, together with its initializer (if any).
+fn single_declarator(node: &TreeNode) -> Option<(&Rc<TreeNode>, Option<&Rc<TreeNode>>)> {
+    if node.value != "VariableDeclaration" || node.children.len() != 1 {
+        return None;
+    }
+    let declarator = &node.children[0];
+    if declarator.value != "VariableDeclarator" || declarator.children.is_empty() {
+        return None;
+    }
+    let binding = &declarator.children[0];
+    if binding.value != "BindingIdentifier" {
+        return None;
+    }
+    Some((binding, declarator.children.get(1)))
+}
+
+/// Rewrite `for (let i = 0; i < xs.length; i += 1) { const x = xs[i]; … }`
+/// (with `i` unused elsewhere) into `for (const x of xs) { … }`. All the
+/// index-stepping spellings (`i++`, `++i`, `i += 1`, `i = i + 1`) already
+/// canonicalized onto the compound form before this runs.
+fn rewrite_index_loop(node: &Rc<TreeNode>, id_counter: &mut usize) -> Option<Rc<TreeNode>> {
+    if node.label != "ForStatement" || node.children.len() != 4 {
+        return None;
+    }
+    let (init, test, update, body) =
+        (&node.children[0], &node.children[1], &node.children[2], &node.children[3]);
+
+    let (index_binding, index_init) = single_declarator(init)?;
+    if index_init?.label != "0" {
+        return None;
+    }
+    let index_label = index_binding.label.clone();
+
+    if test.label != "LessThan" || test.children.len() != 2 {
+        return None;
+    }
+    if test.children[0].label != index_label || test.children[0].value != "Identifier" {
+        return None;
+    }
+    let length_access = &test.children[1];
+    if length_access.label != "." || length_access.children.len() != 2 {
+        return None;
+    }
+    if length_access.children[1].label != "length" {
+        return None;
+    }
+    let iterated = &length_access.children[0];
+    if tree_mentions_identifier(iterated, &index_label) {
+        return None;
+    }
+
+    if update.value != "AssignmentExpression"
+        || update.label != "Addition"
+        || update.children.len() != 2
+        || update.children[0].label != index_label
+        || update.children[1].label != "1"
+    {
+        return None;
+    }
+
+    if body.value != "BlockStatement" || body.children.is_empty() {
+        return None;
+    }
+    let first = &body.children[0];
+    let (element_binding, element_init) = single_declarator(first)?;
+    let element_init = element_init?;
+    if element_init.label != "[]"
+        || element_init.children.len() != 2
+        || !trees_equal(&element_init.children[0], iterated)
+        || element_init.children[1].label != index_label
+        || element_init.children[1].value != "Identifier"
+    {
+        return None;
+    }
+    if body.children[1..].iter().any(|stmt| tree_mentions_identifier(stmt, &index_label)) {
+        return None;
+    }
+
+    let mut for_node = make_node("ForOfStatement", "ForOfStatement", id_counter);
+    let mut decl = make_node("ConstDeclaration", "VariableDeclaration", id_counter);
+    let mut declarator = make_node("VariableDeclarator", "VariableDeclarator", id_counter);
+    declarator.add_child(Rc::clone(element_binding));
+    decl.add_child(Rc::new(declarator));
+    for_node.add_child(Rc::new(decl));
+    for_node.add_child(Rc::clone(iterated));
+    let mut block = make_node("BlockStatement", "BlockStatement", id_counter);
+    for stmt in &body.children[1..] {
+        block.add_child(Rc::clone(stmt));
+    }
+    for_node.add_child(Rc::new(block));
+    Some(Rc::new(for_node))
+}
+
+/// Rewrite the accumulate-into-array idiom onto its method form:
+///
+/// ```text
+/// const out = [];                       const out = xs.map((x) => E);
+/// for (const x of xs) {          ⇒
+///   out.push(E);
+/// }
+/// ```
+///
+/// and the guarded push of the element itself onto `.filter`. Runs after
+/// forEach→for-of lowering, so both loop spellings participate.
+fn rewrite_push_loop(
+    declaration: &Rc<TreeNode>,
+    loop_node: &Rc<TreeNode>,
+    id_counter: &mut usize,
+) -> Option<Rc<TreeNode>> {
+    let (accumulator_binding, accumulator_init) = single_declarator(declaration)?;
+    let accumulator_init = accumulator_init?;
+    if accumulator_init.value != "ArrayExpression" || !accumulator_init.children.is_empty() {
+        return None;
+    }
+    let accumulator = accumulator_binding.label.clone();
+
+    if loop_node.label != "ForOfStatement" || loop_node.children.len() != 3 {
+        return None;
+    }
+    let (left, iterated, body) =
+        (&loop_node.children[0], &loop_node.children[1], &loop_node.children[2]);
+    let (element_binding, element_init) = single_declarator(left)?;
+    if element_init.is_some() {
+        return None;
+    }
+    if tree_mentions_identifier(iterated, &accumulator) {
+        return None;
+    }
+    if body.value != "BlockStatement" || body.children.len() != 1 {
+        return None;
+    }
+
+    let push_argument_of = |stmt: &Rc<TreeNode>| -> Option<Rc<TreeNode>> {
+        if stmt.value != "ExpressionStatement" || stmt.children.len() != 1 {
+            return None;
+        }
+        let call = &stmt.children[0];
+        if call.label != "CallExpression" || call.children.len() != 2 {
+            return None;
+        }
+        let callee = &call.children[0];
+        if callee.label != "."
+            || callee.children.len() != 2
+            || callee.children[0].label != accumulator
+            || callee.children[0].value != "Identifier"
+            || callee.children[1].label != "push"
+        {
+            return None;
+        }
+        Some(Rc::clone(&call.children[1]))
+    };
+
+    let statement = &body.children[0];
+    let (method, callback_body_expr) = if let Some(argument) = push_argument_of(statement) {
+        if tree_mentions_identifier(&argument, &accumulator) {
+            return None;
+        }
+        ("map", argument)
+    } else if statement.value == "IfStatement" && statement.children.len() == 2 {
+        // if (COND) { out.push(x) }  — pushing the element itself.
+        let condition = &statement.children[0];
+        let then_block = &statement.children[1];
+        if then_block.value != "BlockStatement" || then_block.children.len() != 1 {
+            return None;
+        }
+        let argument = push_argument_of(&then_block.children[0])?;
+        if argument.value != "Identifier" || argument.label != element_binding.label {
+            return None;
+        }
+        if tree_mentions_identifier(condition, &accumulator) {
+            return None;
+        }
+        ("filter", Rc::clone(condition))
+    } else {
+        return None;
+    };
+
+    // const out = xs.<method>((x) => { return E; });
+    let mut arrow = make_node("ArrowFunction", "ArrowFunctionExpression", id_counter);
+    let mut parameter = make_node("Parameter", "Parameter", id_counter);
+    parameter.add_child(Rc::clone(element_binding));
+    arrow.add_child(Rc::new(parameter));
+    let mut arrow_block = make_node("BlockStatement", "BlockStatement", id_counter);
+    let mut return_node = make_node("ReturnStatement", "ReturnStatement", id_counter);
+    return_node.add_child(callback_body_expr);
+    arrow_block.add_child(Rc::new(return_node));
+    arrow.add_child(Rc::new(arrow_block));
+
+    let mut member = make_node(".", "StaticMemberExpression", id_counter);
+    member.add_child(Rc::clone(iterated));
+    member.add_child(leaf(method, "Identifier", id_counter));
+
+    let mut call = make_node("CallExpression", "CallExpression", id_counter);
+    call.add_child(Rc::new(member));
+    call.add_child(Rc::new(arrow));
+
+    let mut declarator = make_node("VariableDeclarator", "VariableDeclarator", id_counter);
+    declarator.add_child(Rc::clone(accumulator_binding));
+    declarator.add_child(Rc::new(call));
+    let mut decl = make_node(&declaration.label, "VariableDeclaration", id_counter);
+    decl.add_child(Rc::new(declarator));
+    Some(Rc::new(decl))
+}
+
+/// TreeNode-level "control cannot continue" check, mirroring
+/// [`statement_always_terminates`] for already-converted nodes.
+fn node_always_terminates(node: &TreeNode) -> bool {
+    match node.value.as_str() {
+        "ReturnStatement" | "ThrowStatement" | "BreakStatement" | "ContinueStatement" => true,
+        "BlockStatement" => node.children.last().is_some_and(|last| node_always_terminates(last)),
+        "IfStatement" => {
+            node.children.len() == 3
+                && node_always_terminates(&node.children[1])
+                && node_always_terminates(&node.children[2])
+        }
+        _ => false,
+    }
+}
+
+/// Flip an else-less negative guard so both complementary spellings of a
+/// terminating branch pair converge:
+///
+/// ```text
+/// if (a !== b) { return X; }        if (a === b) { return Y; }
+/// return Y;                    ⇔    return X;
+/// ```
+///
+/// Sound only when both the guard body and the tail always exit — then
+/// "which branch is the guard" is pure style. Only exact complements flip
+/// (equality operators and `!`); ordering comparisons stay put because of
+/// NaN.
+fn rewrite_negative_guard(nodes: &mut Vec<Rc<TreeNode>>, id_counter: &mut usize) {
+    for index in 0..nodes.len() {
+        let is_last = index + 1 == nodes.len();
+        if is_last {
+            break;
+        }
+        let guard = &nodes[index];
+        if guard.value != "IfStatement" || guard.children.len() != 2 {
+            continue;
+        }
+        let test = &guard.children[0];
+        let flipped_label = match test.label.as_str() {
+            "StrictInequality" if test.value == "BinaryExpression" => Some("StrictEquality"),
+            "Inequality" if test.value == "BinaryExpression" => Some("Equality"),
+            "LogicalNot" if test.value == "UnaryExpression" => None,
+            _ => continue,
+        };
+        if !node_always_terminates(&guard.children[1]) {
+            continue;
+        }
+        let mut tail: Vec<Rc<TreeNode>> = nodes[index + 1..].to_vec();
+        if !tail.last().is_some_and(|last| node_always_terminates(last)) {
+            continue;
+        }
+        // The tail may itself start with a negative guard — normalize it
+        // before it becomes the flipped consequent.
+        rewrite_negative_guard(&mut tail, id_counter);
+
+        let positive_test: Rc<TreeNode> = if let Some(label) = flipped_label {
+            let mut flipped = make_node(label, "BinaryExpression", id_counter);
+            for child in &test.children {
+                flipped.add_child(Rc::clone(child));
+            }
+            Rc::new(flipped)
+        } else {
+            // `!x` — the positive form is the bare operand.
+            match test.children.first() {
+                Some(inner) => Rc::clone(inner),
+                None => continue,
+            }
+        };
+
+        let mut tail_block = make_node("BlockStatement", "BlockStatement", id_counter);
+        for stmt in tail {
+            tail_block.add_child(stmt);
+        }
+        let mut flipped_guard = make_node("IfStatement", "IfStatement", id_counter);
+        flipped_guard.add_child(positive_test);
+        flipped_guard.add_child(Rc::new(tail_block));
+
+        let old_consequent = Rc::clone(&guard.children[1]);
+        nodes.truncate(index);
+        nodes.push(Rc::new(flipped_guard));
+        nodes.extend(old_consequent.children.iter().cloned());
+        break;
+    }
+}
+
+/// TreeNode-level purity: labels/kinds that are safe to move across
+/// adjacent statements (identifiers, literals, `this`, and static member
+/// chains of those). Mirrors [`is_side_effect_free`] for converted nodes.
+fn node_is_pure_chain(node: &TreeNode) -> bool {
+    match node.value.as_str() {
+        "Identifier" | "BindingIdentifier" | "ThisExpression" | "StringLiteral"
+        | "NumericLiteral" | "BooleanLiteral" | "NullLiteral" | "BigIntLiteral" => true,
+        "StaticMemberExpression" if node.label == "." => {
+            node.children.first().is_some_and(|object| node_is_pure_chain(object))
+        }
+        _ => false,
+    }
+}
+
+fn count_identifier_uses(node: &TreeNode, label: &str) -> usize {
+    let own = usize::from(node.value == "Identifier" && node.label == label);
+    own + node.children.iter().map(|child| count_identifier_uses(child, label)).sum::<usize>()
+}
+
+/// Clone `node` with the single `Identifier` leaf labeled `label`
+/// replaced by `replacement`. `replaced` flips when the substitution
+/// happens so only the first occurrence is rewritten.
+fn substitute_identifier(
+    node: &Rc<TreeNode>,
+    label: &str,
+    replacement: &Rc<TreeNode>,
+    replaced: &mut bool,
+    id_counter: &mut usize,
+) -> Rc<TreeNode> {
+    if !*replaced && node.value == "Identifier" && node.label == label {
+        *replaced = true;
+        return Rc::clone(replacement);
+    }
+    if node.children.is_empty() {
+        return Rc::clone(node);
+    }
+    let mut fresh = make_node(&node.label, &node.value, id_counter);
+    fresh.source_span = node.source_span;
+    for child in &node.children {
+        fresh.add_child(substitute_identifier(child, label, replacement, replaced, id_counter));
+    }
+    Rc::new(fresh)
+}
+
+/// Inline single-use pure-chain constants:
+///
+/// ```text
+/// const id = payload.member_id;      return { id: payload.member_id };
+/// return { id };                ⇒
+/// ```
+///
+/// Only fires for canonical `§`-renamed locals whose initializer is a
+/// pure chain (identifier / literal / `this` / static member access) and
+/// that are referenced exactly once afterwards — then moving the read to
+/// the use site cannot change behavior (modulo getters, an accepted
+/// caveat shared with the destructuring lowering that feeds this pass).
+fn inline_single_use_constants(nodes: &mut Vec<Rc<TreeNode>>, id_counter: &mut usize) {
+    let mut index = 0;
+    while index < nodes.len() {
+        let Some((binding, Some(init))) = single_declarator(&nodes[index]) else {
+            index += 1;
+            continue;
+        };
+        if nodes[index].label != "ConstDeclaration"
+            || !binding.label.starts_with('§')
+            || !node_is_pure_chain(init)
+        {
+            index += 1;
+            continue;
+        }
+        let label = binding.label.clone();
+        let uses: usize =
+            nodes[index + 1..].iter().map(|stmt| count_identifier_uses(stmt, &label)).sum();
+        if uses != 1 {
+            index += 1;
+            continue;
+        }
+        let Some(use_offset) = nodes[index + 1..]
+            .iter()
+            .position(|stmt| count_identifier_uses(stmt, &label) > 0)
+        else {
+            index += 1;
+            continue;
+        };
+        // Moving the read to the use site is only order-safe when nothing
+        // in between can mutate what the chain reads: every intervening
+        // statement must itself be a pure-chain const declaration (the
+        // destructuring-lowering shape this pass exists for).
+        let gap_is_pure = nodes[index + 1..index + 1 + use_offset].iter().all(|stmt| {
+            matches!(single_declarator(stmt), Some((_, Some(init)))
+                if stmt.label == "ConstDeclaration" && node_is_pure_chain(init))
+        });
+        if !gap_is_pure {
+            index += 1;
+            continue;
+        }
+        let init = Rc::clone(init);
+        let mut replaced = false;
+        let slot = &mut nodes[index + 1 + use_offset];
+        *slot = substitute_identifier(slot, &label, &init, &mut replaced, id_counter);
+        nodes.remove(index);
+        // Re-check the same index — the next statement may now qualify.
+    }
+}
+
+/// Whether an initializer is a pure computation (no calls, construction,
+/// awaits, or mutation anywhere) — such initializers commute with each
+/// other, so declaration order between them is style, not behavior.
+fn node_is_reorderable_init(node: &TreeNode) -> bool {
+    match node.value.as_str() {
+        "CallExpression" | "NewExpression" | "AwaitExpression" | "YieldExpression"
+        | "AssignmentExpression" | "UpdateExpression" | "TaggedTemplateExpression"
+        | "ImportExpression" => false,
+        _ => node.children.iter().all(|child| node_is_reorderable_init(child)),
+    }
+}
+
+/// Order-canonicalize runs of consecutive, mutually independent, pure
+/// `const` declarations by the structure of their initializers.
+/// `const a = o.x; const b = o.y;` and `const b = o.y; const a = o.x;`
+/// are the same code — sorting removes the incidental order (which the
+/// destructuring lowering and hand-written spellings frequently disagree
+/// on) so it stops costing tree distance. Binding names are excluded
+/// from the sort key: they carry pre-relabel ordinals that differ by
+/// construction.
+fn sort_reorderable_declarations(nodes: &mut [Rc<TreeNode>]) {
+    fn init_sort_key(node: &TreeNode) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let (_, Some(init)) = single_declarator(node)? else {
+            return None;
+        };
+        if node.label != "ConstDeclaration" || !node_is_reorderable_init(init) {
+            return None;
+        }
+        fn walk(node: &TreeNode, hasher: &mut impl Hasher) {
+            node.label.hash(hasher);
+            node.value.hash(hasher);
+            node.children.len().hash(hasher);
+            for child in &node.children {
+                walk(child, hasher);
+            }
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        walk(init, &mut hasher);
+        Some(hasher.finish())
+    }
+
+    let mut index = 0;
+    while index < nodes.len() {
+        // Grow a run of sortable const declarations.
+        let mut end = index;
+        while end < nodes.len() && init_sort_key(&nodes[end]).is_some() {
+            end += 1;
+        }
+        if end - index >= 2 {
+            // Independence: no init may mention a binding declared inside
+            // the run (that would be a real data dependency).
+            let bindings: Vec<String> = nodes[index..end]
+                .iter()
+                .filter_map(|node| single_declarator(node).map(|(b, _)| b.label.clone()))
+                .collect();
+            let independent = nodes[index..end].iter().all(|node| {
+                single_declarator(node).and_then(|(_, init)| init).is_some_and(|init| {
+                    bindings.iter().all(|binding| !tree_mentions_identifier(init, binding))
+                })
+            });
+            if independent {
+                nodes[index..end].sort_by_key(|node| init_sort_key(node).unwrap_or(u64::MAX));
+            }
+        }
+        index = end.max(index + 1);
+    }
+}
+
+/// `const t = E; return t;` at the end of a block ⇔ `return E;`.
+fn rewrite_temp_return(nodes: &mut Vec<Rc<TreeNode>>, id_counter: &mut usize) {
+    let count = nodes.len();
+    if count < 2 {
+        return;
+    }
+    let Some((binding, Some(init))) = single_declarator(&nodes[count - 2]) else {
+        return;
+    };
+    let return_node = &nodes[count - 1];
+    if return_node.label != "ReturnStatement"
+        || return_node.children.len() != 1
+        || return_node.children[0].value != "Identifier"
+        || return_node.children[0].label != binding.label
+    {
+        return;
+    }
+    let mut replacement = make_node("ReturnStatement", "ReturnStatement", id_counter);
+    replacement.add_child(Rc::clone(init));
+    nodes.truncate(count - 2);
+    nodes.push(Rc::new(replacement));
+}
+
+/// Run the statement-list peepholes over a freshly built block body.
+fn normalize_statement_nodes(nodes: &mut Vec<Rc<TreeNode>>, id_counter: &mut usize) {
+    if !canonicalize_enabled() {
+        return;
+    }
+    for slot in nodes.iter_mut() {
+        if let Some(rewritten) = rewrite_index_loop(slot, id_counter) {
+            *slot = rewritten;
+        }
+    }
+    inline_single_use_constants(nodes, id_counter);
+    let mut index = 0;
+    while index + 1 < nodes.len() {
+        if let Some(replacement) =
+            rewrite_push_loop(&nodes[index], &nodes[index + 1], id_counter)
+        {
+            nodes[index] = replacement;
+            nodes.remove(index + 1);
+        } else {
+            index += 1;
+        }
+    }
+    sort_reorderable_declarations(nodes);
+    rewrite_temp_return(nodes, id_counter);
+    rewrite_negative_guard(nodes, id_counter);
 }
 
 /// Stringify a class member's `PropertyKey` into a label that's unique per
@@ -916,7 +2422,7 @@ fn statement_to_tree_node(stmt: &Statement, id_counter: &mut usize) -> Option<Rc
             if canonicalize_enabled() && for_stmt.init.is_none() && for_stmt.update.is_none() {
                 let mut node = make_node("WhileStatement", "WhileStatement", id_counter);
                 if let Some(test) = &for_stmt.test {
-                    if let Some(test_node) = expression_to_tree_node(test, id_counter) {
+                    if let Some(test_node) = test_expression_to_tree_node(test, id_counter) {
                         node.add_child(test_node);
                     }
                 } else {
@@ -934,7 +2440,7 @@ fn statement_to_tree_node(stmt: &Statement, id_counter: &mut usize) -> Option<Rc
                 }
             }
             if let Some(test) = &for_stmt.test {
-                if let Some(test_node) = expression_to_tree_node(test, id_counter) {
+                if let Some(test_node) = test_expression_to_tree_node(test, id_counter) {
                     node.add_child(test_node);
                 }
             }
@@ -981,7 +2487,7 @@ fn statement_to_tree_node(stmt: &Statement, id_counter: &mut usize) -> Option<Rc
         }
         Statement::WhileStatement(while_stmt) => {
             let mut node = make_node("WhileStatement", "WhileStatement", id_counter);
-            if let Some(test_node) = expression_to_tree_node(&while_stmt.test, id_counter) {
+            if let Some(test_node) = test_expression_to_tree_node(&while_stmt.test, id_counter) {
                 node.add_child(test_node);
             }
             if let Some(body_node) = statement_to_block_node(&while_stmt.body, id_counter) {
@@ -994,7 +2500,7 @@ fn statement_to_tree_node(stmt: &Statement, id_counter: &mut usize) -> Option<Rc
             if let Some(body_node) = statement_to_block_node(&do_stmt.body, id_counter) {
                 node.add_child(body_node);
             }
-            if let Some(test_node) = expression_to_tree_node(&do_stmt.test, id_counter) {
+            if let Some(test_node) = test_expression_to_tree_node(&do_stmt.test, id_counter) {
                 node.add_child(test_node);
             }
             Some(Rc::new(node))
@@ -1037,11 +2543,6 @@ fn statement_to_tree_node(stmt: &Statement, id_counter: &mut usize) -> Option<Rc
             Some(Rc::new(node))
         }
         Statement::SwitchStatement(switch_stmt) => {
-            if canonicalize_enabled() {
-                if let Some(node) = lower_switch_to_if_chain(switch_stmt, id_counter) {
-                    return Some(node);
-                }
-            }
             let mut node = make_node("SwitchStatement", "SwitchStatement", id_counter);
             if let Some(disc_node) =
                 expression_to_tree_node(&switch_stmt.discriminant, id_counter)
@@ -1143,7 +2644,7 @@ fn for_statement_left_to_tree_node(
         // and the parser-level distinction we get for assignments would be
         // lost the moment they appeared in a loop head.
         ForStatementLeft::AssignmentTargetIdentifier(ident) => {
-            Some(leaf(ident.name.as_str(), "Identifier", id_counter))
+            Some(leaf(&identifier_label(ident.span, &ident.name), "Identifier", id_counter))
         }
         ForStatementLeft::StaticMemberExpression(mem) => {
             let mut node = make_node(".", "StaticMemberExpression", id_counter);
@@ -1234,7 +2735,10 @@ fn function_declaration_to_tree_node(
     id_counter: &mut usize,
     default_label: &str,
 ) -> Option<Rc<TreeNode>> {
-    let mut label = func.id.as_ref().map_or(default_label, |id| id.name.as_str()).to_string();
+    let mut label = func
+        .id
+        .as_ref()
+        .map_or_else(|| default_label.to_string(), |id| identifier_label(id.span, &id.name));
     // Canonical mode encodes async / generator into the declaration label
     // (the way arrow and function expressions already do) so an `async`
     // function and its sync twin register as a labelled difference instead
@@ -1270,7 +2774,10 @@ fn class_declaration_to_tree_node(
     id_counter: &mut usize,
     default_label: &str,
 ) -> Option<Rc<TreeNode>> {
-    let label = class.id.as_ref().map_or(default_label, |id| id.name.as_str()).to_string();
+    let label = class
+        .id
+        .as_ref()
+        .map_or_else(|| default_label.to_string(), |id| identifier_label(id.span, &id.name));
     let mut node = TreeNode::new(label, "ClassDeclaration".to_string(), *id_counter);
     *id_counter += 1;
 
@@ -1305,7 +2812,7 @@ fn variable_declaration_to_tree_node(
 fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<Rc<TreeNode>> {
     match expr {
         Expression::Identifier(ident) => {
-            Some(leaf(ident.name.as_str(), "Identifier", id_counter))
+            Some(leaf(&identifier_label(ident.span, &ident.name), "Identifier", id_counter))
         }
         Expression::StringLiteral(str_lit) => {
             let label = format!("\"{}\"", str_lit.value.as_str());
@@ -1450,17 +2957,46 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
             );
             *id_counter += 1;
 
-            if let Some(left_node) = expression_to_tree_node(&bin_expr.left, id_counter) {
+            // Symmetric equality operators put a lone literal operand
+            // second, so Yoda-style `5 === x` matches `x === 5`.
+            let (first, second) = if canonicalize_enabled()
+                && matches!(
+                    bin_expr.operator,
+                    BinaryOperator::StrictEquality
+                        | BinaryOperator::StrictInequality
+                        | BinaryOperator::Equality
+                        | BinaryOperator::Inequality
+                ) {
+                equality_operand_order(&bin_expr.left, &bin_expr.right)
+            } else {
+                (&bin_expr.left, &bin_expr.right)
+            };
+
+            if let Some(left_node) = expression_to_tree_node(first, id_counter) {
                 node.add_child(left_node);
             }
 
-            if let Some(right_node) = expression_to_tree_node(&bin_expr.right, id_counter) {
+            if let Some(right_node) = expression_to_tree_node(second, id_counter) {
                 node.add_child(right_node);
             }
 
             Some(Rc::new(node))
         }
         Expression::LogicalExpression(log_expr) => {
+            // The strict null/undefined pair contracts onto the loose
+            // comparison it is equivalent to: `x === null || x ===
+            // undefined` ⇔ `x == null` (and the `!==`/`&&`/`!=` duals).
+            if canonicalize_enabled() {
+                match classify_nullish_test(expr) {
+                    Some(NullishTest::IsNullish(subject)) => {
+                        return nullish_comparison_node(subject, true, id_counter);
+                    }
+                    Some(NullishTest::NotNullish(subject)) => {
+                        return nullish_comparison_node(subject, false, id_counter);
+                    }
+                    None => {}
+                }
+            }
             let mut node = TreeNode::new(
                 format!("{:?}", log_expr.operator),
                 "LogicalExpression".to_string(),
@@ -1542,6 +3078,23 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
             Some(Rc::new(node))
         }
         Expression::UnaryExpression(unary) => {
+            if canonicalize_enabled() {
+                // `!<expr>` flips equality operators to their exact
+                // complements and distributes over `&&`/`||` (De Morgan),
+                // so `!(a === b)` ⇔ `a !== b` and `!(a && b)` ⇔
+                // `!a || !b` produce one shape.
+                if unary.operator == UnaryOperator::LogicalNot {
+                    return negated_expression_to_tree_node(&unary.argument, id_counter);
+                }
+                // `void 0` (or `void x` for pure x) IS the undefined
+                // value; collapse onto the `undefined` identifier so both
+                // spellings compare as equal.
+                if unary.operator == UnaryOperator::Void
+                    && is_side_effect_free(&unary.argument)
+                {
+                    return Some(leaf("undefined", "Identifier", id_counter));
+                }
+            }
             let mut node = TreeNode::new(
                 format!("{:?}", unary.operator),
                 "UnaryExpression".to_string(),
@@ -1564,8 +3117,64 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
             Some(Rc::new(node))
         }
         Expression::ConditionalExpression(cond) => {
+            if canonicalize_enabled() {
+                let test = strip_parentheses(&cond.test);
+                let consequent = strip_parentheses(&cond.consequent);
+                let alternate = strip_parentheses(&cond.alternate);
+                // Nullish-defaulting ternaries contract onto `??`:
+                //   `x == null ? d : x` ⇔ `x != null ? x : d` ⇔ `x ?? d`.
+                match classify_nullish_test(test) {
+                    Some(NullishTest::IsNullish(subject))
+                        if pure_expressions_equal(subject, alternate) =>
+                    {
+                        let mut node = make_node("Coalesce", "LogicalExpression", id_counter);
+                        if let Some(child) = expression_to_tree_node(alternate, id_counter) {
+                            node.add_child(child);
+                        }
+                        if let Some(child) = expression_to_tree_node(consequent, id_counter) {
+                            node.add_child(child);
+                        }
+                        return Some(Rc::new(node));
+                    }
+                    Some(NullishTest::NotNullish(subject))
+                        if pure_expressions_equal(subject, consequent) =>
+                    {
+                        let mut node = make_node("Coalesce", "LogicalExpression", id_counter);
+                        if let Some(child) = expression_to_tree_node(consequent, id_counter) {
+                            node.add_child(child);
+                        }
+                        if let Some(child) = expression_to_tree_node(alternate, id_counter) {
+                            node.add_child(child);
+                        }
+                        return Some(Rc::new(node));
+                    }
+                    _ => {}
+                }
+                // `x ? x : y` ⇔ `x || y` and `x ? y : x` ⇔ `x && y` for
+                // side-effect-free x (evaluating x twice is only safe
+                // when x is pure).
+                if is_side_effect_free(test) {
+                    let logical = if pure_expressions_equal(test, consequent) {
+                        Some(("Or", alternate))
+                    } else if pure_expressions_equal(test, alternate) {
+                        Some(("And", consequent))
+                    } else {
+                        None
+                    };
+                    if let Some((label, other)) = logical {
+                        let mut node = make_node(label, "LogicalExpression", id_counter);
+                        if let Some(child) = expression_to_tree_node(test, id_counter) {
+                            node.add_child(child);
+                        }
+                        if let Some(child) = expression_to_tree_node(other, id_counter) {
+                            node.add_child(child);
+                        }
+                        return Some(Rc::new(node));
+                    }
+                }
+            }
             let mut node = make_node("ConditionalExpression", "ConditionalExpression", id_counter);
-            if let Some(test_node) = expression_to_tree_node(&cond.test, id_counter) {
+            if let Some(test_node) = test_expression_to_tree_node(&cond.test, id_counter) {
                 node.add_child(test_node);
             }
             if let Some(cons_node) = expression_to_tree_node(&cond.consequent, id_counter) {
@@ -1604,6 +3213,43 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
             Some(Rc::new(node))
         }
         Expression::ComputedMemberExpression(mem) => {
+            // `arr[arr.length - 1]` ⇔ `arr.at(-1)` for a pure `arr` —
+            // identical values including the out-of-bounds/`undefined`
+            // case. Canonical form is the `.at(-1)` call.
+            if canonicalize_enabled() && !mem.optional && is_side_effect_free(&mem.object) {
+                if let Expression::BinaryExpression(bin) = strip_parentheses(&mem.expression) {
+                    if bin.operator == BinaryOperator::Subtraction {
+                        if let (
+                            Expression::StaticMemberExpression(length_member),
+                            Expression::NumericLiteral(one),
+                        ) = (strip_parentheses(&bin.left), strip_parentheses(&bin.right))
+                        {
+                            if (one.value - 1.0).abs() < f64::EPSILON
+                                && !length_member.optional
+                                && length_member.property.name.as_str() == "length"
+                                && pure_expressions_equal(&mem.object, &length_member.object)
+                            {
+                                let mut member =
+                                    make_node(".", "StaticMemberExpression", id_counter);
+                                if let Some(object) =
+                                    expression_to_tree_node(&mem.object, id_counter)
+                                {
+                                    member.add_child(object);
+                                }
+                                member.add_child(leaf("at", "Identifier", id_counter));
+                                let mut minus_one =
+                                    make_node("UnaryNegation", "UnaryExpression", id_counter);
+                                minus_one.add_child(leaf("1", "NumericLiteral", id_counter));
+                                let mut call =
+                                    make_node("CallExpression", "CallExpression", id_counter);
+                                call.add_child(Rc::new(member));
+                                call.add_child(Rc::new(minus_one));
+                                return Some(Rc::new(call));
+                            }
+                        }
+                    }
+                }
+            }
             let label = if mem.optional { "?.[]" } else { "[]" };
             let mut node = TreeNode::new(
                 label.to_string(),
@@ -1641,6 +3287,17 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
             if canonicalize_enabled() {
                 if let Some(node) = lower_object_assign_to_spread(call_expr, id_counter) {
                     return Some(node);
+                }
+                // `Boolean(x)` ⇔ `!!x` — same value for every input.
+                // Canonical form is the double negation.
+                if let Some(argument) = match_boolean_call(expr) {
+                    let mut inner = make_node("LogicalNot", "UnaryExpression", id_counter);
+                    if let Some(child) = expression_to_tree_node(argument, id_counter) {
+                        inner.add_child(child);
+                    }
+                    let mut outer = make_node("LogicalNot", "UnaryExpression", id_counter);
+                    outer.add_child(Rc::new(inner));
+                    return Some(Rc::new(outer));
                 }
             }
             let label = if call_expr.optional { "?.()" } else { "CallExpression" };
@@ -1749,7 +3406,21 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
                 if let Some(Statement::ExpressionStatement(expr_stmt)) =
                     arrow.body.statements.first()
                 {
-                    if let Some(expr_node) =
+                    if canonicalize_enabled() {
+                        // `(x) => expr` is the same function as
+                        // `(x) => { return expr; }` — wrap the expression
+                        // body in the explicit block/return shape so both
+                        // spellings (and nested callbacks in particular)
+                        // produce identical trees.
+                        let mut block =
+                            make_node("BlockStatement", "BlockStatement", id_counter);
+                        for child in
+                            canonical_return_nodes(Some(&expr_stmt.expression), id_counter)
+                        {
+                            block.add_child(child);
+                        }
+                        node.add_child(Rc::new(block));
+                    } else if let Some(expr_node) =
                         expression_to_tree_node(&expr_stmt.expression, id_counter)
                     {
                         node.add_child(expr_node);
@@ -1900,7 +3571,7 @@ fn assignment_target_to_tree_node(
     use oxc_ast::ast::AssignmentTarget;
     match target {
         AssignmentTarget::AssignmentTargetIdentifier(ident) => Some(leaf(
-            ident.name.as_str(),
+            &identifier_label(ident.span, &ident.name),
             "Identifier",
             id_counter,
         )),
@@ -1955,7 +3626,7 @@ fn simple_assignment_target_to_tree_node(
     use oxc_ast::ast::SimpleAssignmentTarget;
     match target {
         SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => Some(leaf(
-            ident.name.as_str(),
+            &identifier_label(ident.span, &ident.name),
             "Identifier",
             id_counter,
         )),
@@ -2066,7 +3737,7 @@ fn binding_pattern_to_tree_node(
 ) -> Option<Rc<TreeNode>> {
     match pattern {
         BindingPattern::BindingIdentifier(ident) => Some(leaf(
-            ident.name.as_str(),
+            &identifier_label(ident.span, &ident.name),
             "BindingIdentifier",
             id_counter,
         )),
@@ -2129,8 +3800,13 @@ fn function_body_to_tree_node(body: &FunctionBody, id_counter: &mut usize) -> Op
         TreeNode::new("BlockStatement".to_string(), "BlockStatement".to_string(), *id_counter);
     *id_counter += 1;
 
+    let mut statements = Vec::with_capacity(body.statements.len());
     for stmt in &body.statements {
-        append_statement_to_list(&mut node, stmt, id_counter);
+        statements.extend(statement_to_tree_nodes(stmt, id_counter));
+    }
+    normalize_statement_nodes(&mut statements, id_counter);
+    for child in statements {
+        node.add_child(child);
     }
 
     Some(Rc::new(node))
@@ -2144,8 +3820,13 @@ fn block_statement_to_tree_node(
         TreeNode::new("BlockStatement".to_string(), "BlockStatement".to_string(), *id_counter);
     *id_counter += 1;
 
+    let mut statements = Vec::with_capacity(block.body.len());
     for stmt in &block.body {
-        append_statement_to_list(&mut node, stmt, id_counter);
+        statements.extend(statement_to_tree_nodes(stmt, id_counter));
+    }
+    normalize_statement_nodes(&mut statements, id_counter);
+    for child in statements {
+        node.add_child(child);
     }
 
     Some(Rc::new(node))
@@ -2607,5 +4288,383 @@ function f(code: number) {
         }
         assert!(!contains_kind(&canonical, "TemplateLiteral"));
         assert!(contains_kind(&plain, "TemplateLiteral"));
+    }
+
+    // -- alpha-renaming ---------------------------------------------------
+
+    #[test]
+    fn consistent_local_renames_produce_identical_trees() {
+        assert_canonically_equal(
+            r"function calculateCartTotal(prices: number[]): number {
+  if (prices.length === 0) return 0;
+  let total = 0;
+  for (const price of prices) {
+    total += price;
+  }
+  return total;
+}",
+            r"function sumInvoiceAmounts(amounts: number[]): number {
+  if (amounts.length === 0) return 0;
+  let sum = 0;
+  for (const amount of amounts) {
+    sum += amount;
+  }
+  return sum;
+}",
+        );
+    }
+
+    #[test]
+    fn free_identifiers_keep_their_names() {
+        assert_canonically_distinct(
+            "function f(user: string) { notifyByEmail(user); logDelivery(user); return user; }",
+            "function g(user: string) { notifyBySms(user); logDelivery(user); return user; }",
+        );
+    }
+
+    #[test]
+    fn recursion_renames_consistently() {
+        assert_canonically_equal(
+            "function fib(n: number): number { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }",
+            "function fibonacci(k: number): number { if (k < 2) return k; return fibonacci(k - 1) + fibonacci(k - 2); }",
+        );
+    }
+
+    #[test]
+    fn shadowing_stays_distinct_from_reuse() {
+        // Inner `value` shadows the parameter in the left function; the
+        // right one keeps using the parameter. Different data flow.
+        assert_canonically_distinct(
+            "function f(value: number) { const inner = () => { const value = 1; return value; }; return inner() + value; }",
+            "function f(value: number) { const inner = () => { return value; }; return inner() + value; }",
+        );
+    }
+
+    // -- guard style / negation -------------------------------------------
+
+    #[test]
+    fn else_return_equals_guard_return() {
+        assert_canonically_equal(
+            r#"function f(ok: boolean) { if (ok) { return "yes"; } else { return "no"; } }"#,
+            r#"function f(ok: boolean) { if (ok) { return "yes"; } return "no"; }"#,
+        );
+    }
+
+    #[test]
+    fn ternary_return_equals_guard_return() {
+        assert_canonically_equal(
+            r#"function f(ok: boolean) { return ok ? "yes" : "no"; }"#,
+            r#"function f(ok: boolean) { if (ok) { return "yes"; } return "no"; }"#,
+        );
+    }
+
+    #[test]
+    fn negated_if_swaps_branches() {
+        assert_canonically_equal(
+            "function f(ready: boolean) { if (!ready) { prepare(); } else { launch(); } }",
+            "function f(ready: boolean) { if (ready) { launch(); } else { prepare(); } }",
+        );
+    }
+
+    #[test]
+    fn inequality_guard_equals_flipped_equality_guard() {
+        assert_canonically_equal(
+            r#"function f(mode: string) { if (mode !== "on") { return 0; } return 1; }"#,
+            r#"function f(mode: string) { if (mode === "on") { return 1; } return 0; }"#,
+        );
+    }
+
+    #[test]
+    fn terminating_else_hoists_to_guard() {
+        // NOTE: `!==` is used rather than `> 0` because only exact
+        // complements (equality operators, `!`) participate in negation
+        // normalization — `!(x > 0)` is not `x <= 0` when NaN is around.
+        assert_canonically_equal(
+            "function f(input: string) { if (input.length !== 0) { process(input); } else { return; } finish(input); }",
+            "function f(input: string) { if (input.length === 0) { return; } process(input); finish(input); }",
+        );
+    }
+
+    #[test]
+    fn de_morgan_forms_converge() {
+        assert_canonically_equal(
+            "function f(a: boolean, b: boolean) { if (!(a && b)) { return 1; } return 2; }",
+            "function f(a: boolean, b: boolean) { if (!a || !b) { return 1; } return 2; }",
+        );
+    }
+
+    #[test]
+    fn wrong_de_morgan_distribution_stays_distinct() {
+        assert_canonically_distinct(
+            "function f(a: boolean, b: boolean) { if (!(a && b)) { return 1; } return 2; }",
+            "function f(a: boolean, b: boolean) { if (!a && !b) { return 1; } return 2; }",
+        );
+    }
+
+    #[test]
+    fn negated_equality_flips_operator() {
+        assert_canonically_equal(
+            "function f(n: number) { if (!(n === 0)) { return n; } return 1; }",
+            "function f(n: number) { if (n !== 0) { return n; } return 1; }",
+        );
+    }
+
+    #[test]
+    fn yoda_comparison_equals_natural_order() {
+        assert_canonically_equal(
+            "function f(n: number) { if (0 === n) { return 1; } return 2; }",
+            "function f(n: number) { if (n === 0) { return 1; } return 2; }",
+        );
+    }
+
+    // -- logic sugar -------------------------------------------------------
+
+    #[test]
+    fn self_selecting_ternary_equals_logical_or() {
+        assert_canonically_equal(
+            "function f(label: string, fallback: string) { const chosen = label ? label : fallback; return chosen; }",
+            "function f(label: string, fallback: string) { const chosen = label || fallback; return chosen; }",
+        );
+    }
+
+    #[test]
+    fn nullish_ternary_equals_coalesce() {
+        assert_canonically_equal(
+            "function f(input: string | null, fallback: string) { const value = input == null ? fallback : input; return value; }",
+            "function f(input: string | null, fallback: string) { const value = input ?? fallback; return value; }",
+        );
+        assert_canonically_equal(
+            "function f(input: string | null, fallback: string) { const value = input != null ? input : fallback; return value; }",
+            "function f(input: string | null, fallback: string) { const value = input ?? fallback; return value; }",
+        );
+    }
+
+    #[test]
+    fn strict_null_pair_equals_loose_null_check() {
+        assert_canonically_equal(
+            "function f(x: unknown) { if (x === null || x === undefined) { return 0; } return 1; }",
+            "function f(x: unknown) { if (x == null) { return 0; } return 1; }",
+        );
+        assert_canonically_equal(
+            "function f(x: unknown) { if (x !== null && x !== undefined) { return 1; } return 0; }",
+            "function f(x: unknown) { if (x != null) { return 1; } return 0; }",
+        );
+    }
+
+    #[test]
+    fn loose_null_stays_distinct_from_strict_null_only() {
+        assert_canonically_distinct(
+            "function f(x: unknown) { if (x == null) { return 0; } return 1; }",
+            "function f(x: unknown) { if (x === null) { return 0; } return 1; }",
+        );
+    }
+
+    #[test]
+    fn coalesce_stays_distinct_from_logical_or() {
+        assert_canonically_distinct(
+            "function f(count: number | null) { const value = count ?? 10; return value; }",
+            "function f(count: number | null) { const value = count || 10; return value; }",
+        );
+    }
+
+    #[test]
+    fn void_zero_equals_undefined() {
+        assert_canonically_equal(
+            "function f(x: unknown) { if (x === void 0) { return 1; } return 0; }",
+            "function f(x: unknown) { if (x === undefined) { return 1; } return 0; }",
+        );
+    }
+
+    #[test]
+    fn boolean_call_equals_double_negation() {
+        assert_canonically_equal(
+            "function f(x: unknown) { const flag = Boolean(x); return flag; }",
+            "function f(x: unknown) { const flag = !!x; return flag; }",
+        );
+    }
+
+    #[test]
+    fn test_position_double_negation_is_transparent() {
+        assert_canonically_equal(
+            "function f(x: unknown) { if (!!x) { return 1; } return 0; }",
+            "function f(x: unknown) { if (x) { return 1; } return 0; }",
+        );
+    }
+
+    // -- destructuring ------------------------------------------------------
+
+    #[test]
+    fn object_destructuring_equals_member_declarations() {
+        assert_canonically_equal(
+            "function f(config: { host: string; port: number }) { const { host, port } = config; return host + port; }",
+            "function f(config: { host: string; port: number }) { const host = config.host; const port = config.port; return host + port; }",
+        );
+    }
+
+    #[test]
+    fn renaming_destructuring_equals_member_declaration() {
+        assert_canonically_equal(
+            "function f(response: { data: string }) { const { data: payload } = response; return payload; }",
+            "function f(response: { data: string }) { const payload = response.data; return payload; }",
+        );
+    }
+
+    #[test]
+    fn destructuring_with_defaults_keeps_its_shape() {
+        assert_canonically_distinct(
+            "function f(config: { host?: string }) { const { host = \"localhost\" } = config; return host; }",
+            "function f(config: { host?: string }) { const host = config.host; return host; }",
+        );
+    }
+
+    // -- loop forms ----------------------------------------------------------
+
+    #[test]
+    fn index_loop_equals_for_of() {
+        assert_canonically_equal(
+            r"function f(items: string[]) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    handle(item);
+  }
+}",
+            r"function f(items: string[]) {
+  for (const item of items) {
+    handle(item);
+  }
+}",
+        );
+    }
+
+    #[test]
+    fn index_loop_using_index_elsewhere_keeps_its_shape() {
+        assert_canonically_distinct(
+            r"function f(items: string[]) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    handle(item, i);
+  }
+}",
+            r"function f(items: string[]) {
+  for (const item of items) {
+    handle(item);
+  }
+}",
+        );
+    }
+
+    #[test]
+    fn push_loop_equals_map_call() {
+        assert_canonically_equal(
+            r"function f(values: number[]) {
+  const doubled = [];
+  for (const value of values) {
+    doubled.push(value * 2);
+  }
+  return doubled;
+}",
+            r"function f(values: number[]) {
+  return values.map((value) => value * 2);
+}",
+        );
+    }
+
+    #[test]
+    fn guarded_push_loop_equals_filter_call() {
+        assert_canonically_equal(
+            r"function f(values: number[]) {
+  const positive = [];
+  for (const value of values) {
+    if (value > 0) {
+      positive.push(value);
+    }
+  }
+  return positive;
+}",
+            r"function f(values: number[]) {
+  return values.filter((value) => value > 0);
+}",
+        );
+    }
+
+    #[test]
+    fn map_stays_distinct_from_filter() {
+        assert_canonically_distinct(
+            "function f(xs: number[]) { const out = xs.map((x) => x > 0); return out; }",
+            "function f(xs: number[]) { const out = xs.filter((x) => x > 0); return out; }",
+        );
+    }
+
+    // -- micro idioms ----------------------------------------------------------
+
+    #[test]
+    fn temp_return_equals_direct_return() {
+        assert_canonically_equal(
+            "function f(a: number, b: number) { const result = a * b + 1; return result; }",
+            "function f(a: number, b: number) { return a * b + 1; }",
+        );
+    }
+
+    #[test]
+    fn last_index_access_equals_at_minus_one() {
+        assert_canonically_equal(
+            "function f(items: string[]) { const last = items[items.length - 1]; return last; }",
+            "function f(items: string[]) { const last = items.at(-1); return last; }",
+        );
+    }
+
+    #[test]
+    fn at_minus_one_stays_distinct_from_at_zero() {
+        assert_canonically_distinct(
+            "function f(items: string[]) { const edge = items.at(-1); return edge; }",
+            "function f(items: string[]) { const edge = items.at(0); return edge; }",
+        );
+    }
+
+    #[test]
+    fn arrow_expression_body_equals_block_body_in_callbacks() {
+        assert_canonically_equal(
+            "function f(xs: number[]) { const out = xs.map((x) => x * 2); return out; }",
+            "function f(xs: number[]) { const out = xs.map((x) => { return x * 2; }); return out; }",
+        );
+    }
+
+    #[test]
+    fn else_block_wrapping_an_if_equals_else_if() {
+        assert_canonically_equal(
+            "function f(n: number) { if (n > 10) { big(); } else { if (n > 5) { medium(); } } }",
+            "function f(n: number) { if (n > 10) { big(); } else if (n > 5) { medium(); } }",
+        );
+    }
+
+    #[test]
+    fn optional_chain_stays_distinct_from_plain_access() {
+        assert_canonically_distinct(
+            "function f(user: { name?: string } | null) { const name = user?.name; return name; }",
+            "function f(user: { name: string }) { const name = user.name; return name; }",
+        );
+    }
+
+    #[test]
+    fn combo_of_transforms_converges() {
+        assert_canonically_equal(
+            r#"function describeOrders(orders: { id: string; total: number }[]) {
+  const labels = [];
+  for (const order of orders) {
+    labels.push(`Order ${order.id}: ${order.total}`);
+  }
+  if (labels.length === 0) {
+    return "none";
+  } else {
+    const joined = labels.join(", ");
+    return joined;
+  }
+}"#,
+            r#"function summarizeInvoices(invoices: { id: string; total: number }[]) {
+  const lines = invoices.map((invoice) => "Order " + invoice.id + ": " + invoice.total);
+  if (0 === lines.length) return "none";
+  return lines.join(", ");
+}"#,
+        );
     }
 }
