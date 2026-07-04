@@ -356,6 +356,10 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
     results.extend(by_mode.overlap.clone());
     results.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
 
+    // Count only files that were actually analyzed — parse-failed files
+    // live in `skipped_files`, and the CLI's zero-file failure check keys
+    // off this count.
+    let analyzed_count = files.len().saturating_sub(skipped_files.len());
     AnalyzeOutput {
         analyzed_files: input
             .files
@@ -368,7 +372,7 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
         results: results.clone(),
         by_mode,
         stats: AnalyzeStats {
-            file_count: files.len(),
+            file_count: analyzed_count,
             pair_count: results.len(),
             elapsed_ms: 0,
         },

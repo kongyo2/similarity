@@ -437,6 +437,41 @@ pub fn compute_edit_distance_with_cutoff(
         return DISTANCE_EXCEEDED;
     }
 
+    // Label-histogram lower bound. Any edit script maps nodes 1:1 (plus
+    // deletes/inserts); a mapped pair costs 0 only when label AND kind
+    // agree, so at most `overlap` node pairs are free and every one of
+    // the remaining `max(n1, n2) - overlap` nodes on the larger side
+    // costs at least the cheapest operation. This is O(n1 + n2) and
+    // prunes the "similar size, unrelated content" pairs that the pure
+    // size-gap bound cannot touch — the case where skipping the full
+    // O(n1·n2) DP actually matters.
+    let cheapest_edit = options
+        .delete_cost
+        .min(options.insert_cost)
+        .min(options.rename_cost);
+    if cheapest_edit > 0.0 {
+        let mut labels: std::collections::HashMap<(&str, &str), i64> =
+            std::collections::HashMap::with_capacity(flat1.len());
+        for index in 0..flat1.len() {
+            *labels.entry((flat1.labels[index], flat1.values[index])).or_insert(0) += 1;
+        }
+        let mut overlap = 0usize;
+        for index in 0..flat2.len() {
+            if let Some(count) = labels.get_mut(&(flat2.labels[index], flat2.values[index])) {
+                if *count > 0 {
+                    *count -= 1;
+                    overlap += 1;
+                }
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let histogram_bound =
+            (flat1.len().max(flat2.len()) - overlap) as f64 * cheapest_edit;
+        if histogram_bound > max_distance {
+            return DISTANCE_EXCEEDED;
+        }
+    }
+
     let mut memo = vec![f64::NAN; flat1.len() * flat2.len()];
     let distance = subtree_distance(&flat1, &flat2, options, &mut memo, 0, 0);
     if distance > max_distance {
@@ -536,6 +571,27 @@ mod tests {
         );
         let t2 = node("G", "K", 0, vec![leaf("z", "Identifier", 1)]);
         let distance = compute_edit_distance_with_cutoff(&t1, &t2, &unit_options(), 1.0);
+        assert!(distance >= DISTANCE_EXCEEDED);
+    }
+
+    #[test]
+    fn cutoff_prunes_same_size_unrelated_trees() {
+        // Equal sizes defeat the size-gap bound; the label-histogram bound
+        // must still flag the pair without running the full DP.
+        let t1 = node(
+            "F",
+            "K",
+            0,
+            (1..=12).map(|i| leaf(&format!("a{i}"), "Identifier", i)).collect(),
+        );
+        let t2 = node(
+            "F",
+            "K",
+            0,
+            (1..=12).map(|i| leaf(&format!("z{i}"), "Identifier", i)).collect(),
+        );
+        let options = APTEDOptions { rename_cost: 0.3, compare_values: false, ..unit_options() };
+        let distance = compute_edit_distance_with_cutoff(&t1, &t2, &options, 1.0);
         assert!(distance >= DISTANCE_EXCEEDED);
     }
 

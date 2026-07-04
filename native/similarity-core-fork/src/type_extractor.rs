@@ -6,6 +6,19 @@ use oxc_ast::ast::{
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
+/// Render a possibly-qualified type name (`React.FC`, `A.B.C`) as its
+/// full dotted path — collapsing to the rightmost segment would let
+/// `React.FC` compare equal to any other namespace's `FC`.
+fn render_ts_type_name(name: &oxc_ast::ast::TSTypeName) -> String {
+    match name {
+        oxc_ast::ast::TSTypeName::IdentifierReference(ident) => ident.name.as_str().to_string(),
+        oxc_ast::ast::TSTypeName::QualifiedName(qualified) => {
+            format!("{}.{}", render_ts_type_name(&qualified.left), qualified.right.name.as_str())
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
 /// Return the byte span (start, end) of any `TSType` variant. The variants
 /// each carry their own `span` field but there is no shared accessor; pattern
 /// matching every variant explicitly keeps us insulated from changes to oxc's
@@ -437,7 +450,6 @@ impl TypeExtractor {
 
         let mut properties = self.extract_type_properties(&type_alias.type_annotation);
         let generics = self.extract_generics(type_alias.type_parameters.as_ref());
-        Self::substitute_generic_params(&mut properties, &generics);
 
         // Type aliases whose body is not an object literal (string-literal
         // unions, primitive aliases, function types, Record<…>, …) extract
@@ -470,6 +482,10 @@ impl TypeExtractor {
                 });
             }
         }
+        // Substitute AFTER the fallback body exists so non-object generic
+        // aliases participate too: `type Box<T> = T[]` and
+        // `type Bag<U> = U[]` must both carry the body `#0[]`.
+        Self::substitute_generic_params(&mut properties, &generics);
 
         Some(TypeDefinition {
             name,
@@ -630,17 +646,11 @@ impl TypeExtractor {
                     oxc_ast::ast::TSTypeName::IdentifierReference(ident) => {
                         ident.name.as_str().to_string()
                     }
-                    oxc_ast::ast::TSTypeName::QualifiedName(qualified) => {
-                        // Render `React.FC`-style names by their rightmost
-                        // segment plus the qualifier text, rather than
-                        // collapsing to "unknown".
-                        format!("{:?}", qualified.left)
-                            .split_whitespace()
-                            .next()
-                            .map_or_else(
-                                || qualified.right.name.as_str().to_string(),
-                                |_| qualified.right.name.as_str().to_string(),
-                            )
+                    oxc_ast::ast::TSTypeName::QualifiedName(_) => {
+                        // Render the full dotted path — `React.FC` must not
+                        // compare equal to a bare `FC` or some other
+                        // namespace's `FC`.
+                        render_ts_type_name(&type_ref.type_name)
                     }
                     _ => "unknown".to_string(),
                 };
@@ -1276,5 +1286,45 @@ type IgnoredAlias = {
 
         let ignored_alias = types.iter().find(|t| t.name == "IgnoredAlias").unwrap();
         assert!(ignored_alias.has_ignore_directive);
+    }
+
+    #[test]
+    fn qualified_type_references_keep_their_namespace() {
+        let code = r"
+export interface WithQualified {
+  view: React.FC;
+}
+
+export interface WithBare {
+  view: FC;
+}
+";
+        let types = extract_types_from_code(code, "test.ts").unwrap();
+        let qualified = types.iter().find(|t| t.name == "WithQualified").unwrap();
+        let bare = types.iter().find(|t| t.name == "WithBare").unwrap();
+        assert_eq!(qualified.properties[0].type_annotation, "React.FC");
+        assert_eq!(bare.properties[0].type_annotation, "FC");
+        assert_ne!(
+            qualified.properties[0].type_annotation,
+            bare.properties[0].type_annotation
+        );
+    }
+
+    #[test]
+    fn generic_aliases_substitute_params_into_fallback_bodies() {
+        // `type Box<T> = T[]` and `type Bag<U> = U[]` must extract the
+        // same positional body, not `T[]` vs `U[]`.
+        let code = r"
+export type Box<T> = T[];
+export type Bag<U> = U[];
+";
+        let types = extract_types_from_code(code, "test.ts").unwrap();
+        let bodies: Vec<&str> = types
+            .iter()
+            .map(|t| t.properties[0].type_annotation.as_str())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1], "positional substitution must unify {bodies:?}");
+        assert!(bodies[0].contains("#0"));
     }
 }

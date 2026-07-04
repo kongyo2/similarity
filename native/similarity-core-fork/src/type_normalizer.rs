@@ -104,6 +104,7 @@ pub(crate) fn split_top_level(input: &str, separator: char) -> Vec<String> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut in_string: Option<char> = None;
+    let mut previous = '\0';
     let mut current = String::new();
     for ch in input.chars() {
         if let Some(quote) = in_string {
@@ -111,6 +112,7 @@ pub(crate) fn split_top_level(input: &str, separator: char) -> Vec<String> {
             if ch == quote {
                 in_string = None;
             }
+            previous = ch;
             continue;
         }
         match ch {
@@ -120,6 +122,12 @@ pub(crate) fn split_top_level(input: &str, separator: char) -> Vec<String> {
             }
             '<' | '(' | '[' | '{' => {
                 depth += 1;
+                current.push(ch);
+            }
+            // The `>` of an arrow (`=>`) is an operator, not a bracket —
+            // decrementing on it desynchronized the depth for every type
+            // containing a function arm (`Result<() => string, Error>`).
+            '>' if previous == '=' => {
                 current.push(ch);
             }
             '>' | ')' | ']' | '}' => {
@@ -132,6 +140,7 @@ pub(crate) fn split_top_level(input: &str, separator: char) -> Vec<String> {
             }
             _ => current.push(ch),
         }
+        previous = ch;
     }
     parts.push(current.trim().to_string());
     parts.retain(|part| !part.is_empty());
@@ -248,9 +257,12 @@ pub fn normalize_type_name(type_name: &str) -> String {
 
 fn is_balanced(text: &str) -> bool {
     let mut depth = 0i32;
+    let mut previous = '\0';
     for ch in text.chars() {
         match ch {
             '<' | '(' | '[' | '{' => depth += 1,
+            // Skip the `>` of `=>` — see `split_top_level`.
+            '>' if previous == '=' => {}
             '>' | ')' | ']' | '}' => {
                 depth -= 1;
                 if depth < 0 {
@@ -259,6 +271,7 @@ fn is_balanced(text: &str) -> bool {
             }
             _ => {}
         }
+        previous = ch;
     }
     depth == 0
 }
@@ -735,5 +748,25 @@ mod tests {
         assert_eq!(levenshtein_distance("abc", "abc"), 0);
         assert_eq!(levenshtein_distance("abc", "ab"), 1);
         assert_eq!(levenshtein_distance("abc", "def"), 3);
+    }
+
+    #[test]
+    fn split_top_level_ignores_arrow_operators() {
+        assert_eq!(
+            split_top_level("(a) => b, c", ','),
+            vec!["(a) => b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            split_top_level("(() => User) | null", '|'),
+            vec!["(() => User)".to_string(), "null".to_string()]
+        );
+    }
+
+    #[test]
+    fn function_types_with_arrows_normalize_argument_lists() {
+        // The `>` in `=>` must not desynchronize bracket depth: both
+        // arguments of the generic are still seen.
+        let normalized = normalize_type_name("Result<() => string, Error>");
+        assert_eq!(normalized, "Result<() => string, Error>");
     }
 }

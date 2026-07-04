@@ -26,9 +26,11 @@ pub struct DetailedOverlap {
     pub target_code: String,
 }
 
-/// Extract and index every function of one file exactly once. Functions
-/// that cannot be parsed standalone (e.g. constructors) are skipped;
-/// files that fail to parse produce an empty index.
+/// Extract and index every function of one file exactly once — including
+/// nested helpers, so a duplicated inner function copied into another
+/// module still participates in cross-file comparisons. Functions that
+/// cannot be parsed standalone (e.g. constructors) are skipped; files
+/// that fail to parse produce an empty index.
 fn index_file_functions(file_name: &str, source: &str) -> Vec<IndexedFunction> {
     let Ok(functions) = extract_functions(file_name, source) else {
         return Vec::new();
@@ -37,35 +39,26 @@ fn index_file_functions(file_name: &str, source: &str) -> Vec<IndexedFunction> {
     let mut indexed = Vec::with_capacity(functions.len());
     for func in &functions {
         if let Ok(entry) = index_function(func, &lines, file_name) {
-            indexed.push((func.clone(), entry));
+            indexed.push(entry);
         }
     }
+    indexed
+}
 
-    // Nested functions live entirely inside their parents, so the
-    // parent's subtree fingerprints trivially contain the child — a
-    // containment artifact, not duplication. Keeping both would make
-    // every same-file scan report parent/child "overlaps" at 1.0.
-    let mut result = Vec::with_capacity(indexed.len());
-    for (position, (func, entry)) in indexed.iter().enumerate() {
-        let contained_in_other = indexed
-            .iter()
-            .enumerate()
-            .any(|(other_position, (other, _))| {
-                other_position != position && func.is_parent_child_relationship(other)
-            });
-        // Only drop CHILD functions (a parent keeps its overlaps): a
-        // child is one whose span nests inside the other's.
-        let is_child = indexed.iter().enumerate().any(|(other_position, (other, _))| {
-            other_position != position
-                && other.body_span.start < func.body_span.start
-                && other.body_span.end > func.body_span.end
-        });
-        if contained_in_other && is_child {
-            continue;
-        }
-        result.push(entry.clone());
-    }
-    result
+/// Whether one same-file function's line range strictly contains the
+/// other's. A nested function lives entirely inside its parent, so the
+/// parent's subtree fingerprints trivially include the child and every
+/// parent/child pair would "overlap" at similarity 1.0 — a containment
+/// artifact, not duplication. Only these PAIRS are skipped; the nested
+/// function itself stays indexed for every other comparison.
+fn is_nested_pair(left: &IndexedFunction, right: &IndexedFunction) -> bool {
+    let left_contains_right = left.start_line <= right.start_line
+        && left.end_line >= right.end_line
+        && (left.start_line, left.end_line) != (right.start_line, right.end_line);
+    let right_contains_left = right.start_line <= left.start_line
+        && right.end_line >= left.end_line
+        && (left.start_line, left.end_line) != (right.start_line, right.end_line);
+    left_contains_right || right_contains_left
 }
 
 /// Detect overlapping code fragments between two source texts.
@@ -102,6 +95,9 @@ pub fn find_function_overlaps(
             if same_file && target_position <= source_position {
                 continue;
             }
+            if same_file && is_nested_pair(source_func, target_func) {
+                continue;
+            }
             all_overlaps.extend(detect_partial_overlaps(source_func, target_func, options));
         }
     }
@@ -133,10 +129,14 @@ pub fn find_overlaps_across_files(
 
     let mut all_overlaps = Vec::new();
     for i in 0..files.len() {
-        // Same-file scan: ordered pairs only.
+        // Same-file scan: ordered pairs only, skipping parent/child
+        // containment pairs.
         for (source_position, source_func) in indexed_per_file[i].iter().enumerate() {
             for (target_position, target_func) in indexed_per_file[i].iter().enumerate() {
                 if target_position <= source_position {
+                    continue;
+                }
+                if is_nested_pair(source_func, target_func) {
                     continue;
                 }
                 for overlap in detect_partial_overlaps(source_func, target_func, options) {
@@ -402,5 +402,58 @@ function beta(values: number[]) {
 
         let segment = extract_code_segment(code, 1, 5).unwrap();
         assert_eq!(segment, "line1\nline2\nline3\nline4\nline5");
+    }
+
+    #[test]
+    fn nested_helpers_participate_in_cross_file_overlaps() {
+        // The inner helper of `outer` is duplicated as a top-level
+        // function in another file: it must stay indexed (only
+        // parent/child PAIRS are skipped) so the cross-file overlap is
+        // found.
+        let file_a = r"
+function outer(rows: number[][]) {
+    function normalizeRow(row: number[]): number[] {
+        const scaled = [];
+        for (const cell of row) {
+            if (cell > 0) {
+                scaled.push(cell * 100 + 7);
+            }
+        }
+        return scaled;
+    }
+    return rows.map(normalizeRow);
+}
+";
+        let file_b = r"
+export function normalizeVector(row: number[]): number[] {
+    const scaled = [];
+    for (const cell of row) {
+        if (cell > 0) {
+            scaled.push(cell * 100 + 7);
+        }
+    }
+    return scaled;
+}
+";
+        let mut files = HashMap::new();
+        files.insert("a.ts".to_string(), file_a.to_string());
+        files.insert("b.ts".to_string(), file_b.to_string());
+        let options = OverlapOptions {
+            min_window_size: 5,
+            max_window_size: 30,
+            threshold: 0.8,
+            size_tolerance: 0.25,
+        };
+        let overlaps = find_overlaps_across_files(&files, &options).unwrap();
+        let involves_inner_helper = overlaps.iter().any(|o| {
+            (o.overlap.source_function == "normalizeRow"
+                || o.overlap.target_function == "normalizeRow")
+                && (o.overlap.source_function == "normalizeVector"
+                    || o.overlap.target_function == "normalizeVector")
+        });
+        assert!(
+            involves_inner_helper,
+            "expected the nested helper to overlap its cross-file copy: {overlaps:?}"
+        );
     }
 }

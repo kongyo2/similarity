@@ -126,7 +126,19 @@ fn calculate_structural_similarity(
     let total_props2 = type2.properties.len();
 
     if total_props1 == 0 && total_props2 == 0 {
-        return 1.0; // Both empty
+        // Two property-less shapes carry no structural evidence at all —
+        // a flat 1.0 here would make every pair of empty marker types
+        // score ≥ structural_weight and flood the report. Require naming
+        // agreement to stand in for the missing structure: identically
+        // named empties (the interface ⇔ alias cross-kind case) still
+        // reach ~1.0, related names (EmptyA/EmptyB) stay above the
+        // default threshold, unrelated names fall well below it.
+        let name_similarity =
+            crate::type_normalizer::calculate_property_similarity(
+                &type1.original_name,
+                &type2.original_name,
+            );
+        return 0.6 + 0.4 * name_similarity;
     }
 
     if total_props1 == 0 || total_props2 == 0 {
@@ -620,5 +632,25 @@ mod tests {
         let similar_pairs = find_similar_types(&[active, ignored], 0.7, &options);
 
         assert!(similar_pairs.is_empty());
+    }
+
+    #[test]
+    fn unrelated_empty_types_stay_below_threshold() {
+        let type1 = create_test_type("FeatureGate", vec![]);
+        let type2 = create_test_type("RetryBudget", vec![]);
+        let options = TypeComparisonOptions::default();
+        let result = compare_types(&type1, &type2, &options);
+        assert!(
+            result.similarity < 0.8,
+            "unrelated empty markers must not auto-match, got {}",
+            result.similarity
+        );
+
+        // Same-named empties (the interface ⇔ alias cross-kind case)
+        // still clear a high threshold.
+        let type3 = create_test_type("Empty", vec![]);
+        let type4 = create_test_type("Empty", vec![]);
+        let same = compare_types(&type3, &type4, &options);
+        assert!(same.similarity >= 0.9, "identical empty names must match, got {}", same.similarity);
     }
 }
