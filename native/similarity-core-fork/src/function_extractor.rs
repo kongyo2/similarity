@@ -908,14 +908,20 @@ fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSet
     let Some(callee) = node.children.first() else {
         return;
     };
-    if callee.value != "StaticMemberExpression" || callee.children.len() != 2 {
+    if callee.children.len() != 2 {
         return;
     }
     let property = &callee.children[1];
-    if property.value != "Identifier" {
-        return;
-    }
-    let name = property.label.as_str();
+    let name = match callee.value.as_str() {
+        // `xs.slice(…)`
+        "StaticMemberExpression" if property.value == "Identifier" => property.label.as_str(),
+        // `xs["slice"](…)` — the same property access spelled with
+        // bracket notation (StringLiteral labels carry their quotes).
+        "ComputedMemberExpression" if property.value == "StringLiteral" => {
+            property.label.trim_start_matches('"').trim_end_matches('"')
+        }
+        _ => return,
+    };
     if !boundary_builtin(name) {
         return;
     }
@@ -1993,6 +1999,36 @@ export function firstAndLast(alpha: string[], beta: string[]): string {
         assert!(
             pairs.is_empty(),
             "a substituted boundary among repeated calls must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bracket_notation_boundary_twins_stay_distinct() {
+        // `xs["at"](…)` is the same property access as `xs.at(…)` spelled
+        // with brackets — boundary atoms must fire for it too.
+        let code = r#"
+export function newestEntry(entries: string[]): string {
+  const picked = entries["at"](-1);
+  if (picked === undefined) {
+    return "none";
+  }
+  return picked;
+}
+
+export function oldestEntry(entries: string[]): string {
+  const picked = entries["at"](0);
+  if (picked === undefined) {
+    return "none";
+  }
+  return picked;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "bracket-notation boundary twins must stay below threshold, got {:?}",
             pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
         );
     }
