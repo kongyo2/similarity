@@ -57,6 +57,19 @@ built on.
 - `splice` boundary atoms cover only `start`/`deleteCount` (positions 0
   and 1); arguments from position 2 onward are inserted values, so twins
   differing there stay parameterizable data-literal duplicates.
+- Boundary and fold atoms carry occurrence COUNTS: with two `.at()`
+  reads (or two accumulators), changing just one of them is a
+  substitution even though the unchanged occurrence keeps the shared
+  atom alive on both sides — set semantics would have misread that as a
+  one-sided extension.
+- The zero-argument form of the boundary members (except `splice`)
+  normalizes to an explicit leading `0`: `xs.slice()` ⇔ `xs.slice(0)`
+  and `s.charAt()` ⇔ `s.charAt(0)` are the same operation, so spelling
+  the default must not trip the cap. `splice()` (removes nothing) vs
+  `splice(0)` (removes everything) stays literal.
+- `substring` records its index literals position-insensitively because
+  JavaScript reorders the arguments after clamping: `s.substring(0, n)`
+  ⇔ `s.substring(n, 0)`.
 - The class fingerprint boost requires signature agreement (exact or
   after fuzzy name-stripping): the fingerprint tree carries no
   TypeScript type annotations, so same-body methods over different

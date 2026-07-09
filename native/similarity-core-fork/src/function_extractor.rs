@@ -794,12 +794,47 @@ struct AtomSets {
     value_atoms: std::collections::HashSet<String>,
     /// Control-flow atoms: loop kinds and loop jumps.
     control_atoms: std::collections::HashSet<String>,
+    /// Synthetic atoms (`boundary:*`, `fold:*`) carry occurrence COUNTS:
+    /// a function reading `a.at(0)` and `b.at(0)` differs from one
+    /// reading `a.at(0)` and `b.at(-1)` by one substituted occurrence,
+    /// which plain set semantics would misread as a one-sided addition
+    /// (`at[0]=0` present on both sides, `at[0]=-1` only on one).
+    synthetic_atoms: std::collections::HashMap<String, usize>,
+}
+
+impl AtomSets {
+    fn add_synthetic(&mut self, atom: String) {
+        *self.synthetic_atoms.entry(atom).or_insert(0) += 1;
+    }
+}
+
+/// Total occurrences in `left` not covered by `right` (multiset
+/// asymmetric difference).
+fn synthetic_missing(
+    left: &std::collections::HashMap<String, usize>,
+    right: &std::collections::HashMap<String, usize>,
+) -> usize {
+    left.iter()
+        .map(|(atom, &count)| count.saturating_sub(right.get(atom).copied().unwrap_or(0)))
+        .sum()
 }
 
 struct AtomDifference {
     missing_in_left: usize,
     missing_in_right: usize,
     control: usize,
+}
+
+/// Positional/slicing builtins whose numeric arguments are boundary
+/// semantics. `splice` is special-cased in two ways below: its trailing
+/// arguments are inserted values (not positions), and its zero-argument
+/// form is NOT equivalent to an explicit leading `0`.
+fn boundary_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "at" | "slice" | "splice" | "charAt" | "charCodeAt" | "codePointAt" | "substring"
+            | "substr"
+    )
 }
 
 /// Collect behavior-carrying labels: free identifiers (anything
@@ -850,6 +885,22 @@ fn collect_behavioral_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) 
 /// one argument) apart do different work, unlike data-literal twins (a
 /// table name, a status code) which stay reportable as parameterizable
 /// duplicates.
+///
+/// Three semantic wrinkles are folded in so equivalent spellings emit
+/// equal atoms:
+///
+/// * the zero-argument form of every member except `splice` is the same
+///   operation as an explicit leading `0` (`xs.slice()` ⇔ `xs.slice(0)`,
+///   `s.charAt()` ⇔ `s.charAt(0)` — omitted arguments coerce to index
+///   0), so it normalizes to the explicit form; `splice()` removes
+///   nothing while `splice(0)` removes everything, so its arity stays
+///   literal.
+/// * `substring` swaps its arguments after clamping (`s.substring(0, n)`
+///   ⇔ `s.substring(n, 0)`), so its index literals are recorded
+///   position-insensitively.
+/// * atoms are occurrence-COUNTED (see `AtomSets::synthetic_atoms`): a
+///   second call site reading a different boundary must register as a
+///   substitution, not vanish into set semantics.
 fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) {
     if node.value != "CallExpression" {
         return;
@@ -865,15 +916,17 @@ fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSet
         return;
     }
     let name = property.label.as_str();
-    if !matches!(
-        name,
-        "at" | "slice" | "splice" | "charAt" | "charCodeAt" | "codePointAt" | "substring"
-            | "substr"
-    ) {
+    if !boundary_builtin(name) {
         return;
     }
     let arity = node.children.len() - 1;
-    atoms.value_atoms.insert(format!("boundary:{name}/{arity}"));
+    if arity == 0 && name != "splice" {
+        // Omitted-argument form: same operation as an explicit index 0.
+        atoms.add_synthetic(format!("boundary:{name}/1"));
+        atoms.add_synthetic(boundary_literal_atom(name, 0, "0"));
+        return;
+    }
+    atoms.add_synthetic(format!("boundary:{name}/{arity}"));
     // `splice` is the one member of the family whose trailing arguments
     // are inserted VALUES, not positions: only `start` and `deleteCount`
     // (positions 0 and 1) are boundaries, and twins differing in an
@@ -884,10 +937,20 @@ fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSet
             break;
         }
         if let Some(index_literal) = static_index_literal(argument) {
-            atoms
-                .value_atoms
-                .insert(format!("boundary:{name}[{position}]={index_literal}"));
+            atoms.add_synthetic(boundary_literal_atom(name, position, &index_literal));
         }
+    }
+}
+
+/// Atom key for one boundary index literal. `substring` drops the
+/// argument position from the key because JavaScript reorders its
+/// arguments after clamping — `(0, n)` and `(n, 0)` select the same
+/// range, so only the multiset of literals is behavioral.
+fn boundary_literal_atom(name: &str, position: usize, literal: &str) -> String {
+    if name == "substring" {
+        format!("boundary:{name}[]={literal}")
+    } else {
+        format!("boundary:{name}[{position}]={literal}")
     }
 }
 
@@ -950,7 +1013,7 @@ fn collect_fold_direction_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSe
         // head; the flattened RHS supplies the string evidence.
         flatten_addition_chain(chain, &mut leaves);
         if leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
-            atoms.value_atoms.insert("fold:head".to_string());
+            atoms.add_synthetic("fold:head".to_string());
         }
         return;
     }
@@ -974,7 +1037,7 @@ fn collect_fold_direction_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSe
             } else {
                 "fold:mid"
             };
-            atoms.value_atoms.insert(marker.to_string());
+            atoms.add_synthetic(marker.to_string());
         }
     }
 }
@@ -1003,8 +1066,10 @@ fn behavioral_atom_difference(
     collect_behavioral_atoms(tree1, &mut atoms1);
     collect_behavioral_atoms(tree2, &mut atoms2);
     AtomDifference {
-        missing_in_right: atoms1.value_atoms.difference(&atoms2.value_atoms).count(),
-        missing_in_left: atoms2.value_atoms.difference(&atoms1.value_atoms).count(),
+        missing_in_right: atoms1.value_atoms.difference(&atoms2.value_atoms).count()
+            + synthetic_missing(&atoms1.synthetic_atoms, &atoms2.synthetic_atoms),
+        missing_in_left: atoms2.value_atoms.difference(&atoms1.value_atoms).count()
+            + synthetic_missing(&atoms2.synthetic_atoms, &atoms1.synthetic_atoms),
         control: atoms1
             .control_atoms
             .symmetric_difference(&atoms2.control_atoms)
@@ -1905,6 +1970,126 @@ export function rewindAuditTrail(state: { trail: string }, segments: string[]): 
     }
 
     #[test]
+    fn boundary_atoms_count_occurrences() {
+        // One of TWO `.at()` reads changes boundary: `at[0]=0` survives on
+        // both sides through the other call site, so set semantics would
+        // misread the change as a one-sided addition. Occurrence counting
+        // must flag it as a substitution and keep the pair distinct.
+        let code = r#"
+export function firstOfBoth(alpha: string[], beta: string[]): string {
+  const left = alpha.at(0) ?? "none";
+  const right = beta.at(0) ?? "none";
+  return left + ":" + right;
+}
+
+export function firstAndLast(alpha: string[], beta: string[]): string {
+  const left = alpha.at(0) ?? "none";
+  const right = beta.at(-1) ?? "none";
+  return left + ":" + right;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "a substituted boundary among repeated calls must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fold_atoms_count_occurrences() {
+        // Two accumulators: both append on one side; append + prepend on
+        // the other. The shared `fold:head` must not mask the flipped
+        // second accumulator.
+        let code = r#"
+export function buildBothForward(items: string[]): [string, string] {
+  let names = "";
+  let codes = "";
+  for (const item of items) {
+    names = names + item + ",";
+    codes = codes + item + ";";
+  }
+  return [names, codes];
+}
+
+export function buildSecondReversed(items: string[]): [string, string] {
+  let names = "";
+  let codes = "";
+  for (const item of items) {
+    names = names + item + ",";
+    codes = item + ";" + codes;
+  }
+  return [names, codes];
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "a flipped second accumulator must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn omitted_zero_defaults_are_not_boundary_twins() {
+        // `xs.slice()` and `xs.slice(0)` copy the same array — one side
+        // spelling the default argument must not trip the boundary cap.
+        let code = r"
+export function cloneQueue(jobs: string[]): string[] {
+  if (jobs.length === 0) {
+    return [];
+  }
+  return jobs.slice();
+}
+
+export function copyQueue(tasks: string[]): string[] {
+  if (tasks.length === 0) {
+    return [];
+  }
+  return tasks.slice(0);
+}
+";
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "slice() vs slice(0) twins must stay reportable duplicates"
+        );
+    }
+
+    #[test]
+    fn substring_boundary_literals_are_position_insensitive() {
+        // JavaScript swaps substring's arguments after clamping, so
+        // `s.substring(0, cut)` and `s.substring(cut, 0)` select the same
+        // range and must not be capped apart.
+        let code = r#"
+export function headOfLabel(label: string, cut: number): string {
+  if (label.length === 0) {
+    return "";
+  }
+  return label.substring(0, cut);
+}
+
+export function labelPrefix(title: string, cut: number): string {
+  if (title.length === 0) {
+    return "";
+  }
+  return title.substring(cut, 0);
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "substring(0, cut) vs substring(cut, 0) must stay reportable duplicates"
+        );
+    }
+
+    #[test]
     fn folds_without_string_evidence_get_no_direction_atoms() {
         // `+` over numbers is commutative: `sum += n` vs `sum = n + sum`
         // is not a directional rewrite the analyzer can prove, so without
@@ -1919,8 +2104,8 @@ export function rewindAuditTrail(state: { trail: string }, segments: string[]): 
             let mut atoms = AtomSets::default();
             collect_behavioral_atoms(&tree, &mut atoms);
             let mut folds: Vec<String> = atoms
-                .value_atoms
-                .into_iter()
+                .synthetic_atoms
+                .into_keys()
                 .filter(|atom| atom.starts_with("fold:"))
                 .collect();
             folds.sort();
