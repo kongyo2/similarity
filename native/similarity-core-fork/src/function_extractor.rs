@@ -794,12 +794,47 @@ struct AtomSets {
     value_atoms: std::collections::HashSet<String>,
     /// Control-flow atoms: loop kinds and loop jumps.
     control_atoms: std::collections::HashSet<String>,
+    /// Synthetic atoms (`boundary:*`, `fold:*`) carry occurrence COUNTS:
+    /// a function reading `a.at(0)` and `b.at(0)` differs from one
+    /// reading `a.at(0)` and `b.at(-1)` by one substituted occurrence,
+    /// which plain set semantics would misread as a one-sided addition
+    /// (`at[0]=0` present on both sides, `at[0]=-1` only on one).
+    synthetic_atoms: std::collections::HashMap<String, usize>,
+}
+
+impl AtomSets {
+    fn add_synthetic(&mut self, atom: String) {
+        *self.synthetic_atoms.entry(atom).or_insert(0) += 1;
+    }
+}
+
+/// Total occurrences in `left` not covered by `right` (multiset
+/// asymmetric difference).
+fn synthetic_missing(
+    left: &std::collections::HashMap<String, usize>,
+    right: &std::collections::HashMap<String, usize>,
+) -> usize {
+    left.iter()
+        .map(|(atom, &count)| count.saturating_sub(right.get(atom).copied().unwrap_or(0)))
+        .sum()
 }
 
 struct AtomDifference {
     missing_in_left: usize,
     missing_in_right: usize,
     control: usize,
+}
+
+/// Positional/slicing builtins whose numeric arguments are boundary
+/// semantics. `splice` is special-cased in two ways below: its trailing
+/// arguments are inserted values (not positions), and its zero-argument
+/// form is NOT equivalent to an explicit leading `0`.
+fn boundary_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "at" | "slice" | "splice" | "charAt" | "charCodeAt" | "codePointAt" | "substring"
+            | "substr"
+    )
 }
 
 /// Collect behavior-carrying labels: free identifiers (anything
@@ -812,6 +847,38 @@ struct AtomDifference {
 /// way renaming two positional parameters does, and the corpus treats
 /// those as duplicates.
 fn collect_behavioral_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) {
+    // Pre-pass: locals declared with a string-literal initializer
+    // (`let trail = "";`) are provably string accumulators, so their
+    // folds are direction-sensitive even when the `+` chain itself
+    // carries no literal (`trail = trail + segment` vs
+    // `trail = segment + trail`).
+    let mut string_literal_locals = std::collections::HashSet::new();
+    collect_string_literal_locals(node, &mut string_literal_locals);
+    collect_behavioral_atoms_inner(node, atoms, &string_literal_locals);
+}
+
+/// Labels of locals whose declarator initializer is a string literal.
+fn collect_string_literal_locals(
+    node: &crate::tree::TreeNode,
+    locals: &mut std::collections::HashSet<String>,
+) {
+    if node.value == "VariableDeclarator" && node.children.len() == 2 {
+        let target = &node.children[0];
+        let init = &node.children[1];
+        if target.value == "BindingIdentifier" && init.value == "StringLiteral" {
+            locals.insert(target.label.clone());
+        }
+    }
+    for child in &node.children {
+        collect_string_literal_locals(child, locals);
+    }
+}
+
+fn collect_behavioral_atoms_inner(
+    node: &crate::tree::TreeNode,
+    atoms: &mut AtomSets,
+    string_literal_locals: &std::collections::HashSet<String>,
+) {
     let is_value_atom = match node.value.as_str() {
         "Identifier" | "BindingIdentifier" | "PrivateIdentifier" => {
             !node.label.starts_with('§')
@@ -832,12 +899,241 @@ fn collect_behavioral_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) 
         }
         _ => {}
     }
+    collect_boundary_call_atoms(node, atoms);
+    collect_fold_direction_atoms(node, atoms, string_literal_locals);
     let skip_pattern_key = node.value == "BindingProperty";
     for (index, child) in node.children.iter().enumerate() {
         if skip_pattern_key && index == 0 {
             continue;
         }
-        collect_behavioral_atoms(child, atoms);
+        collect_behavioral_atoms_inner(child, atoms, string_literal_locals);
+    }
+}
+
+/// Positional/slicing builtins whose numeric arguments and arity are
+/// boundary semantics, not parameterizable data. `.at(-1)` reads the
+/// newest entry while `.at(0)` reads the oldest, and `.slice(0, n)` keeps
+/// exactly the head that `.slice(n)` drops — twins one index literal (or
+/// one argument) apart do different work, unlike data-literal twins (a
+/// table name, a status code) which stay reportable as parameterizable
+/// duplicates.
+///
+/// Three semantic wrinkles are folded in so equivalent spellings emit
+/// equal atoms:
+///
+/// * the zero-argument form of every member except `splice` is the same
+///   operation as an explicit leading `0` (`xs.slice()` ⇔ `xs.slice(0)`,
+///   `s.charAt()` ⇔ `s.charAt(0)` — omitted arguments coerce to index
+///   0), so it normalizes to the explicit form; `splice()` removes
+///   nothing while `splice(0)` removes everything, so its arity stays
+///   literal.
+/// * `substring` swaps its arguments after clamping (`s.substring(0, n)`
+///   ⇔ `s.substring(n, 0)`), so its index literals are recorded
+///   position-insensitively.
+/// * atoms are occurrence-COUNTED (see `AtomSets::synthetic_atoms`): a
+///   second call site reading a different boundary must register as a
+///   substitution, not vanish into set semantics.
+fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) {
+    if node.value != "CallExpression" {
+        return;
+    }
+    let Some(callee) = node.children.first() else {
+        return;
+    };
+    if callee.children.len() != 2 {
+        return;
+    }
+    let property = &callee.children[1];
+    let name = match callee.value.as_str() {
+        // `xs.slice(…)`
+        "StaticMemberExpression" if property.value == "Identifier" => property.label.as_str(),
+        // `xs["slice"](…)` — the same property access spelled with
+        // bracket notation (StringLiteral labels carry their quotes).
+        "ComputedMemberExpression" if property.value == "StringLiteral" => {
+            property.label.trim_start_matches('"').trim_end_matches('"')
+        }
+        _ => return,
+    };
+    if !boundary_builtin(name) {
+        return;
+    }
+    // Explicit trailing `undefined` is the omitted-argument spelling for
+    // these APIs (`xs.slice(0, undefined)` copies to the end exactly like
+    // `xs.slice(0)`), so it is trimmed before arity is recorded, and
+    // arguments beyond the API's meaningful parameter count are ignored
+    // by JavaScript (`xs.at(0, traceId)` reads the same element as
+    // `xs.at(0)`), so the recorded arity clamps to that count. `splice`
+    // is excluded from both: `splice(0, undefined)` coerces deleteCount
+    // to 0 and removes nothing, and its trailing arguments are inserted
+    // values, not ignored extras.
+    let mut arguments: &[std::rc::Rc<crate::tree::TreeNode>] = &node.children[1..];
+    if name != "splice" {
+        while let Some(last) = arguments.last() {
+            if last.value == "Identifier" && last.label == "undefined" {
+                arguments = &arguments[..arguments.len() - 1];
+            } else {
+                break;
+            }
+        }
+        let meaningful_arity = match name {
+            "at" | "charAt" | "charCodeAt" | "codePointAt" => 1,
+            _ => 2, // slice | substring | substr
+        };
+        if arguments.len() > meaningful_arity {
+            arguments = &arguments[..meaningful_arity];
+        }
+    }
+    let arity = arguments.len();
+    if arity == 0 && name != "splice" {
+        // Omitted-argument form: same operation as an explicit index 0.
+        atoms.add_synthetic(format!("boundary:{name}/1"));
+        atoms.add_synthetic(boundary_literal_atom(name, 0, "0"));
+        return;
+    }
+    atoms.add_synthetic(format!("boundary:{name}/{arity}"));
+    // `splice` is the one member of the family whose trailing arguments
+    // are inserted VALUES, not positions: only `start` and `deleteCount`
+    // (positions 0 and 1) are boundaries, and twins differing in an
+    // inserted value are ordinary data-literal duplicates.
+    let boundary_positions = if name == "splice" { 2 } else { usize::MAX };
+    for (position, argument) in arguments.iter().enumerate() {
+        if position >= boundary_positions {
+            break;
+        }
+        if let Some(index_literal) = static_index_literal(argument) {
+            atoms.add_synthetic(boundary_literal_atom(name, position, &index_literal));
+        }
+    }
+}
+
+/// Atom key for one boundary index literal. `substring` drops the
+/// argument position from the key because JavaScript reorders its
+/// arguments after clamping — `(0, n)` and `(n, 0)` select the same
+/// range — and clamps negatives to 0 first, so `substring(-1, n)` is
+/// `substring(0, n)`; only the clamped multiset of literals is
+/// behavioral. `slice`/`at` keep negatives distinct (they index from the
+/// end) and stay position-keyed.
+fn boundary_literal_atom(name: &str, position: usize, literal: &str) -> String {
+    if name == "substring" {
+        let clamped = if literal.starts_with('-') { "0" } else { literal };
+        format!("boundary:{name}[]={clamped}")
+    } else {
+        format!("boundary:{name}[{position}]={literal}")
+    }
+}
+
+/// `0`, `1`, `-1`, … — a literal (possibly negated) numeric index.
+fn static_index_literal(node: &crate::tree::TreeNode) -> Option<String> {
+    if node.value == "NumericLiteral" {
+        return Some(node.label.clone());
+    }
+    if node.value == "UnaryExpression" && node.label == "UnaryNegation" && node.children.len() == 1
+    {
+        let inner = &node.children[0];
+        if inner.value == "NumericLiteral" {
+            return Some(format!("-{}", inner.label));
+        }
+    }
+    None
+}
+
+/// Fold-direction atoms: an assignment that rebuilds its own target from a
+/// `+` chain is order-sensitive because string `+` is not commutative —
+/// `trail = trail + seg + "/"` appends while `trail = seg + "/" + trail`
+/// prepends, and the two loops produce reversed outputs. The accumulator's
+/// position in the chain (head / mid / tail) is therefore a behavioral
+/// atom. Two deliberate scope limits:
+///
+/// * the atom only fires when a chain operand is a string LITERAL —
+///   that's the one case where the concatenation (and hence its
+///   direction) is provable from syntax. Numeric folds (`sum += n` vs
+///   `sum = n + sum`) are commutative and must not be penalized, and an
+///   untyped identifier chain could be either, so it gets no atom.
+/// * the target may be a local (`trail`) or a member slot
+///   (`this.trail`, `state.trail`) — member accumulators compare
+///   structurally via the same node hash the statement-permutation
+///   check uses.
+///
+/// The canonicalizer already contracts `x = x + y` onto the `+=` shape
+/// (an `AssignmentExpression` labeled `Addition`), which is by
+/// construction a head fold; non-`+` operators are left alone — their
+/// swapped-operand twins already diverge structurally through the
+/// compound-contraction asymmetry.
+fn collect_fold_direction_atoms(
+    node: &crate::tree::TreeNode,
+    atoms: &mut AtomSets,
+    string_literal_locals: &std::collections::HashSet<String>,
+) {
+    if node.value != "AssignmentExpression" || node.children.len() != 2 {
+        return;
+    }
+    let target = &node.children[0];
+    if !matches!(
+        target.value.as_str(),
+        "Identifier"
+            | "BindingIdentifier"
+            | "StaticMemberExpression"
+            | "PrivateFieldExpression"
+            | "ComputedMemberExpression"
+    ) {
+        return;
+    }
+    // String evidence: a literal operand in the chain proves the
+    // concatenation from the expression itself; a target declared with a
+    // string-literal initializer (`let trail = "";`) proves it from the
+    // declaration. Either way the fold direction is behavioral.
+    let target_is_string_local = matches!(
+        target.value.as_str(),
+        "Identifier" | "BindingIdentifier"
+    ) && string_literal_locals.contains(&target.label);
+    let chain = &node.children[1];
+    let mut leaves = Vec::new();
+    if node.label == "Addition" {
+        // Contracted `x += y` / `x = x + y`: the accumulator is the chain
+        // head; the flattened RHS supplies the in-chain string evidence.
+        flatten_addition_chain(chain, &mut leaves);
+        if target_is_string_local || leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
+            atoms.add_synthetic("fold:head".to_string());
+        }
+        return;
+    }
+    if node.label != "Assign" {
+        return;
+    }
+    if chain.value != "BinaryExpression" || chain.label != "Addition" {
+        return;
+    }
+    flatten_addition_chain(chain, &mut leaves);
+    if !target_is_string_local && !leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
+        return;
+    }
+    let target_hash = structural_node_hash(target);
+    for (position, leaf) in leaves.iter().enumerate() {
+        if leaf.value == target.value && structural_node_hash(leaf) == target_hash {
+            let marker = if position == 0 {
+                "fold:head"
+            } else if position == leaves.len() - 1 {
+                "fold:tail"
+            } else {
+                "fold:mid"
+            };
+            atoms.add_synthetic(marker.to_string());
+        }
+    }
+}
+
+/// Collect the operand leaves of a left/right-nested `+` chain in source
+/// order.
+fn flatten_addition_chain<'a>(
+    node: &'a crate::tree::TreeNode,
+    leaves: &mut Vec<&'a crate::tree::TreeNode>,
+) {
+    if node.value == "BinaryExpression" && node.label == "Addition" {
+        for child in &node.children {
+            flatten_addition_chain(child, leaves);
+        }
+    } else {
+        leaves.push(node);
     }
 }
 
@@ -850,8 +1146,10 @@ fn behavioral_atom_difference(
     collect_behavioral_atoms(tree1, &mut atoms1);
     collect_behavioral_atoms(tree2, &mut atoms2);
     AtomDifference {
-        missing_in_right: atoms1.value_atoms.difference(&atoms2.value_atoms).count(),
-        missing_in_left: atoms2.value_atoms.difference(&atoms1.value_atoms).count(),
+        missing_in_right: atoms1.value_atoms.difference(&atoms2.value_atoms).count()
+            + synthetic_missing(&atoms1.synthetic_atoms, &atoms2.synthetic_atoms),
+        missing_in_left: atoms2.value_atoms.difference(&atoms1.value_atoms).count()
+            + synthetic_missing(&atoms2.synthetic_atoms, &atoms1.synthetic_atoms),
         control: atoms1
             .control_atoms
             .symmetric_difference(&atoms2.control_atoms)
@@ -1603,6 +1901,486 @@ mod tests {
                 || (result.func1.name == "handleUser" && result.func2.name == "processUser")
         });
         assert!(process_handle.is_none());
+    }
+
+    #[test]
+    fn boundary_index_twins_stay_distinct() {
+        // XF-N15 shape: `.at(-1)` picks the newest entry, `.at(0)` the
+        // oldest — one literal apart, but reading different elements.
+        let code = r#"
+export function newestSnapshot(snapshots: string[]): string {
+  const picked = snapshots.at(-1);
+  if (picked === undefined) {
+    return "none";
+  }
+  return picked;
+}
+
+export function oldestSnapshot(snapshots: string[]): string {
+  const picked = snapshots.at(0);
+  if (picked === undefined) {
+    return "none";
+  }
+  return picked;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "boundary-index twins must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn slice_arity_twins_stay_distinct() {
+        // XF-N17 shape: `slice(0, cut)` keeps the head that `slice(cut)`
+        // drops — complementary halves from the same call shape.
+        let code = r"
+export function takeTopJobs(jobs: string[], cut: number): string[] {
+  if (jobs.length === 0) {
+    return [];
+  }
+  return jobs.slice(0, cut);
+}
+
+export function dropTopJobs(jobs: string[], cut: number): string[] {
+  if (jobs.length === 0) {
+    return [];
+  }
+  return jobs.slice(cut);
+}
+";
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "slice head/tail twins must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fold_direction_twins_stay_distinct() {
+        // XF-N40 shape: appending builds a/b/c/ while prepending builds
+        // c/b/a/ — string + is not commutative.
+        let code = r#"
+export function buildTrailForward(segments: string[]): string {
+  let trail = "";
+  for (const segment of segments) {
+    trail = trail + segment + "/";
+  }
+  return trail;
+}
+
+export function buildTrailReversed(segments: string[]): string {
+  let trail = "";
+  for (const segment of segments) {
+    trail = segment + "/" + trail;
+  }
+  return trail;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "append vs prepend folds must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn splice_inserted_value_twins_stay_duplicates() {
+        // Only `start` and `deleteCount` are boundary positions on
+        // `splice`; arguments from position 2 onward are inserted VALUES,
+        // and twins differing only there are parameterizable data-literal
+        // duplicates.
+        let code = r"
+export function resetLeadingFlag(flags: number[], cursor: number): number[] {
+  if (flags.length === 0) {
+    return flags;
+  }
+  flags.splice(cursor, 1, 0);
+  return flags;
+}
+
+export function raiseLeadingFlag(flags: number[], cursor: number): number[] {
+  if (flags.length === 0) {
+    return flags;
+  }
+  flags.splice(cursor, 1, 1);
+  return flags;
+}
+";
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "splice twins differing only in the inserted value must stay reportable"
+        );
+    }
+
+    #[test]
+    fn member_target_fold_direction_twins_stay_distinct() {
+        // `this.trail` / `state.trail` accumulators carry the same
+        // append-vs-prepend behavioral difference as local ones.
+        let code = r#"
+export function extendAuditTrail(state: { trail: string }, segments: string[]): void {
+  for (const segment of segments) {
+    state.trail = state.trail + segment + "/";
+  }
+}
+
+export function rewindAuditTrail(state: { trail: string }, segments: string[]): void {
+  for (const segment of segments) {
+    state.trail = segment + "/" + state.trail;
+  }
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "member-target append vs prepend folds must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn boundary_atoms_count_occurrences() {
+        // One of TWO `.at()` reads changes boundary: `at[0]=0` survives on
+        // both sides through the other call site, so set semantics would
+        // misread the change as a one-sided addition. Occurrence counting
+        // must flag it as a substitution and keep the pair distinct.
+        let code = r#"
+export function firstOfBoth(alpha: string[], beta: string[]): string {
+  const left = alpha.at(0) ?? "none";
+  const right = beta.at(0) ?? "none";
+  return left + ":" + right;
+}
+
+export function firstAndLast(alpha: string[], beta: string[]): string {
+  const left = alpha.at(0) ?? "none";
+  const right = beta.at(-1) ?? "none";
+  return left + ":" + right;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "a substituted boundary among repeated calls must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bracket_notation_boundary_twins_stay_distinct() {
+        // `xs["at"](…)` is the same property access as `xs.at(…)` spelled
+        // with brackets — boundary atoms must fire for it too.
+        let code = r#"
+export function newestEntry(entries: string[]): string {
+  const picked = entries["at"](-1);
+  if (picked === undefined) {
+    return "none";
+  }
+  return picked;
+}
+
+export function oldestEntry(entries: string[]): string {
+  const picked = entries["at"](0);
+  if (picked === undefined) {
+    return "none";
+  }
+  return picked;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "bracket-notation boundary twins must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fold_atoms_count_occurrences() {
+        // Two accumulators: both append on one side; append + prepend on
+        // the other. The shared `fold:head` must not mask the flipped
+        // second accumulator.
+        let code = r#"
+export function buildBothForward(items: string[]): [string, string] {
+  let names = "";
+  let codes = "";
+  for (const item of items) {
+    names = names + item + ",";
+    codes = codes + item + ";";
+  }
+  return [names, codes];
+}
+
+export function buildSecondReversed(items: string[]): [string, string] {
+  let names = "";
+  let codes = "";
+  for (const item of items) {
+    names = names + item + ",";
+    codes = item + ";" + codes;
+  }
+  return [names, codes];
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "a flipped second accumulator must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn omitted_zero_defaults_are_not_boundary_twins() {
+        // `xs.slice()` and `xs.slice(0)` copy the same array — one side
+        // spelling the default argument must not trip the boundary cap.
+        let code = r"
+export function cloneQueue(jobs: string[]): string[] {
+  if (jobs.length === 0) {
+    return [];
+  }
+  return jobs.slice();
+}
+
+export function copyQueue(tasks: string[]): string[] {
+  if (tasks.length === 0) {
+    return [];
+  }
+  return tasks.slice(0);
+}
+";
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "slice() vs slice(0) twins must stay reportable duplicates"
+        );
+    }
+
+    #[test]
+    fn substring_boundary_literals_are_position_insensitive() {
+        // JavaScript swaps substring's arguments after clamping, so
+        // `s.substring(0, cut)` and `s.substring(cut, 0)` select the same
+        // range and must not be capped apart.
+        let code = r#"
+export function headOfLabel(label: string, cut: number): string {
+  if (label.length === 0) {
+    return "";
+  }
+  return label.substring(0, cut);
+}
+
+export function labelPrefix(title: string, cut: number): string {
+  if (title.length === 0) {
+    return "";
+  }
+  return title.substring(cut, 0);
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "substring(0, cut) vs substring(cut, 0) must stay reportable duplicates"
+        );
+    }
+
+    #[test]
+    fn extra_boundary_arguments_are_ignored_like_javascript() {
+        // `xs.at(0, traceId)` reads the same element as `xs.at(0)` — the
+        // ignored extra argument must not change the recorded arity.
+        let code = r#"
+export function firstJob(jobs: string[], traceId: string): string {
+  const picked = jobs.at(0, traceId);
+  if (picked === undefined) {
+    return "none";
+  }
+  return picked;
+}
+
+export function headJob(tasks: string[], traceId: string): string {
+  const picked = tasks.at(0);
+  if (picked === undefined) {
+    return "none";
+  }
+  return picked;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "at(0) vs at(0, ignored) twins must stay reportable duplicates"
+        );
+    }
+
+    #[test]
+    fn string_initialized_locals_prove_fold_direction() {
+        // No literal in the chain, but `let trail = ""` proves the
+        // accumulator is a string — append vs prepend must stay distinct.
+        let code = r#"
+export function joinForward(segments: string[]): string {
+  let trail = "";
+  for (const segment of segments) {
+    trail = trail + segment;
+  }
+  return trail;
+}
+
+export function joinReversed(segments: string[]): string {
+  let trail = "";
+  for (const segment of segments) {
+    trail = segment + trail;
+  }
+  return trail;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "string-initialized fold reversals must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trailing_undefined_boundary_defaults_are_omitted_args() {
+        // `xs.slice(0, undefined)` copies to the end exactly like
+        // `xs.slice(0)` — the explicit default must not trip the cap.
+        let code = r"
+export function copyBatch(jobs: string[]): string[] {
+  if (jobs.length === 0) {
+    return [];
+  }
+  return jobs.slice(0);
+}
+
+export function cloneBatch(tasks: string[]): string[] {
+  if (tasks.length === 0) {
+    return [];
+  }
+  return tasks.slice(0, undefined);
+}
+";
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "slice(0) vs slice(0, undefined) twins must stay reportable duplicates"
+        );
+    }
+
+    #[test]
+    fn negative_substring_literals_clamp_to_zero() {
+        // JavaScript clamps substring's negative arguments to 0, so
+        // `substring(-1, cut)` selects the same text as `substring(0, cut)`.
+        let code = r#"
+export function frontOfCode(code: string, cut: number): string {
+  if (code.length === 0) {
+    return "";
+  }
+  return code.substring(-1, cut);
+}
+
+export function codePrefix(text: string, cut: number): string {
+  if (text.length === 0) {
+    return "";
+  }
+  return text.substring(0, cut);
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "substring(-1, cut) vs substring(0, cut) twins must stay reportable duplicates"
+        );
+    }
+
+    #[test]
+    fn folds_without_string_evidence_get_no_direction_atoms() {
+        // `+` over numbers is commutative: `sum += n` vs `sum = n + sum`
+        // is not a directional rewrite the analyzer can prove, so without
+        // a string literal in the chain the fold-direction atoms must
+        // stay silent (the pair keeps whatever score the tree distance
+        // gives it, uncapped). With a string literal in the chain the
+        // direction IS provable and the atoms fire.
+        use crate::parser::parse_and_convert_to_tree_canonical;
+
+        let fold_atoms = |source: &str| -> Vec<String> {
+            let tree = parse_and_convert_to_tree_canonical("probe.ts", source).unwrap();
+            let mut atoms = AtomSets::default();
+            collect_behavioral_atoms(&tree, &mut atoms);
+            let mut folds: Vec<String> = atoms
+                .synthetic_atoms
+                .into_keys()
+                .filter(|atom| atom.starts_with("fold:"))
+                .collect();
+            folds.sort();
+            folds
+        };
+
+        let numeric_append =
+            "function f(xs: number[]) { let sum = 0; for (const x of xs) { sum += x; } return sum; }";
+        let numeric_prepend =
+            "function f(xs: number[]) { let sum = 0; for (const x of xs) { sum = x + sum; } return sum; }";
+        assert!(fold_atoms(numeric_append).is_empty(), "numeric append must not emit fold atoms");
+        assert!(fold_atoms(numeric_prepend).is_empty(), "numeric prepend must not emit fold atoms");
+
+        let string_append = r#"function f(xs: string[]) { let out = ""; for (const x of xs) { out = out + x + "/"; } return out; }"#;
+        let string_prepend = r#"function f(xs: string[]) { let out = ""; for (const x of xs) { out = x + "/" + out; } return out; }"#;
+        assert_eq!(fold_atoms(string_append), vec!["fold:head".to_string()]);
+        assert_eq!(fold_atoms(string_prepend), vec!["fold:tail".to_string()]);
+    }
+
+    #[test]
+    fn same_direction_folds_still_match() {
+        // Control for the fold-direction atom: two append folds with
+        // renamed identifiers mark the same accumulator position, so the
+        // new atoms must not push a true rename-duplicate below
+        // threshold.
+        let code = r#"
+export function joinSegments(pieces: string[]): string {
+  let joined = "";
+  for (const piece of pieces) {
+    joined += piece + "/";
+  }
+  return joined;
+}
+
+export function gluePath(parts: string[]): string {
+  let glued = "";
+  for (const part of parts) {
+    glued += part + "/";
+  }
+  return glued;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "same-direction folds must still report as duplicates"
+        );
     }
 
     #[test]

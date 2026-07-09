@@ -59,7 +59,8 @@ score as equal:
   renamed-but-identically-typed property sets, `Array<T>` ⇔ `T[]`,
   `x?: T` ⇔ `x: T | undefined`, reordered unions, renamed generic params
 - classes: reordered members, renamed private fields, constructor
-  parameter properties ⇔ explicit field + assignment
+  parameter properties ⇔ explicit field + assignment, and fully renamed
+  method names when the canonical method bodies match
 
 Rewrites that change behavior keep their distinct shapes on purpose:
 swapped builtins (`.map` vs `.filter`, `Math.max` vs `Math.min`), a
@@ -68,9 +69,13 @@ different free callee (`sendEmail` vs `sendSms`), flipped operators
 `x === null`, optional chaining vs plain access, `for-of` vs `for-in`, an
 added `break`, reordered statements that share data, `async` vs sync
 contracts, `then(onFulfilled, onRejected)`, fall-through `switch` cases,
-`Object.assign` with a mutated target, string prepend vs append folds, and
-templates that stringify adjacent values (`` `${a}${b}` `` vs numeric
-`a + b`). Twins that differ **only in data literals** (a table name, a
+`Object.assign` with a mutated target, string prepend vs append folds
+(`trail = trail + seg` vs `trail = seg + trail`), boundary indexes
+(`.at(-1)` vs `.at(0)`, `.slice(0, n)` vs `.slice(n)`), templates that
+stringify adjacent values (`` `${a}${b}` `` vs numeric `a + b`), and on
+the type side `Promise<ShopUser>` vs `Promise<ShopOrder>` payloads,
+`Map<K, V>` vs `Map<V, K>` swaps, and index signatures vs concrete
+members. Twins that differ **only in data literals** (a table name, a
 status code, a locale string) are reported — parameterizing them is the
 refactor.
 
@@ -90,18 +95,20 @@ twins, and realistic cross-file copy-paste.
 | v0.3.0 | 71 pairs | 15 / 71 | 21.13% | 78.87% |
 | v0.4.1 | 71 pairs | 0 / 71 | 0.00% | 100.00% |
 | v0.4.1 | 261 pairs | 89 / 261 | 34.10% | 65.90% |
-| **v0.5.0** | **261 pairs** | **7 / 261** | **2.68%** | **97.32%** |
+| v0.5.0 | 261 pairs | 7 / 261 | 2.68% | 97.32% |
+| **v0.6.0** | **261 pairs** | **0 / 261** | **0.00%** | **100.00%** |
 
-v0.5.0 keeps the original 71-pair corpus at 100% while cutting the
-extended-corpus error rate **12.7x** below the previous engine. It is also
-~1.6x faster end-to-end (11.0s vs 17.2s for a 311-file project across all
-four modes; 557ms vs 879ms for functions+types+classes), despite doing far
-more canonicalization work per function.
+v0.6.0 closes out the seven pairs v0.5.0 still mislabeled — boundary-index
+twins (`.at(-1)` vs `.at(0)`, `.slice(0, n)` vs `.slice(n)`), string
+append vs prepend folds, generic-payload and key/value-swap type twins,
+index-signature lookalikes, and fully-renamed class twins whose method
+bodies match — bringing the full corpus to 100% at the default threshold.
+The engine remains ~1.6x faster end-to-end than v0.4.1 (11.0s vs 17.2s for
+a 311-file project across all four modes).
 
 Run it yourself with `npm run bench:accuracy`; the suite in
-`tests/accuracy-benchmark.test.ts` fails CI if the error rate ever rises
-above one tenth of the v0.4.1 baseline, or if any original 71-pair label
-regresses.
+`tests/accuracy-benchmark.test.ts` fails CI if **any** labeled pair is
+mislabeled.
 
 ## CLI options
 
@@ -125,3 +132,33 @@ regresses.
 
 Annotate a declaration with a `// similarity-ignore` comment on the
 preceding line to exclude it from the report.
+
+## References
+
+The function comparison implements **TSED** (Tree Similarity of Edit
+Distance): both fragments are parsed to ASTs, an APTED-style tree edit
+distance δ with configurable per-operation weights (rename 0.3, delete
+1.0, insert 1.0 — tuned against the labeled corpus) is computed, and the
+score is normalized as `TSED = max(1 − δ / MaxNodes(G1, G2), 0)`. The
+alpha-renaming, refactor canonicalization, behavioral-atom guard, and
+size-penalty layers documented above are this project's additions on top
+of that metric; the operation-weight sensitivity they exploit is the
+paper's RQ3 finding that TSED's penalty weights are influential and
+language-dependent.
+
+- Yewei Song, Cedric Lothritz, Daniel Tang, Tegawendé F. Bissyandé, and
+  Jacques Klein. 2024. *Revisiting Code Similarity Evaluation with
+  Abstract Syntax Tree Edit Distance.* In Proceedings of the 62nd Annual
+  Meeting of the Association for Computational Linguistics (Volume 2:
+  Short Papers). [ACL Anthology 2024.acl-short.3](https://aclanthology.org/2024.acl-short.3/)
+  · [arXiv:2404.08817](https://arxiv.org/abs/2404.08817)
+- Yewei Song, Saad Ezzini, Xunzhu Tang, Cedric Lothritz, Jacques Klein,
+  Tegawendé Bissyandé, Andrey Boytsov, Ulrick Ble, and Anne Goujon. 2023.
+  *Enhancing Text-to-SQL Translation for Financial System Design.* The
+  paper that introduced the original TSED metric.
+  [arXiv:2312.14725](https://arxiv.org/abs/2312.14725)
+- Mateusz Pawlik and Nikolaus Augsten. 2015. *Efficient Computation of
+  the Tree Edit Distance.* ACM Transactions on Database Systems 40(1) —
+  the APTED algorithm family used for δ. See also Pawlik and Augsten
+  2016, *Tree edit distance: Robust and memory-efficient,* Information
+  Systems 56.

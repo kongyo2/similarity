@@ -1,5 +1,112 @@
 # Changelog
 
+## 0.6.0 — 2026-07-09
+
+Closes out the accuracy program started in 0.5.0: the seven remaining
+mislabeled pairs (six false positives, one false negative) are fixed and
+the 261-pair labeled corpus now scores **100.00%** at the default
+threshold, with the original 71-pair core corpus still at 100%. The CI
+gate pins zero mislabels going forward. A README References section now
+documents the TSED papers (Song et al., ACL 2024) the engine's metric is
+built on.
+
+### Detection accuracy
+
+- **Boundary-index atoms** (functions): numeric index literals and call
+  arity on the positional/slicing builtins (`at`, `slice`, `splice`,
+  `charAt`, `charCodeAt`, `codePointAt`, `substring`, `substr`) are now
+  behavior-carrying atoms. `.at(-1)` vs `.at(0)` reads a different
+  element, and `.slice(0, n)` keeps exactly the head that `.slice(n)`
+  drops — such twins cap below the reporting threshold instead of scoring
+  ~0.89–0.95. Data literals elsewhere (a table name, a status code) stay
+  parameterizable duplicates. (fixes XF-N15, XF-N17)
+- **Fold-direction atoms** (functions): an assignment that rebuilds its
+  own target from a `+` chain now marks the accumulator's position in the
+  chain (head/mid/tail). String `+` is not commutative, so
+  `trail = trail + seg + "/"` (append) vs `trail = seg + "/" + trail`
+  (prepend) stay distinct, while same-direction folds — including the
+  `+=` spelling the canonicalizer already contracts onto — keep comparing
+  as duplicates. (fixes XF-N40)
+- **Types**: array types compare element-wise, so `ShopUser[]` vs
+  `ShopOrder[]` is the nominal payload contrast rather than an
+  edit-distance near-match of the bracketed spellings, and array vs
+  non-array is a shape mismatch outright; a permutation of the same
+  generic arguments (`Map<string, number>` vs `Map<number, string>`)
+  scores as the key/value swap it is; index signatures never pair with
+  concrete properties in the rename-tolerant phase (`[flag: string]:
+  boolean` admits every string key, `enabled: boolean` exactly one).
+  (fixes XT-N07, XT-N08, XT-N12)
+- **Classes**: the fuzzy method matcher now consults the canonical body
+  fingerprints introduced in 0.5.0 — a fully-renamed twin (class name,
+  fields, AND method names all changed) whose method bodies parse to
+  identical canonical trees matches through the rename instead of being
+  dropped by the name-similarity term. Naming weight rebalanced
+  0.3 → 0.15 (structural 0.7 → 0.85), mirroring the type comparator's
+  0.5.0 rebalance and for the same reason: the agreement factors inside
+  the structural score already discount same-name/different-body
+  lookalikes. (fixes XC-P04)
+
+### Scope guards on the new detectors (review hardening)
+
+- The fold-direction atoms only fire when a chain operand is a string
+  LITERAL — the one case where the concatenation (and hence its
+  direction) is provable from syntax. Commutative numeric folds
+  (`sum += n` vs `sum = n + sum`) are never direction-capped.
+- Fold-direction targets may be member slots (`this.trail`,
+  `state.trail`), compared structurally, not just local variables.
+- `splice` boundary atoms cover only `start`/`deleteCount` (positions 0
+  and 1); arguments from position 2 onward are inserted values, so twins
+  differing there stay parameterizable data-literal duplicates.
+- Boundary and fold atoms carry occurrence COUNTS: with two `.at()`
+  reads (or two accumulators), changing just one of them is a
+  substitution even though the unchanged occurrence keeps the shared
+  atom alive on both sides — set semantics would have misread that as a
+  one-sided extension.
+- The zero-argument form of the boundary members (except `splice`)
+  normalizes to an explicit leading `0`: `xs.slice()` ⇔ `xs.slice(0)`
+  and `s.charAt()` ⇔ `s.charAt(0)` are the same operation, so spelling
+  the default must not trip the cap. `splice()` (removes nothing) vs
+  `splice(0)` (removes everything) stays literal.
+- `substring` records its index literals position-insensitively because
+  JavaScript reorders the arguments after clamping: `s.substring(0, n)`
+  ⇔ `s.substring(n, 0)`; negatives clamp to 0 first, so
+  `s.substring(-1, n)` ⇔ `s.substring(0, n)` too.
+- Explicit trailing `undefined` arguments trim before arity is recorded
+  (`xs.slice(0, undefined)` ⇔ `xs.slice(0)`), except on `splice`, where
+  `undefined` coerces deleteCount to 0 and means something different.
+- Bracket-notation property calls (`xs["slice"](0)`) collect the same
+  boundary atoms as their dot-notation spelling.
+- A local declared with a string-literal initializer (`let trail = ""`)
+  proves its folds are string concatenation even when the `+` chain
+  itself carries no literal, so `trail = trail + seg` vs
+  `trail = seg + trail` stays distinct under that declaration.
+- Arguments beyond a boundary builtin's meaningful parameter count are
+  ignored, matching JavaScript (`xs.at(0, traceId)` ⇔ `xs.at(0)`).
+- Class property matching discounts `static` vs instance mismatches
+  (×0.4, the same treatment the method pass already applied): a static
+  field and an instance field of the same name and type live on
+  different runtime surfaces.
+- The class fingerprint boost requires signature agreement (exact or
+  after fuzzy name-stripping): the fingerprint tree carries no
+  TypeScript type annotations, so same-body methods over different
+  parameter types must not match through it.
+- Index signatures never enter the rename-tolerant property phase at
+  all: `[index: string]` and `[index: number]` are different key-domain
+  contracts even when their value types agree.
+
+### Accuracy
+
+| Engine | Corpus | Wrong labels | Error rate | Accuracy |
+| --- | --- | ---: | ---: | ---: |
+| v0.5.0 | 261 pairs | 7 / 261 | 2.68% | 97.32% |
+| v0.6.0 | 261 pairs | 0 / 261 | 0.00% | 100.00% |
+
+### CI
+
+- `tests/accuracy-benchmark.test.ts` now pins 100% corpus accuracy: any
+  mislabeled pair fails the suite (previously the budget was one tenth of
+  the v0.4.1 error-rate baseline, ~8 pairs).
+
 ## 0.5.0 — 2026-07-04
 
 The detection engine was rebuilt around scope-aware alpha-renaming and a
