@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.6.0 — 2026-07-09
+
+Closes out the accuracy program started in 0.5.0: the seven remaining
+mislabeled pairs (six false positives, one false negative) are fixed and
+the 261-pair labeled corpus now scores **100.00%** at the default
+threshold, with the original 71-pair core corpus still at 100%. The CI
+gate pins zero mislabels going forward. A README References section now
+documents the TSED papers (Song et al., ACL 2024) the engine's metric is
+built on.
+
+### Detection accuracy
+
+- **Boundary-index atoms** (functions): numeric index literals and call
+  arity on the positional/slicing builtins (`at`, `slice`, `splice`,
+  `charAt`, `charCodeAt`, `codePointAt`, `substring`, `substr`) are now
+  behavior-carrying atoms. `.at(-1)` vs `.at(0)` reads a different
+  element, and `.slice(0, n)` keeps exactly the head that `.slice(n)`
+  drops — such twins cap below the reporting threshold instead of scoring
+  ~0.89–0.95. Data literals elsewhere (a table name, a status code) stay
+  parameterizable duplicates. (fixes XF-N15, XF-N17)
+- **Fold-direction atoms** (functions): an assignment that rebuilds its
+  own target from a `+` chain now marks the accumulator's position in the
+  chain (head/mid/tail). String `+` is not commutative, so
+  `trail = trail + seg + "/"` (append) vs `trail = seg + "/" + trail`
+  (prepend) stay distinct, while same-direction folds — including the
+  `+=` spelling the canonicalizer already contracts onto — keep comparing
+  as duplicates. (fixes XF-N40)
+- **Types**: array types compare element-wise, so `ShopUser[]` vs
+  `ShopOrder[]` is the nominal payload contrast rather than an
+  edit-distance near-match of the bracketed spellings, and array vs
+  non-array is a shape mismatch outright; a permutation of the same
+  generic arguments (`Map<string, number>` vs `Map<number, string>`)
+  scores as the key/value swap it is; index signatures never pair with
+  concrete properties in the rename-tolerant phase (`[flag: string]:
+  boolean` admits every string key, `enabled: boolean` exactly one).
+  (fixes XT-N07, XT-N08, XT-N12)
+- **Classes**: the fuzzy method matcher now consults the canonical body
+  fingerprints introduced in 0.5.0 — a fully-renamed twin (class name,
+  fields, AND method names all changed) whose method bodies parse to
+  identical canonical trees matches through the rename instead of being
+  dropped by the name-similarity term. Naming weight rebalanced
+  0.3 → 0.15 (structural 0.7 → 0.85), mirroring the type comparator's
+  0.5.0 rebalance and for the same reason: the agreement factors inside
+  the structural score already discount same-name/different-body
+  lookalikes. (fixes XC-P04)
+
+### Accuracy
+
+| Engine | Corpus | Wrong labels | Error rate | Accuracy |
+| --- | --- | ---: | ---: | ---: |
+| v0.5.0 | 261 pairs | 7 / 261 | 2.68% | 97.32% |
+| v0.6.0 | 261 pairs | 0 / 261 | 0.00% | 100.00% |
+
+### CI
+
+- `tests/accuracy-benchmark.test.ts` now pins 100% corpus accuracy: any
+  mislabeled pair fails the suite (previously the budget was one tenth of
+  the v0.4.1 error-rate baseline, ~8 pairs).
+
 ## 0.5.0 — 2026-07-04
 
 The detection engine was rebuilt around scope-aware alpha-renaming and a

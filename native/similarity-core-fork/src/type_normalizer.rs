@@ -392,6 +392,22 @@ pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
         (None, None) => {}
     }
 
+    // Array types compare element-wise: `ShopUser[]` vs `ShopOrder[]` is
+    // the payload contrast itself, not the near-match plain edit distance
+    // saw in the bracketed names, and an array vs a non-array is a shape
+    // mismatch outright.
+    let element1 =
+        normalized1.strip_suffix("[]").filter(|inner| !inner.is_empty() && is_balanced(inner));
+    let element2 =
+        normalized2.strip_suffix("[]").filter(|inner| !inner.is_empty() && is_balanced(inner));
+    match (element1, element2) {
+        (Some(element1), Some(element2)) => {
+            return calculate_type_similarity(element1, element2);
+        }
+        (Some(_), None) | (None, Some(_)) => return 0.2,
+        (None, None) => {}
+    }
+
     // Generic references compare structurally: same container with
     // different payloads (`Promise<User>` vs `Promise<Order>`) is a REAL
     // contract difference, not the near-match plain edit distance would
@@ -399,6 +415,19 @@ pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
     match (parse_generic_reference(&normalized1), parse_generic_reference(&normalized2)) {
         (Some((base1, args1)), Some((base2, args2))) => {
             if base1 == base2 && args1.len() == args2.len() {
+                // Same container, same argument multiset, different
+                // positions — `Map<string, number>` vs `Map<number,
+                // string>` is a key/value swap, i.e. an inverted
+                // contract, not a near-duplicate.
+                if args1.len() >= 2 && args1 != args2 {
+                    let mut sorted1 = args1.clone();
+                    let mut sorted2 = args2.clone();
+                    sorted1.sort();
+                    sorted2.sort();
+                    if sorted1 == sorted2 {
+                        return 0.25;
+                    }
+                }
                 let total: f64 = args1
                     .iter()
                     .zip(args2.iter())
@@ -580,6 +609,14 @@ pub fn find_property_matches(
     // leftovers, greedily paired in sorted order for determinism. The
     // 0.95 factor keeps a full-rename match slightly below an exact-name
     // match of the same shape.
+    //
+    // Index signatures are not renameable properties: `[index: string]:
+    // boolean` admits every string key while `enabled: boolean` admits
+    // exactly one, so the rename-tolerant phase never pairs an index
+    // signature with a concrete property. Two index signatures with the
+    // same key type share their extractor-assigned name and already match
+    // in phase 1.
+    let is_index_signature = |name: &str| name.starts_with('[');
     let mut leftovers1: Vec<&String> =
         type1.properties.keys().filter(|name| !matched1.contains(*name)).collect();
     let mut leftovers2: Vec<&String> =
@@ -592,6 +629,9 @@ pub fn find_property_matches(
         let mut best: Option<(&String, f64)> = None;
         for prop2 in &leftovers2 {
             if matched2.contains(*prop2) {
+                continue;
+            }
+            if is_index_signature(prop1) != is_index_signature(prop2) {
                 continue;
             }
             let type2_annotation = &type2.properties[*prop2];
@@ -748,6 +788,59 @@ mod tests {
         assert_eq!(levenshtein_distance("abc", "abc"), 0);
         assert_eq!(levenshtein_distance("abc", "ab"), 1);
         assert_eq!(levenshtein_distance("abc", "def"), 3);
+    }
+
+    #[test]
+    fn array_types_compare_by_element() {
+        // `ShopUser[]` vs `ShopOrder[]` is the nominal payload contrast,
+        // not a Levenshtein near-match of the bracketed spellings.
+        assert_eq!(calculate_type_similarity("ShopUser[]", "ShopOrder[]"), 0.2);
+        assert_eq!(calculate_type_similarity("ShopUser[]", "ShopUser[]"), 1.0);
+        // Array vs non-array is a shape mismatch outright.
+        assert_eq!(calculate_type_similarity("string[]", "string"), 0.2);
+        assert_eq!(calculate_type_similarity("Set<string>", "string[]"), 0.2);
+    }
+
+    #[test]
+    fn permuted_generic_arguments_are_a_swapped_contract() {
+        // Key/value swap admits (and returns) entirely different values.
+        assert_eq!(
+            calculate_type_similarity("Map<string, number>", "Map<number, string>"),
+            0.25
+        );
+        // Identical argument lists still compare as equal…
+        assert_eq!(
+            calculate_type_similarity("Map<string, number>", "Map<string, number>"),
+            1.0
+        );
+        // …and non-permutation argument differences keep the graded
+        // same-container score.
+        let graded = calculate_type_similarity("Map<string, number>", "Map<string, boolean>");
+        assert!(graded > 0.25 && graded < 1.0, "got {graded}");
+    }
+
+    #[test]
+    fn index_signatures_never_pair_with_concrete_properties() {
+        // XT-N12 shape: an open string-keyed map vs a single concrete
+        // boolean member. The rename-tolerant phase must not unify them.
+        let flags = create_test_type("FeatureFlags", vec![("[index: string]", "boolean", false, false)]);
+        let toggle = create_test_type("FeatureToggle", vec![("enabled", "boolean", false, false)]);
+        let options = NormalizationOptions::default();
+        let matches = find_property_matches(
+            &normalize_type(&flags, &options),
+            &normalize_type(&toggle, &options),
+            0.7,
+        );
+        assert!(matches.is_empty(), "index signature must not match a concrete property");
+
+        // Two identically-keyed index signatures still match (phase 1).
+        let toggles = create_test_type("ToggleMap", vec![("[index: string]", "boolean", false, false)]);
+        let matches = find_property_matches(
+            &normalize_type(&flags, &options),
+            &normalize_type(&toggles, &options),
+            0.7,
+        );
+        assert_eq!(matches.len(), 1);
     }
 
     #[test]

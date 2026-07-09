@@ -223,8 +223,14 @@ pub fn compare_classes(
     // Calculate structural similarity
     let (structural_similarity, differences) = calculate_structural_similarity(&norm1, &norm2);
 
-    // Combined similarity (weighted average)
-    let similarity = 0.3 * naming_similarity + 0.7 * structural_similarity;
+    // Combined similarity (weighted average). Structural evidence
+    // dominates, mirroring the type comparator's 0.85/0.15 rebalance: a
+    // fully-renamed twin (class, fields, AND method names changed) keeps
+    // no lexical overlap, and the old 0.3 naming weight pushed such pairs
+    // below threshold even when every canonical method body matched. The
+    // agreement factors inside the structural score already discount
+    // same-name/different-body lookalikes, so naming adds little there.
+    let similarity = 0.15 * naming_similarity + 0.85 * structural_similarity;
 
     ClassComparisonResult { similarity, structural_similarity, naming_similarity, differences }
 }
@@ -479,7 +485,20 @@ fn calculate_structural_similarity(
                 0.4 + 0.4 * name_overlap
             };
             let name_sim = calculate_name_similarity(name1, name2);
-            let score = 0.6 * sig_match + 0.4 * name_sim;
+            let mut score = 0.6 * sig_match + 0.4 * name_sim;
+            // Identical canonical body fingerprints are the strongest
+            // duplicate signal there is: a full method rename
+            // (`addSample` → `recordPoint`) leaves no lexical overlap for
+            // the name term, but two methods that parse to the same
+            // canonical tree DO the same thing. Let the body evidence
+            // dominate the name evidence instead of averaging with it.
+            let fingerprints_match = matches!(
+                (method1.body_fingerprint, method2.body_fingerprint),
+                (Some(fp1), Some(fp2)) if fp1 == fp2
+            );
+            if fingerprints_match {
+                score = score.max(0.95);
+            }
             if best_match.is_none_or(|(_, b)| score > b) {
                 best_match = Some((name2, score));
             }
@@ -612,4 +631,94 @@ pub fn find_similar_classes_across_files(
     }
 
     find_similar_classes(&all_classes, threshold)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::class_extractor::extract_classes_from_code;
+
+    fn compare_sources(source1: &str, source2: &str) -> ClassComparisonResult {
+        let classes1 = extract_classes_from_code(source1, "a.ts").unwrap();
+        let classes2 = extract_classes_from_code(source2, "b.ts").unwrap();
+        compare_classes(&classes1[0], &classes2[0])
+    }
+
+    #[test]
+    fn renamed_method_names_do_not_hide_equal_bodies() {
+        // XC-P04 shape: class, field, AND method names all renamed, but
+        // every signature and canonical method body matches.
+        let result = compare_sources(
+            r"
+export class SampleWindow {
+  private values: number[] = [];
+  addSample(value: number): void {
+    this.values.push(value);
+    if (this.values.length > 50) this.values.shift();
+  }
+  averageOf(): number {
+    if (this.values.length === 0) return 0;
+    return this.values.reduce((acc, v) => acc + v, 0) / this.values.length;
+  }
+}
+",
+            r"
+export class ReadingWindow {
+  private points: number[] = [];
+  recordPoint(point: number): void {
+    this.points.push(point);
+    if (this.points.length > 50) this.points.shift();
+  }
+  meanOf(): number {
+    if (this.points.length === 0) return 0;
+    return this.points.reduce((acc, p) => acc + p, 0) / this.points.length;
+  }
+}
+",
+        );
+        assert!(
+            result.similarity >= 0.8,
+            "fully-renamed twin with equal bodies must clear the default threshold, got {}",
+            result.similarity
+        );
+    }
+
+    #[test]
+    fn renamed_methods_with_different_bodies_get_no_fingerprint_boost() {
+        // Same member counts and signature shapes, but the bodies compute
+        // different things — the fingerprint fast-path must not fire.
+        let result = compare_sources(
+            r"
+export class RollingMax {
+  private values: number[] = [];
+  record(value: number): void {
+    this.values.push(value);
+    if (this.values.length > 50) this.values.shift();
+  }
+  currentPeak(): number {
+    if (this.values.length === 0) return 0;
+    return Math.max(...this.values);
+  }
+}
+",
+            r"
+export class GapTracker {
+  private points: number[] = [];
+  observe(point: number): void {
+    if (this.points.length >= 50) this.points.pop();
+    this.points.unshift(point);
+  }
+  widestGap(): number {
+    if (this.points.length < 2) return 0;
+    return Math.max(...this.points) - Math.min(...this.points);
+  }
+}
+",
+        );
+        assert!(
+            result.similarity < 0.8,
+            "different-body lookalikes must stay below the default threshold, got {}",
+            result.similarity
+        );
+    }
 }
