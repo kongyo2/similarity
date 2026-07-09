@@ -847,6 +847,38 @@ fn boundary_builtin(name: &str) -> bool {
 /// way renaming two positional parameters does, and the corpus treats
 /// those as duplicates.
 fn collect_behavioral_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) {
+    // Pre-pass: locals declared with a string-literal initializer
+    // (`let trail = "";`) are provably string accumulators, so their
+    // folds are direction-sensitive even when the `+` chain itself
+    // carries no literal (`trail = trail + segment` vs
+    // `trail = segment + trail`).
+    let mut string_literal_locals = std::collections::HashSet::new();
+    collect_string_literal_locals(node, &mut string_literal_locals);
+    collect_behavioral_atoms_inner(node, atoms, &string_literal_locals);
+}
+
+/// Labels of locals whose declarator initializer is a string literal.
+fn collect_string_literal_locals(
+    node: &crate::tree::TreeNode,
+    locals: &mut std::collections::HashSet<String>,
+) {
+    if node.value == "VariableDeclarator" && node.children.len() == 2 {
+        let target = &node.children[0];
+        let init = &node.children[1];
+        if target.value == "BindingIdentifier" && init.value == "StringLiteral" {
+            locals.insert(target.label.clone());
+        }
+    }
+    for child in &node.children {
+        collect_string_literal_locals(child, locals);
+    }
+}
+
+fn collect_behavioral_atoms_inner(
+    node: &crate::tree::TreeNode,
+    atoms: &mut AtomSets,
+    string_literal_locals: &std::collections::HashSet<String>,
+) {
     let is_value_atom = match node.value.as_str() {
         "Identifier" | "BindingIdentifier" | "PrivateIdentifier" => {
             !node.label.starts_with('§')
@@ -868,13 +900,13 @@ fn collect_behavioral_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) 
         _ => {}
     }
     collect_boundary_call_atoms(node, atoms);
-    collect_fold_direction_atoms(node, atoms);
+    collect_fold_direction_atoms(node, atoms, string_literal_locals);
     let skip_pattern_key = node.value == "BindingProperty";
     for (index, child) in node.children.iter().enumerate() {
         if skip_pattern_key && index == 0 {
             continue;
         }
-        collect_behavioral_atoms(child, atoms);
+        collect_behavioral_atoms_inner(child, atoms, string_literal_locals);
     }
 }
 
@@ -925,7 +957,22 @@ fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSet
     if !boundary_builtin(name) {
         return;
     }
-    let arity = node.children.len() - 1;
+    // Explicit trailing `undefined` is the omitted-argument spelling for
+    // these APIs (`xs.slice(0, undefined)` copies to the end exactly like
+    // `xs.slice(0)`), so it is trimmed before arity is recorded. `splice`
+    // is excluded: `splice(0, undefined)` coerces deleteCount to 0 and
+    // removes nothing, unlike `splice(0)` which removes to the end.
+    let mut arguments: &[std::rc::Rc<crate::tree::TreeNode>] = &node.children[1..];
+    if name != "splice" {
+        while let Some(last) = arguments.last() {
+            if last.value == "Identifier" && last.label == "undefined" {
+                arguments = &arguments[..arguments.len() - 1];
+            } else {
+                break;
+            }
+        }
+    }
+    let arity = arguments.len();
     if arity == 0 && name != "splice" {
         // Omitted-argument form: same operation as an explicit index 0.
         atoms.add_synthetic(format!("boundary:{name}/1"));
@@ -938,7 +985,7 @@ fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSet
     // (positions 0 and 1) are boundaries, and twins differing in an
     // inserted value are ordinary data-literal duplicates.
     let boundary_positions = if name == "splice" { 2 } else { usize::MAX };
-    for (position, argument) in node.children.iter().skip(1).enumerate() {
+    for (position, argument) in arguments.iter().enumerate() {
         if position >= boundary_positions {
             break;
         }
@@ -951,10 +998,14 @@ fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSet
 /// Atom key for one boundary index literal. `substring` drops the
 /// argument position from the key because JavaScript reorders its
 /// arguments after clamping — `(0, n)` and `(n, 0)` select the same
-/// range, so only the multiset of literals is behavioral.
+/// range — and clamps negatives to 0 first, so `substring(-1, n)` is
+/// `substring(0, n)`; only the clamped multiset of literals is
+/// behavioral. `slice`/`at` keep negatives distinct (they index from the
+/// end) and stay position-keyed.
 fn boundary_literal_atom(name: &str, position: usize, literal: &str) -> String {
     if name == "substring" {
-        format!("boundary:{name}[]={literal}")
+        let clamped = if literal.starts_with('-') { "0" } else { literal };
+        format!("boundary:{name}[]={clamped}")
     } else {
         format!("boundary:{name}[{position}]={literal}")
     }
@@ -997,7 +1048,11 @@ fn static_index_literal(node: &crate::tree::TreeNode) -> Option<String> {
 /// construction a head fold; non-`+` operators are left alone — their
 /// swapped-operand twins already diverge structurally through the
 /// compound-contraction asymmetry.
-fn collect_fold_direction_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) {
+fn collect_fold_direction_atoms(
+    node: &crate::tree::TreeNode,
+    atoms: &mut AtomSets,
+    string_literal_locals: &std::collections::HashSet<String>,
+) {
     if node.value != "AssignmentExpression" || node.children.len() != 2 {
         return;
     }
@@ -1012,13 +1067,21 @@ fn collect_fold_direction_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSe
     ) {
         return;
     }
+    // String evidence: a literal operand in the chain proves the
+    // concatenation from the expression itself; a target declared with a
+    // string-literal initializer (`let trail = "";`) proves it from the
+    // declaration. Either way the fold direction is behavioral.
+    let target_is_string_local = matches!(
+        target.value.as_str(),
+        "Identifier" | "BindingIdentifier"
+    ) && string_literal_locals.contains(&target.label);
     let chain = &node.children[1];
     let mut leaves = Vec::new();
     if node.label == "Addition" {
         // Contracted `x += y` / `x = x + y`: the accumulator is the chain
-        // head; the flattened RHS supplies the string evidence.
+        // head; the flattened RHS supplies the in-chain string evidence.
         flatten_addition_chain(chain, &mut leaves);
-        if leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
+        if target_is_string_local || leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
             atoms.add_synthetic("fold:head".to_string());
         }
         return;
@@ -1030,7 +1093,7 @@ fn collect_fold_direction_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSe
         return;
     }
     flatten_addition_chain(chain, &mut leaves);
-    if !leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
+    if !target_is_string_local && !leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
         return;
     }
     let target_hash = structural_node_hash(target);
@@ -2122,6 +2185,92 @@ export function labelPrefix(title: string, cut: number): string {
             pairs.len(),
             1,
             "substring(0, cut) vs substring(cut, 0) must stay reportable duplicates"
+        );
+    }
+
+    #[test]
+    fn string_initialized_locals_prove_fold_direction() {
+        // No literal in the chain, but `let trail = ""` proves the
+        // accumulator is a string — append vs prepend must stay distinct.
+        let code = r#"
+export function joinForward(segments: string[]): string {
+  let trail = "";
+  for (const segment of segments) {
+    trail = trail + segment;
+  }
+  return trail;
+}
+
+export function joinReversed(segments: string[]): string {
+  let trail = "";
+  for (const segment of segments) {
+    trail = segment + trail;
+  }
+  return trail;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "string-initialized fold reversals must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trailing_undefined_boundary_defaults_are_omitted_args() {
+        // `xs.slice(0, undefined)` copies to the end exactly like
+        // `xs.slice(0)` — the explicit default must not trip the cap.
+        let code = r"
+export function copyBatch(jobs: string[]): string[] {
+  if (jobs.length === 0) {
+    return [];
+  }
+  return jobs.slice(0);
+}
+
+export function cloneBatch(tasks: string[]): string[] {
+  if (tasks.length === 0) {
+    return [];
+  }
+  return tasks.slice(0, undefined);
+}
+";
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "slice(0) vs slice(0, undefined) twins must stay reportable duplicates"
+        );
+    }
+
+    #[test]
+    fn negative_substring_literals_clamp_to_zero() {
+        // JavaScript clamps substring's negative arguments to 0, so
+        // `substring(-1, cut)` selects the same text as `substring(0, cut)`.
+        let code = r#"
+export function frontOfCode(code: string, cut: number): string {
+  if (code.length === 0) {
+    return "";
+  }
+  return code.substring(-1, cut);
+}
+
+export function codePrefix(text: string, cut: number): string {
+  if (text.length === 0) {
+    return "";
+  }
+  return text.substring(0, cut);
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "substring(-1, cut) vs substring(0, cut) twins must stay reportable duplicates"
         );
     }
 

@@ -69,7 +69,17 @@ built on.
   `splice(0)` (removes everything) stays literal.
 - `substring` records its index literals position-insensitively because
   JavaScript reorders the arguments after clamping: `s.substring(0, n)`
-  ⇔ `s.substring(n, 0)`.
+  ⇔ `s.substring(n, 0)`; negatives clamp to 0 first, so
+  `s.substring(-1, n)` ⇔ `s.substring(0, n)` too.
+- Explicit trailing `undefined` arguments trim before arity is recorded
+  (`xs.slice(0, undefined)` ⇔ `xs.slice(0)`), except on `splice`, where
+  `undefined` coerces deleteCount to 0 and means something different.
+- Bracket-notation property calls (`xs["slice"](0)`) collect the same
+  boundary atoms as their dot-notation spelling.
+- A local declared with a string-literal initializer (`let trail = ""`)
+  proves its folds are string concatenation even when the `+` chain
+  itself carries no literal, so `trail = trail + seg` vs
+  `trail = seg + trail` stays distinct under that declaration.
 - The class fingerprint boost requires signature agreement (exact or
   after fuzzy name-stripping): the fingerprint tree carries no
   TypeScript type annotations, so same-body methods over different

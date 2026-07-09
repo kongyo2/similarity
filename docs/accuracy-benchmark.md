@@ -4,7 +4,7 @@
 
 # Refactoring Accuracy Benchmark
 
-Generated at: 2026-07-09T19:44:10.613Z
+Generated at: 2026-07-09T20:09:24.238Z
 
 Settings: threshold 0.8 (CLI default), minLines 3 (CLI default)
 

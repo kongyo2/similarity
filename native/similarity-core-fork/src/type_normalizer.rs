@@ -255,6 +255,41 @@ pub fn normalize_type_name(type_name: &str) -> String {
     }
 }
 
+/// Strip parentheses that wrap the ENTIRE type (`(User | Error)` →
+/// `User | Error`), repeatedly. A parenthesis that closes before the end
+/// of the string — a function type's parameter list, for instance — is
+/// left alone.
+fn strip_wrapping_parens(input: &str) -> &str {
+    let mut current = input.trim();
+    loop {
+        if !(current.starts_with('(') && current.ends_with(')')) {
+            return current;
+        }
+        let mut depth = 0i32;
+        let mut previous = '\0';
+        let mut closes_at_end = false;
+        for (index, ch) in current.char_indices() {
+            match ch {
+                '(' | '<' | '[' | '{' => depth += 1,
+                '>' if previous == '=' => {}
+                ')' | '>' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        closes_at_end = index == current.len() - 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            previous = ch;
+        }
+        if !closes_at_end {
+            return current;
+        }
+        current = current[1..current.len() - 1].trim();
+    }
+}
+
 fn is_balanced(text: &str) -> bool {
     let mut depth = 0i32;
     let mut previous = '\0';
@@ -402,7 +437,14 @@ pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
         normalized2.strip_suffix("[]").filter(|inner| !inner.is_empty() && is_balanced(inner));
     match (element1, element2) {
         (Some(element1), Some(element2)) => {
-            return calculate_type_similarity(element1, element2);
+            // Compound element types round-trip through the normalizer as
+            // `(A | B)[]` — strip the wrapping parentheses so the union
+            // comparison sees its top-level `|` again instead of falling
+            // back to edit distance on the parenthesized strings.
+            return calculate_type_similarity(
+                strip_wrapping_parens(element1),
+                strip_wrapping_parens(element2),
+            );
         }
         (Some(_), None) | (None, Some(_)) => return 0.2,
         (None, None) => {}
@@ -803,6 +845,23 @@ mod tests {
         // Array vs non-array is a shape mismatch outright.
         assert_eq!(calculate_type_similarity("string[]", "string"), 0.2);
         assert_eq!(calculate_type_similarity("Set<string>", "string[]"), 0.2);
+    }
+
+    #[test]
+    fn parenthesized_array_elements_compare_as_unions() {
+        // `Array<User | Error>` normalizes to `(User | Error)[]`; the
+        // wrapping parentheses must not hide the union from the arm-wise
+        // comparison (edit distance on the parenthesized strings scored
+        // one-arm-different unions as a ~0.8 near-match).
+        let similar = calculate_type_similarity("(User | Error)[]", "(Order | Error)[]");
+        assert!(
+            similar <= 0.3,
+            "one-arm-different union arrays must score low, got {similar}"
+        );
+        assert_eq!(
+            calculate_type_similarity("(User | Error)[]", "(Error | User)[]"),
+            1.0
+        );
     }
 
     #[test]
