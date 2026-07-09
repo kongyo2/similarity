@@ -959,9 +959,13 @@ fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSet
     }
     // Explicit trailing `undefined` is the omitted-argument spelling for
     // these APIs (`xs.slice(0, undefined)` copies to the end exactly like
-    // `xs.slice(0)`), so it is trimmed before arity is recorded. `splice`
-    // is excluded: `splice(0, undefined)` coerces deleteCount to 0 and
-    // removes nothing, unlike `splice(0)` which removes to the end.
+    // `xs.slice(0)`), so it is trimmed before arity is recorded, and
+    // arguments beyond the API's meaningful parameter count are ignored
+    // by JavaScript (`xs.at(0, traceId)` reads the same element as
+    // `xs.at(0)`), so the recorded arity clamps to that count. `splice`
+    // is excluded from both: `splice(0, undefined)` coerces deleteCount
+    // to 0 and removes nothing, and its trailing arguments are inserted
+    // values, not ignored extras.
     let mut arguments: &[std::rc::Rc<crate::tree::TreeNode>] = &node.children[1..];
     if name != "splice" {
         while let Some(last) = arguments.last() {
@@ -970,6 +974,13 @@ fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSet
             } else {
                 break;
             }
+        }
+        let meaningful_arity = match name {
+            "at" | "charAt" | "charCodeAt" | "codePointAt" => 1,
+            _ => 2, // slice | substring | substr
+        };
+        if arguments.len() > meaningful_arity {
+            arguments = &arguments[..meaningful_arity];
         }
     }
     let arity = arguments.len();
@@ -2185,6 +2196,36 @@ export function labelPrefix(title: string, cut: number): string {
             pairs.len(),
             1,
             "substring(0, cut) vs substring(cut, 0) must stay reportable duplicates"
+        );
+    }
+
+    #[test]
+    fn extra_boundary_arguments_are_ignored_like_javascript() {
+        // `xs.at(0, traceId)` reads the same element as `xs.at(0)` — the
+        // ignored extra argument must not change the recorded arity.
+        let code = r#"
+export function firstJob(jobs: string[], traceId: string): string {
+  const picked = jobs.at(0, traceId);
+  if (picked === undefined) {
+    return "none";
+  }
+  return picked;
+}
+
+export function headJob(tasks: string[], traceId: string): string {
+  const picked = tasks.at(0);
+  if (picked === undefined) {
+    return "none";
+  }
+  return picked;
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "at(0) vs at(0, ignored) twins must stay reportable duplicates"
         );
     }
 

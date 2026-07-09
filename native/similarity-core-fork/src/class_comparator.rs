@@ -310,6 +310,10 @@ fn calculate_structural_similarity(
     for name in &class1_property_names {
         let prop1 = &class1.properties[*name];
         if let Some(prop2) = class2.properties.get(*name) {
+            // A `static` field and an instance field live on different
+            // runtime surfaces even when name and type agree — same
+            // discount the method pass applies via its agreement factor.
+            let modifier_factor = if prop1.is_static == prop2.is_static { 1.0 } else { 0.4 };
             // Class-reference types tolerate renames: `repo: InvoiceRepo`
             // and `repo: ReceiptRepo` are the same dependency slot in two
             // renamed class families (the same placeholdering the fuzzy
@@ -321,10 +325,10 @@ fn calculate_structural_similarity(
                     == replace_camelcase_identifiers(&prop2.type_annotation)
             {
                 // Strict match — credit both class1 and class2 sides.
-                property_score += 2.0;
+                property_score += 2.0 * modifier_factor;
             } else {
                 // Same name, different type — partial match.
-                property_score += 1.4;
+                property_score += 1.4 * modifier_factor;
                 property_type_mismatches.push(PropertyMismatch {
                     name: (*name).to_string(),
                     type1: prop1.type_annotation.clone(),
@@ -378,7 +382,12 @@ fn calculate_structural_similarity(
                 0.4
             };
             let name_sim = calculate_name_similarity(name1, name2);
-            let score = 0.8 * type_match + 0.2 * name_sim;
+            let mut score = 0.8 * type_match + 0.2 * name_sim;
+            // Same runtime-surface rule as the strict pass: a static
+            // field is not a rename of an instance field.
+            if prop1.is_static != prop2.is_static {
+                score *= 0.4;
+            }
             if best_match.is_none_or(|(_, b)| score > b) {
                 best_match = Some((name2, score));
             }
@@ -718,6 +727,30 @@ export class CodeFormatter {
         assert!(
             result.similarity < 0.8,
             "same-body methods with incompatible signatures must stay below threshold, got {}",
+            result.similarity
+        );
+    }
+
+    #[test]
+    fn static_and_instance_fields_are_different_surfaces() {
+        // Same field name and type, but one lives on the class and the
+        // other on instances — with unrelated class names this must not
+        // report as a duplicate on the property signal alone.
+        let result = compare_sources(
+            r"
+export class GlobalRegistry {
+  static entries: Map<string, string> = new Map();
+}
+",
+            r"
+export class SessionScratch {
+  entries: Map<string, string> = new Map();
+}
+",
+        );
+        assert!(
+            result.similarity < 0.8,
+            "static vs instance field lookalikes must stay below threshold, got {}",
             result.similarity
         );
     }

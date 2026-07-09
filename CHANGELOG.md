@@ -80,6 +80,12 @@ built on.
   proves its folds are string concatenation even when the `+` chain
   itself carries no literal, so `trail = trail + seg` vs
   `trail = seg + trail` stays distinct under that declaration.
+- Arguments beyond a boundary builtin's meaningful parameter count are
+  ignored, matching JavaScript (`xs.at(0, traceId)` ⇔ `xs.at(0)`).
+- Class property matching discounts `static` vs instance mismatches
+  (×0.4, the same treatment the method pass already applied): a static
+  field and an instance field of the same name and type live on
+  different runtime surfaces.
 - The class fingerprint boost requires signature agreement (exact or
   after fuzzy name-stripping): the fingerprint tree carries no
   TypeScript type annotations, so same-body methods over different
