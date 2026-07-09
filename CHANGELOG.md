@@ -46,6 +46,25 @@ built on.
   the structural score already discount same-name/different-body
   lookalikes. (fixes XC-P04)
 
+### Scope guards on the new detectors (review hardening)
+
+- The fold-direction atoms only fire when a chain operand is a string
+  LITERAL — the one case where the concatenation (and hence its
+  direction) is provable from syntax. Commutative numeric folds
+  (`sum += n` vs `sum = n + sum`) are never direction-capped.
+- Fold-direction targets may be member slots (`this.trail`,
+  `state.trail`), compared structurally, not just local variables.
+- `splice` boundary atoms cover only `start`/`deleteCount` (positions 0
+  and 1); arguments from position 2 onward are inserted values, so twins
+  differing there stay parameterizable data-literal duplicates.
+- The class fingerprint boost requires signature agreement (exact or
+  after fuzzy name-stripping): the fingerprint tree carries no
+  TypeScript type annotations, so same-body methods over different
+  parameter types must not match through it.
+- Index signatures never enter the rename-tolerant property phase at
+  all: `[index: string]` and `[index: number]` are different key-domain
+  contracts even when their value types agree.
+
 ### Accuracy
 
 | Engine | Corpus | Wrong labels | Error rate | Accuracy |

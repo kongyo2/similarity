@@ -612,10 +612,11 @@ pub fn find_property_matches(
     //
     // Index signatures are not renameable properties: `[index: string]:
     // boolean` admits every string key while `enabled: boolean` admits
-    // exactly one, so the rename-tolerant phase never pairs an index
-    // signature with a concrete property. Two index signatures with the
-    // same key type share their extractor-assigned name and already match
-    // in phase 1.
+    // exactly one, and `[index: number]` is a different key domain than
+    // `[index: string]` even when the value types agree. So index
+    // signatures never enter the rename-tolerant phase at all — two index
+    // signatures with the same key type share their extractor-assigned
+    // name and already matched in phase 1.
     let is_index_signature = |name: &str| name.starts_with('[');
     let mut leftovers1: Vec<&String> =
         type1.properties.keys().filter(|name| !matched1.contains(*name)).collect();
@@ -625,13 +626,16 @@ pub fn find_property_matches(
     leftovers2.sort();
 
     for prop1 in leftovers1 {
+        if is_index_signature(prop1) {
+            continue;
+        }
         let type1_annotation = &type1.properties[prop1];
         let mut best: Option<(&String, f64)> = None;
         for prop2 in &leftovers2 {
             if matched2.contains(*prop2) {
                 continue;
             }
-            if is_index_signature(prop1) != is_index_signature(prop2) {
+            if is_index_signature(prop2) {
                 continue;
             }
             let type2_annotation = &type2.properties[*prop2];
@@ -841,6 +845,19 @@ mod tests {
             0.7,
         );
         assert_eq!(matches.len(), 1);
+
+        // Different key domains are different contracts even when the
+        // value types agree: `[index: string]` admits every string key,
+        // `[index: number]` only numeric ones — the rename-tolerant
+        // phase must not unify them either.
+        let numeric_keys =
+            create_test_type("SlotMap", vec![("[index: number]", "boolean", false, false)]);
+        let matches = find_property_matches(
+            &normalize_type(&flags, &options),
+            &normalize_type(&numeric_keys, &options),
+            0.7,
+        );
+        assert!(matches.is_empty(), "string-keyed and number-keyed index signatures must not pair");
     }
 
     #[test]

@@ -491,12 +491,17 @@ fn calculate_structural_similarity(
             // (`addSample` → `recordPoint`) leaves no lexical overlap for
             // the name term, but two methods that parse to the same
             // canonical tree DO the same thing. Let the body evidence
-            // dominate the name evidence instead of averaging with it.
+            // dominate the name evidence instead of averaging with it —
+            // but only when the signatures agree (exactly or after the
+            // fuzzy name-stripping): the fingerprint tree carries no
+            // TypeScript type annotations, so `(input: string) => string`
+            // and `(input: number) => string` around the same body hash
+            // identically while exposing different public contracts.
             let fingerprints_match = matches!(
                 (method1.body_fingerprint, method2.body_fingerprint),
                 (Some(fp1), Some(fp2)) if fp1 == fp2
             );
-            if fingerprints_match {
+            if fingerprints_match && sig_match >= 0.85 {
                 score = score.max(0.95);
             }
             if best_match.is_none_or(|(_, b)| score > b) {
@@ -679,6 +684,40 @@ export class ReadingWindow {
         assert!(
             result.similarity >= 0.8,
             "fully-renamed twin with equal bodies must clear the default threshold, got {}",
+            result.similarity
+        );
+    }
+
+    #[test]
+    fn fingerprint_boost_requires_compatible_signatures() {
+        // The fingerprint tree carries no TypeScript type annotations, so
+        // two same-body methods over DIFFERENT parameter types hash
+        // identically — the boost must not fire when the (annotation-
+        // aware) signatures disagree, because the public contracts
+        // differ.
+        let result = compare_sources(
+            r"
+export class TextNormalizer {
+  private count: number = 0;
+  read(input: string): string {
+    this.count += 1;
+    return String(input);
+  }
+}
+",
+            r"
+export class CodeFormatter {
+  private total: number = 0;
+  parse(input: number): string {
+    this.total += 1;
+    return String(input);
+  }
+}
+",
+        );
+        assert!(
+            result.similarity < 0.8,
+            "same-body methods with incompatible signatures must stay below threshold, got {}",
             result.similarity
         );
     }

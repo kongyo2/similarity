@@ -874,7 +874,15 @@ fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSet
     }
     let arity = node.children.len() - 1;
     atoms.value_atoms.insert(format!("boundary:{name}/{arity}"));
+    // `splice` is the one member of the family whose trailing arguments
+    // are inserted VALUES, not positions: only `start` and `deleteCount`
+    // (positions 0 and 1) are boundaries, and twins differing in an
+    // inserted value are ordinary data-literal duplicates.
+    let boundary_positions = if name == "splice" { 2 } else { usize::MAX };
     for (position, argument) in node.children.iter().skip(1).enumerate() {
+        if position >= boundary_positions {
+            break;
+        }
         if let Some(index_literal) = static_index_literal(argument) {
             atoms
                 .value_atoms
@@ -900,37 +908,65 @@ fn static_index_literal(node: &crate::tree::TreeNode) -> Option<String> {
 
 /// Fold-direction atoms: an assignment that rebuilds its own target from a
 /// `+` chain is order-sensitive because string `+` is not commutative —
-/// `trail = trail + seg` appends while `trail = seg + trail` prepends, and
-/// the two loops produce reversed outputs. The accumulator's position in
-/// the chain (head / mid / tail) is therefore a behavioral atom. The
-/// canonicalizer already contracts `x = x + y` onto the `+=` shape (an
-/// `AssignmentExpression` labeled `Addition`), which is by construction a
-/// head fold; non-`+` operators are left alone — their swapped-operand
-/// twins already diverge structurally through the compound-contraction
-/// asymmetry.
+/// `trail = trail + seg + "/"` appends while `trail = seg + "/" + trail`
+/// prepends, and the two loops produce reversed outputs. The accumulator's
+/// position in the chain (head / mid / tail) is therefore a behavioral
+/// atom. Two deliberate scope limits:
+///
+/// * the atom only fires when a chain operand is a string LITERAL —
+///   that's the one case where the concatenation (and hence its
+///   direction) is provable from syntax. Numeric folds (`sum += n` vs
+///   `sum = n + sum`) are commutative and must not be penalized, and an
+///   untyped identifier chain could be either, so it gets no atom.
+/// * the target may be a local (`trail`) or a member slot
+///   (`this.trail`, `state.trail`) — member accumulators compare
+///   structurally via the same node hash the statement-permutation
+///   check uses.
+///
+/// The canonicalizer already contracts `x = x + y` onto the `+=` shape
+/// (an `AssignmentExpression` labeled `Addition`), which is by
+/// construction a head fold; non-`+` operators are left alone — their
+/// swapped-operand twins already diverge structurally through the
+/// compound-contraction asymmetry.
 fn collect_fold_direction_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) {
     if node.value != "AssignmentExpression" || node.children.len() != 2 {
         return;
     }
     let target = &node.children[0];
-    if !matches!(target.value.as_str(), "Identifier" | "BindingIdentifier") {
+    if !matches!(
+        target.value.as_str(),
+        "Identifier"
+            | "BindingIdentifier"
+            | "StaticMemberExpression"
+            | "PrivateFieldExpression"
+            | "ComputedMemberExpression"
+    ) {
         return;
     }
+    let chain = &node.children[1];
+    let mut leaves = Vec::new();
     if node.label == "Addition" {
-        atoms.value_atoms.insert("fold:head".to_string());
+        // Contracted `x += y` / `x = x + y`: the accumulator is the chain
+        // head; the flattened RHS supplies the string evidence.
+        flatten_addition_chain(chain, &mut leaves);
+        if leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
+            atoms.value_atoms.insert("fold:head".to_string());
+        }
         return;
     }
     if node.label != "Assign" {
         return;
     }
-    let rhs = &node.children[1];
-    if rhs.value != "BinaryExpression" || rhs.label != "Addition" {
+    if chain.value != "BinaryExpression" || chain.label != "Addition" {
         return;
     }
-    let mut leaves = Vec::new();
-    flatten_addition_chain(rhs, &mut leaves);
+    flatten_addition_chain(chain, &mut leaves);
+    if !leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
+        return;
+    }
+    let target_hash = structural_node_hash(target);
     for (position, leaf) in leaves.iter().enumerate() {
-        if leaf.value == "Identifier" && leaf.label == target.label {
+        if leaf.value == target.value && structural_node_hash(leaf) == target_hash {
             let marker = if position == 0 {
                 "fold:head"
             } else if position == leaves.len() - 1 {
@@ -1808,6 +1844,100 @@ export function buildTrailReversed(segments: string[]): string {
             "append vs prepend folds must stay below threshold, got {:?}",
             pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn splice_inserted_value_twins_stay_duplicates() {
+        // Only `start` and `deleteCount` are boundary positions on
+        // `splice`; arguments from position 2 onward are inserted VALUES,
+        // and twins differing only there are parameterizable data-literal
+        // duplicates.
+        let code = r"
+export function resetLeadingFlag(flags: number[], cursor: number): number[] {
+  if (flags.length === 0) {
+    return flags;
+  }
+  flags.splice(cursor, 1, 0);
+  return flags;
+}
+
+export function raiseLeadingFlag(flags: number[], cursor: number): number[] {
+  if (flags.length === 0) {
+    return flags;
+  }
+  flags.splice(cursor, 1, 1);
+  return flags;
+}
+";
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(
+            pairs.len(),
+            1,
+            "splice twins differing only in the inserted value must stay reportable"
+        );
+    }
+
+    #[test]
+    fn member_target_fold_direction_twins_stay_distinct() {
+        // `this.trail` / `state.trail` accumulators carry the same
+        // append-vs-prepend behavioral difference as local ones.
+        let code = r#"
+export function extendAuditTrail(state: { trail: string }, segments: string[]): void {
+  for (const segment of segments) {
+    state.trail = state.trail + segment + "/";
+  }
+}
+
+export function rewindAuditTrail(state: { trail: string }, segments: string[]): void {
+  for (const segment of segments) {
+    state.trail = segment + "/" + state.trail;
+  }
+}
+"#;
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "member-target append vs prepend folds must stay below threshold, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn folds_without_string_evidence_get_no_direction_atoms() {
+        // `+` over numbers is commutative: `sum += n` vs `sum = n + sum`
+        // is not a directional rewrite the analyzer can prove, so without
+        // a string literal in the chain the fold-direction atoms must
+        // stay silent (the pair keeps whatever score the tree distance
+        // gives it, uncapped). With a string literal in the chain the
+        // direction IS provable and the atoms fire.
+        use crate::parser::parse_and_convert_to_tree_canonical;
+
+        let fold_atoms = |source: &str| -> Vec<String> {
+            let tree = parse_and_convert_to_tree_canonical("probe.ts", source).unwrap();
+            let mut atoms = AtomSets::default();
+            collect_behavioral_atoms(&tree, &mut atoms);
+            let mut folds: Vec<String> = atoms
+                .value_atoms
+                .into_iter()
+                .filter(|atom| atom.starts_with("fold:"))
+                .collect();
+            folds.sort();
+            folds
+        };
+
+        let numeric_append =
+            "function f(xs: number[]) { let sum = 0; for (const x of xs) { sum += x; } return sum; }";
+        let numeric_prepend =
+            "function f(xs: number[]) { let sum = 0; for (const x of xs) { sum = x + sum; } return sum; }";
+        assert!(fold_atoms(numeric_append).is_empty(), "numeric append must not emit fold atoms");
+        assert!(fold_atoms(numeric_prepend).is_empty(), "numeric prepend must not emit fold atoms");
+
+        let string_append = r#"function f(xs: string[]) { let out = ""; for (const x of xs) { out = out + x + "/"; } return out; }"#;
+        let string_prepend = r#"function f(xs: string[]) { let out = ""; for (const x of xs) { out = x + "/" + out; } return out; }"#;
+        assert_eq!(fold_atoms(string_append), vec!["fold:head".to_string()]);
+        assert_eq!(fold_atoms(string_prepend), vec!["fold:tail".to_string()]);
     }
 
     #[test]
