@@ -6,6 +6,7 @@
 [![node](https://img.shields.io/node/v/@kongyo2/similarity-ts.svg)](https://www.npmjs.com/package/@kongyo2/similarity-ts)
 [![license](https://img.shields.io/npm/l/@kongyo2/similarity-ts.svg)](https://github.com/kongyo2/similarity/blob/main/LICENSE)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kongyo2/similarity)
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/kongyo2/similarity?utm_source=oss&utm_medium=github&utm_campaign=kongyo2%2Fsimilarity&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 
 TypeScript-only similarity analyzer
 
