@@ -5,6 +5,7 @@
 [![CI](https://github.com/kongyo2/similarity/actions/workflows/ci.yml/badge.svg)](https://github.com/kongyo2/similarity/actions/workflows/ci.yml)
 [![node](https://img.shields.io/node/v/@kongyo2/similarity-ts.svg)](https://www.npmjs.com/package/@kongyo2/similarity-ts)
 [![license](https://img.shields.io/npm/l/@kongyo2/similarity-ts.svg)](https://github.com/kongyo2/similarity/blob/main/LICENSE)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kongyo2/similarity)
 
 TypeScript-only similarity analyzer
 
