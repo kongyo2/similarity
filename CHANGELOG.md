@@ -1,5 +1,121 @@
 # Changelog
 
+## 0.7.0 — 2026-09-01
+
+Accuracy work driven by a real codebase. The engine was run over a snapshot
+of the TypeScript compiler repository — the `packages/typescript/src` API
+package, the VS Code extension, the AST/protocol generator scripts, and
+1,482 conformance test files — and every class of reported pair was
+audited. The mislabel families found there were added to the labeled corpus
+as 28 new ground-truth pairs (corpus now **289 pairs**); the v0.6.0 engine
+gets 20 of them wrong (6.92% error rate on the extended corpus), v0.7.0
+classifies all 289 correctly and keeps the original 261 at 100% with
+unchanged margins.
+
+### Detection accuracy
+
+- **Functions — bodiless declarations** (precision): overload signatures,
+  `declare function …;` and `abstract` methods have no body and are no
+  longer extracted. Their type-less parameter lists used to compare as
+  1.000 duplicates of each other (the `visitNode` overloads in the
+  compiler's `visitor.generated.ts`). (XF-N41)
+- **Functions — declaration scopes** (recall): function expressions bound
+  to a variable (`const f = function () {…}`), functions declared inside
+  `namespace`/`module` blocks, and arrow-function class fields
+  (`handle = (event) => {…}`) are now extracted, so their twins can be
+  found at all. (XF-P43, XF-P44, XF-P45)
+- **Functions — constructor parameter properties** (recall): the canonical
+  tree desugars `constructor(private readonly repo: Repo) {}` into the
+  `this.repo = repo;` assignments TypeScript emits (right after a leading
+  `super(…)` call when there is one), so the shorthand and the explicit
+  spelling compare as equal. (XF-P46)
+- **Types — nominal atoms**: qualified references (`SyntaxKind.Block`) and
+  literal types (`"click"`, `1`, `true`) compare nominally instead of by
+  edit distance of their spelling (`SyntaxKind.NonNullExpression` vs
+  `SyntaxKind.VoidExpression` scored 0.75 as *types*), and a same-named
+  member typed with differing literals or members of the same enum is a
+  discriminant mismatch that halves the structural evidence: the variants
+  of a discriminated union (`ForInStatement` vs `ForOfStatement`,
+  `MouseEnterEvent` vs `MouseLeaveEvent`) are distinct types however many
+  members they share. (XT-N13)
+- **Types — heritage**: `extends` clauses are part of the contract. A
+  differing or one-sided clause discounts structural similarity (×0.7);
+  the same clauses in any order are unaffected. (XT-N14, XT-P21)
+- **Types — rename evidence**: the rename-tolerant property phase needs a
+  skeleton to stand on. One-member types never pair by rename, two-member
+  shapes earn half credit, three or more full credit (the existing
+  XT-P04/T-N01 positives are unchanged), and members typed
+  `any`/`unknown`/`never` — the `_fooBrand: any` marker idiom — never pair
+  by rename. (XT-N15, XT-N16)
+- **Types — exotic type nodes**: `typeof x` queries, type predicates,
+  conditional, mapped and template-literal types and every other node
+  without a structural renderer keep their whitespace-normalized source
+  spelling instead of collapsing onto one `unknown` token that made them
+  all compare equal; `typeof`/predicate members compare by what they name.
+  (XT-N17, XT-P22)
+- **Types and classes — namespaces**: interfaces, aliases and classes
+  declared inside `namespace`/`module` blocks (including
+  `declare namespace` in declaration files) are extracted. (XT-P23, XC-P12)
+- **Classes — constructors**: a constructor that does real work is a
+  member. Its signature and canonical body (parameter properties
+  desugared) take part in the comparison, so same-fields-same-methods
+  classes whose constructors differ (one schedules a refill timer, the
+  other stores a limit) no longer compare as identical. Wiring-only
+  constructors (`super(…)` plus `this.x = x`, or the empty body of a
+  parameter-property constructor) add nothing the field list does not
+  already say and stay out, so a class that happens to have one is not
+  "missing" it on the other side. (XC-N07, XC-P11, XC-P13)
+- **Classes — heritage and tiny shapes**: one-sided `extends` discounts
+  structural similarity (×0.7), and a pair with a single member each is
+  capped like the member-less case (0.85 structural), so
+  `class Marker { id = 0 }` vs `class Slot { id = 0 }` needs naming
+  agreement to pass. (XC-N08, XC-N09)
+- **Classes — member keys**: `#private` members and computed keys
+  (`[Symbol.iterator]`) are kept as members instead of being dropped,
+  which left such classes looking member-less.
+
+### Determinism
+
+- Type mode compared declarations in `HashMap` iteration order, so which
+  side of a pair drove the greedy rename-tolerant matching changed from
+  run to run (one corpus pair scored 0.830 on one run and 0.823 on the
+  next). Declarations are now compared in file/line order; the same input
+  always yields the same report.
+
+### Weights
+
+- The APTED operation weights (rename 0.3, delete 1.0, insert 1.0) were
+  re-validated against the extended corpus following the TSED paper's RQ3
+  finding that they are influential: every setting in rename 0.2–0.5 ×
+  delete/insert 0.8–1.0 keeps 289/289 and moves the tightest margins by
+  less than 0.03, so the calibrated defaults stay.
+
+### Real-world effect
+
+Pairs reported at the default threshold on the TypeScript compiler
+repository snapshot the release was audited against:
+
+| Target | Mode | v0.6.0 | v0.7.0 |
+| --- | --- | ---: | ---: |
+| `packages/typescript/src` (108 files) | types | 685 | 419 |
+| `packages/typescript/src` | functions | 926 | 925 |
+| VS Code extension + generator scripts (27 files) | types | 16 | 5 |
+| conformance tests (1,482 files) | classes | 15,062 | 6,061 |
+| conformance tests | types | 823 | 937 |
+
+The removed type pairs are the AST-node and protocol-parameter interfaces
+that differ only in their `kind` discriminant, their heritage, or a single
+renamed member; the added conformance pairs are namespace-scoped
+declarations that were previously invisible. Scan time on the 108-file
+package moved from 10.5 s to 11.4 s.
+
+### Accuracy
+
+| Engine | Corpus | Wrong labels | Error rate | Accuracy |
+| --- | --- | ---: | ---: | ---: |
+| v0.6.0 | 289 pairs | 20 / 289 | 6.92% | 93.08% |
+| v0.7.0 | 289 pairs | 0 / 289 | 0.00% | 100.00% |
+
 ## 0.6.0 — 2026-07-09
 
 Closes out the accuracy program started in 0.5.0: the seven remaining

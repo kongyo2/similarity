@@ -545,7 +545,22 @@ fn calculate_structural_similarity(
     let matched_elements = property_score + method_score;
 
     let structural_similarity = if total_elements > 0.0 {
-        (matched_elements / total_elements).min(1.0)
+        let mut ratio = (matched_elements / total_elements).min(1.0);
+        // A single member carries about as much evidence as none: `class
+        // Foo { x = 1 }` and `class Bar { x = 1 }` agree on one field and
+        // nothing else, so — like the member-less case below — a tiny shape
+        // needs naming agreement to clear the default threshold.
+        if total_elements <= 2.0 {
+            ratio = ratio.min(0.85);
+        }
+        // Inheriting from a base class is a contract the other side lacks
+        // (inherited members, `super` dispatch, `instanceof` identity):
+        // `class AuditLog extends EventEmitter { … }` is not a duplicate of
+        // a standalone class with the same own members.
+        if class1.extends.is_some() != class2.extends.is_some() {
+            ratio *= 0.7;
+        }
+        ratio
     } else {
         // Two member-less classes: everything they DO comes from their
         // heritage, so "identical" is only justified when the heritage
@@ -791,6 +806,112 @@ export class GapTracker {
             result.similarity < 0.8,
             "different-body lookalikes must stay below the default threshold, got {}",
             result.similarity
+        );
+    }
+
+    #[test]
+    fn constructor_work_counts() {
+        // XC-N07 shape: same field and method, but one constructor also
+        // schedules a refill timer.
+        let result = compare_sources(
+            r"
+export class RetryBudget {
+  remaining: number;
+  constructor(limit: number) {
+    this.remaining = limit;
+  }
+  spend(): boolean {
+    if (this.remaining <= 0) return false;
+    this.remaining -= 1;
+    return true;
+  }
+}
+",
+            r"
+export class TokenBucket {
+  remaining: number;
+  constructor(limit: number, refillMs: number) {
+    this.remaining = limit;
+    setInterval(() => { this.remaining = limit; }, refillMs);
+  }
+  spend(): boolean {
+    if (this.remaining <= 0) return false;
+    this.remaining -= 1;
+    return true;
+  }
+}
+",
+        );
+        assert!(
+            result.similarity < 0.8,
+            "divergent constructors must stay below threshold, got {}",
+            result.similarity
+        );
+    }
+
+    #[test]
+    fn one_sided_heritage_is_discounted() {
+        // XC-N08 shape.
+        let result = compare_sources(
+            r"
+export class AuditLog extends EventEmitter {
+  private entries: string[] = [];
+  record(entry: string): void { this.entries.push(entry); }
+  snapshot(): string[] { return [...this.entries]; }
+}
+",
+            r"
+export class TraceLog {
+  private entries: string[] = [];
+  record(entry: string): void { this.entries.push(entry); }
+  snapshot(): string[] { return [...this.entries]; }
+}
+",
+        );
+        assert!(
+            result.similarity < 0.8,
+            "one-sided extends must stay below threshold, got {}",
+            result.similarity
+        );
+        let same_base = compare_sources(
+            r"
+export class AuditLog extends EventEmitter {
+  private entries: string[] = [];
+  record(entry: string): void { this.entries.push(entry); }
+}
+",
+            r"
+export class TraceLog extends EventEmitter {
+  private entries: string[] = [];
+  record(entry: string): void { this.entries.push(entry); }
+}
+",
+        );
+        assert!(
+            same_base.similarity >= 0.9,
+            "shared heritage must not be penalized, got {}",
+            same_base.similarity
+        );
+    }
+
+    #[test]
+    fn single_member_classes_need_naming_agreement() {
+        // XC-N09 shape.
+        let unrelated =
+            compare_sources("export class Marker { id = 0; }", "export class Slot { id = 0; }");
+        assert!(
+            unrelated.similarity < 0.8,
+            "one shared field is not a duplicate class, got {}",
+            unrelated.similarity
+        );
+        let related = compare_sources(
+            "export class FeatureFlag { enabled = false; }",
+            "export class FeatureFlagCopy { enabled = false; }",
+        );
+        assert!(
+            related.similarity >= 0.8,
+            "matching names plus the same member still pass, got {}",
+            related.similarity
         );
     }
 }

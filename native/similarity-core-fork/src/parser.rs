@@ -3812,6 +3812,68 @@ fn function_body_to_tree_node(body: &FunctionBody, id_counter: &mut usize) -> Op
     Some(Rc::new(node))
 }
 
+/// Canonical constructor body. TypeScript parameter properties
+/// (`constructor(private readonly repo: Repo) {}`) are sugar for an
+/// explicit field assignment, so the body is converted with the
+/// `this.repo = repo;` statements the compiler emits — right after a
+/// leading `super(…)` call when there is one, at the top otherwise. The
+/// shorthand and the explicit `constructor(repo: Repo) { this.repo =
+/// repo; }` spelling then produce identical trees, in the function
+/// comparator and in the class comparator's method fingerprints alike.
+fn constructor_body_to_tree_node(
+    function: &Function,
+    body: &FunctionBody,
+    id_counter: &mut usize,
+) -> Option<Rc<TreeNode>> {
+    let mut node =
+        TreeNode::new("BlockStatement".to_string(), "BlockStatement".to_string(), *id_counter);
+    *id_counter += 1;
+
+    let mut statements = Vec::with_capacity(body.statements.len() + function.params.items.len());
+    for stmt in &body.statements {
+        statements.extend(statement_to_tree_nodes(stmt, id_counter));
+    }
+
+    let mut synthesized = Vec::new();
+    for param in &function.params.items {
+        let is_property = param.accessibility.is_some() || param.readonly || param.r#override;
+        if !is_property {
+            continue;
+        }
+        let BindingPattern::BindingIdentifier(ident) = &param.pattern else {
+            continue;
+        };
+        // `this.<name> = <name>;` — the same shape `statement_to_tree_node`
+        // builds for the hand-written assignment.
+        let mut member = make_node(".", "StaticMemberExpression", id_counter);
+        member.add_child(leaf("ThisExpression", "ThisExpression", id_counter));
+        member.add_child(leaf(ident.name.as_str(), "Identifier", id_counter));
+        let mut assign = make_node("Assign", "AssignmentExpression", id_counter);
+        assign.add_child(Rc::new(member));
+        assign.add_child(leaf(&identifier_label(ident.span, &ident.name), "Identifier", id_counter));
+        let mut stmt = make_node("ExpressionStatement", "ExpressionStatement", id_counter);
+        stmt.add_child(Rc::new(assign));
+        synthesized.push(Rc::new(stmt));
+    }
+    let insert_at = usize::from(statements.first().is_some_and(|first| node_is_super_call(first)));
+    statements.splice(insert_at..insert_at, synthesized);
+    normalize_statement_nodes(&mut statements, id_counter);
+    for child in statements {
+        node.add_child(child);
+    }
+
+    Some(Rc::new(node))
+}
+
+/// `super(…);` in statement position (already converted).
+fn node_is_super_call(node: &TreeNode) -> bool {
+    node.value == "ExpressionStatement"
+        && node.children.first().is_some_and(|expr| {
+            expr.value == "CallExpression"
+                && expr.children.first().is_some_and(|callee| callee.value == "Super")
+        })
+}
+
 fn block_statement_to_tree_node(
     block: &BlockStatement,
     id_counter: &mut usize,
@@ -3876,7 +3938,14 @@ fn class_element_to_tree_node(
                 }
             }
             if let Some(body) = &method.value.body {
-                if let Some(body_node) = function_body_to_tree_node(body, id_counter) {
+                let body_node = if canonicalize_enabled()
+                    && method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor
+                {
+                    constructor_body_to_tree_node(&method.value, body, id_counter)
+                } else {
+                    function_body_to_tree_node(body, id_counter)
+                };
+                if let Some(body_node) = body_node {
                     node.add_child(body_node);
                 }
             }
@@ -4665,6 +4734,32 @@ function f(code: number) {
   if (0 === lines.length) return "none";
   return lines.join(", ");
 }"#,
+        );
+    }
+
+    // -- constructor parameter properties -----------------------------------
+
+    #[test]
+    fn parameter_properties_equal_explicit_field_assignments() {
+        assert_canonically_equal(
+            "class A { constructor(private readonly repo: Repo, public clock: Clock) { this.startedAt = clock.now(); } }",
+            "class A { constructor(repo: Repo, clock: Clock) { this.repo = repo; this.clock = clock; this.startedAt = clock.now(); } }",
+        );
+    }
+
+    #[test]
+    fn parameter_property_assignments_follow_the_super_call() {
+        assert_canonically_equal(
+            "class A extends B { constructor(private readonly repo: Repo) { super(); } }",
+            "class A extends B { constructor(repo: Repo) { super(); this.repo = repo; } }",
+        );
+    }
+
+    #[test]
+    fn plain_constructor_parameters_are_not_desugared() {
+        assert_canonically_distinct(
+            "class A { constructor(repo: Repo) { this.other = repo; } }",
+            "class A { constructor(repo: Repo) { this.repo = repo; this.other = repo; } }",
         );
     }
 }

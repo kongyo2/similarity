@@ -9,6 +9,9 @@ pub struct NormalizedType {
     pub signature: String, // 正規化された型シグネチャ
     pub original_name: String,
     pub kind: TypeKind,
+    /// Sorted, deduplicated `extends` clause (interfaces only; empty for
+    /// aliases and literals).
+    pub extends: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +89,10 @@ pub fn normalize_type(type_def: &TypeDefinition, options: &NormalizationOptions)
         options.ignore_property_order,
     );
 
+    let mut extends = type_def.extends.clone();
+    extends.sort();
+    extends.dedup();
+
     NormalizedType {
         properties,
         optional_properties,
@@ -93,6 +100,7 @@ pub fn normalize_type(type_def: &TypeDefinition, options: &NormalizationOptions)
         signature,
         original_name: type_def.name.clone(),
         kind: type_def.kind.clone(),
+        extends,
     }
 }
 
@@ -485,12 +493,39 @@ pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
         (None, None) => {}
     }
 
-    // Bare type references are nominal: `ShopUser` vs `ShopOrder` are
-    // unrelated contracts no matter how many characters they share, so
-    // don't let Levenshtein closeness of the NAMES manufacture type
-    // similarity.
-    if is_bare_type_reference(&normalized1) && is_bare_type_reference(&normalized2) {
-        return if normalized1 == normalized2 { 1.0 } else { 0.2 };
+    // `typeof x` queries and `x is T` predicates compare by what they
+    // name / narrow to, not by the shared keyword text around it.
+    if let (Some(query1), Some(query2)) =
+        (typeof_query_operand(&normalized1), typeof_query_operand(&normalized2))
+    {
+        return calculate_type_similarity(query1, query2);
+    }
+    if let (Some(target1), Some(target2)) =
+        (type_predicate_target(&normalized1), type_predicate_target(&normalized2))
+    {
+        return calculate_type_similarity(target1, target2);
+    }
+
+    // Bare type references — including qualified ones (`SyntaxKind.Block`)
+    // and literal types (`"click"`) — are nominal: `ShopUser` vs
+    // `ShopOrder`, `SyntaxKind.Block` vs `SyntaxKind.Identifier`, and
+    // `"mouse-enter"` vs `"mouse-leave"` are unrelated contracts no matter
+    // how many characters they share, so don't let Levenshtein closeness
+    // of the SPELLINGS manufacture type similarity. (Discriminated-union
+    // members and enum-keyed `kind` fields used to score ~0.9 on exactly
+    // that closeness.)
+    if is_nominal_atom(&normalized1) && is_nominal_atom(&normalized2) {
+        if normalized1 == normalized2 {
+            return 1.0;
+        }
+        // Two different literal types are disjoint singletons — nothing in
+        // common at all — whereas two different references may still be
+        // structurally related underneath, hence the small floor.
+        return if is_literal_type(&normalized1) && is_literal_type(&normalized2) {
+            0.0
+        } else {
+            0.2
+        };
     }
 
     // For other (structured) types, use string similarity
@@ -545,10 +580,67 @@ fn parse_generic_reference(type_name: &str) -> Option<(&str, Vec<String>)> {
     Some((base, args))
 }
 
-/// A single identifier-shaped type token (`User`, `string`, `#0`).
+/// A single identifier-shaped type token (`User`, `string`, `#0`), or a
+/// qualified one (`SyntaxKind.Block`, `React.FC`).
 fn is_bare_type_reference(type_name: &str) -> bool {
     !type_name.is_empty()
-        && type_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '#' || c == '$')
+        && type_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '.')
+}
+
+/// A string-literal type (`"click"`), as rendered by the extractor.
+fn is_string_literal_type(type_name: &str) -> bool {
+    type_name.len() >= 2 && type_name.starts_with('"') && type_name.ends_with('"')
+}
+
+/// A literal type: `"click"`, `42`, `true`.
+fn is_literal_type(type_name: &str) -> bool {
+    is_string_literal_type(type_name)
+        || matches!(type_name, "true" | "false")
+        || type_name.parse::<f64>().is_ok()
+}
+
+/// Types that are equal only to themselves: references (nominal) and
+/// literal types (disjoint singletons).
+fn is_nominal_atom(type_name: &str) -> bool {
+    is_bare_type_reference(type_name) || is_string_literal_type(type_name)
+}
+
+/// Two normalized annotations that are both literal types, or both members
+/// of the same enum-like qualifier (`SyntaxKind.A` / `SyntaxKind.B`), and
+/// differ — the discriminated-union signature of two distinct variants.
+pub(crate) fn is_discriminant_mismatch(type1: &str, type2: &str) -> bool {
+    if type1 == type2 {
+        return false;
+    }
+    if is_literal_type(type1) && is_literal_type(type2) {
+        return true;
+    }
+    match (type1.rsplit_once('.'), type2.rsplit_once('.')) {
+        (Some((qualifier1, _)), Some((qualifier2, _))) => {
+            qualifier1 == qualifier2
+                && is_bare_type_reference(type1)
+                && is_bare_type_reference(type2)
+        }
+        _ => false,
+    }
+}
+
+/// The `x` of a `typeof x` type query.
+fn typeof_query_operand(type_name: &str) -> Option<&str> {
+    let operand = type_name.strip_prefix("typeof ")?.trim();
+    (!operand.is_empty()).then_some(operand)
+}
+
+/// The `T` of a `x is T` / `asserts x is T` type predicate.
+fn type_predicate_target(type_name: &str) -> Option<&str> {
+    let rest = type_name.strip_prefix("asserts ").unwrap_or(type_name);
+    let (subject, target) = rest.split_once(" is ")?;
+    let subject_is_identifier = !subject.is_empty()
+        && subject.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+    let target = target.trim();
+    (subject_is_identifier && !target.is_empty()).then_some(target)
 }
 
 /// Calculate similarity between union types
@@ -660,6 +752,17 @@ pub fn find_property_matches(
     // signatures with the same key type share their extractor-assigned
     // name and already matched in phase 1.
     let is_index_signature = |name: &str| name.starts_with('[');
+    // A renamed-property match is only evidence when the type skeleton is
+    // distinctive enough to carry it. One property renamed (`{ version:
+    // string }` vs `{ resultingAction: string }`) shares nothing but a
+    // primitive; two share a coin flip; from three members on, a fully
+    // consistent skeleton is the rename-twin signal this phase exists for.
+    // Properties annotated `any`/`unknown`/`never` carry no skeleton at all
+    // (the `_fooBrand: any` marker idiom) and never pair by rename.
+    let smaller_member_count = type1.properties.len().min(type2.properties.len());
+    #[allow(clippy::cast_precision_loss)]
+    let rename_confidence = ((smaller_member_count as f64 - 1.0) / 2.0).clamp(0.0, 1.0);
+    let is_uninformative = |annotation: &str| matches!(annotation, "any" | "unknown" | "never");
     let mut leftovers1: Vec<&String> =
         type1.properties.keys().filter(|name| !matched1.contains(*name)).collect();
     let mut leftovers2: Vec<&String> =
@@ -668,10 +771,16 @@ pub fn find_property_matches(
     leftovers2.sort();
 
     for prop1 in leftovers1 {
+        if rename_confidence <= 0.0 {
+            break;
+        }
         if is_index_signature(prop1) {
             continue;
         }
         let type1_annotation = &type1.properties[prop1];
+        if is_uninformative(type1_annotation) {
+            continue;
+        }
         let mut best: Option<(&String, f64)> = None;
         for prop2 in &leftovers2 {
             if matched2.contains(*prop2) {
@@ -690,7 +799,7 @@ pub fn find_property_matches(
         }
         if let Some((prop2, name_similarity)) = best {
             matched2.insert(prop2);
-            let overall_similarity = 0.95 * optionality_factor(prop1, prop2);
+            let overall_similarity = 0.95 * optionality_factor(prop1, prop2) * rename_confidence;
             matches.push(PropertyMatch {
                 prop1: prop1.clone(),
                 prop2: prop2.clone(),
@@ -937,5 +1046,119 @@ mod tests {
         // arguments of the generic are still seen.
         let normalized = normalize_type_name("Result<() => string, Error>");
         assert_eq!(normalized, "Result<() => string, Error>");
+    }
+
+    #[test]
+    fn qualified_and_literal_types_are_nominal() {
+        // XT-N13 shape: enum-member and string-literal discriminants used
+        // to score by edit distance of their spellings.
+        assert_eq!(calculate_type_similarity("SyntaxKind.Block", "SyntaxKind.Identifier"), 0.2);
+        assert_eq!(calculate_type_similarity("SyntaxKind.Block", "SyntaxKind.Block"), 1.0);
+        assert_eq!(calculate_type_similarity("\"mouse-enter\"", "\"mouse-leave\""), 0.0);
+        assert_eq!(calculate_type_similarity("\"click\"", "\"click\""), 1.0);
+        assert_eq!(calculate_type_similarity("1", "2"), 0.0);
+        assert_eq!(calculate_type_similarity("true", "false"), 0.0);
+    }
+
+    #[test]
+    fn typeof_queries_and_predicates_compare_their_targets() {
+        assert_eq!(calculate_type_similarity("typeof stringSource", "typeof numberSource"), 0.2);
+        assert_eq!(calculate_type_similarity("typeof source", "typeof source"), 1.0);
+        assert_eq!(calculate_type_similarity("value is string", "value is number"), 0.2);
+        assert_eq!(calculate_type_similarity("value is string", "input is string"), 1.0);
+        assert_eq!(
+            calculate_type_similarity("asserts value is string", "asserts value is string"),
+            1.0
+        );
+        let guard = calculate_type_similarity(
+            "(value: unknown) => value is string",
+            "(value: unknown) => value is number",
+        );
+        assert!(guard < 0.6, "the narrowed type must dominate a predicate, got {guard}");
+    }
+
+    #[test]
+    fn rename_matches_need_shape_evidence() {
+        let options = NormalizationOptions::default();
+        // One renamed property carries no evidence at all (XT-N16).
+        let start = create_test_type("LSServerStart", vec![("version", "string", false, false)]);
+        let error =
+            create_test_type("LSConnectionError", vec![("resultingAction", "string", false, false)]);
+        let matches = find_property_matches(
+            &normalize_type(&start, &options),
+            &normalize_type(&error, &options),
+            0.7,
+        );
+        assert!(matches.is_empty(), "a single renamed property must not pair: {matches:?}");
+
+        // Two members: half credit.
+        let package = create_test_type(
+            "PackageInfo",
+            vec![("name", "string", false, false), ("version", "string", false, false)],
+        );
+        let marker = create_test_type(
+            "KindMarkerInfo",
+            vec![("name", "string", false, false), ("value", "string", false, false)],
+        );
+        let matches = find_property_matches(
+            &normalize_type(&package, &options),
+            &normalize_type(&marker, &options),
+            0.7,
+        );
+        let renamed = matches.iter().find(|m| m.prop1 == "version").expect("version pairs with value");
+        assert!((renamed.overall_similarity - 0.475).abs() < 1e-9, "got {}", renamed.overall_similarity);
+
+        // Three members: full rename credit (the XT-P04 skeleton).
+        let address = create_test_type(
+            "ShippingAddress",
+            vec![
+                ("street", "string", false, false),
+                ("city", "string", false, false),
+                ("zip", "string", false, false),
+            ],
+        );
+        let location = create_test_type(
+            "MailingLocation",
+            vec![
+                ("line", "string", false, false),
+                ("town", "string", false, false),
+                ("postal", "string", false, false),
+            ],
+        );
+        let matches = find_property_matches(
+            &normalize_type(&address, &options),
+            &normalize_type(&location, &options),
+            0.7,
+        );
+        assert_eq!(matches.len(), 3);
+        assert!(matches.iter().all(|m| (m.overall_similarity - 0.95).abs() < 1e-9));
+    }
+
+    #[test]
+    fn any_typed_markers_never_pair_by_rename() {
+        // XT-N15 shape: brand interfaces exist to be distinct.
+        let options = NormalizationOptions::default();
+        let expression = create_test_type(
+            "ExpressionBase",
+            vec![
+                ("_expressionBrand", "any", false, false),
+                ("pos", "number", false, false),
+                ("end", "number", false, false),
+            ],
+        );
+        let statement = create_test_type(
+            "StatementBase",
+            vec![
+                ("_statementBrand", "any", false, false),
+                ("pos", "number", false, false),
+                ("end", "number", false, false),
+            ],
+        );
+        let matches = find_property_matches(
+            &normalize_type(&expression, &options),
+            &normalize_type(&statement, &options),
+            0.7,
+        );
+        assert_eq!(matches.len(), 2, "only the exact-name members pair: {matches:?}");
     }
 }

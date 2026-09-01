@@ -1168,4 +1168,79 @@ export function buildTrailReversed(segments: string[]): string {
     },
     forbidPairs: [["buildTrailForward", "buildTrailReversed"]],
   },
+
+  // -------------------------------------------------------------------
+  // signature-only — declarations without a body. Modeled on the
+  // `visitNode` overload signatures in the TypeScript compiler's
+  // `visitor.generated.ts`, which v0.6.0 reported as 1.000 duplicates of
+  // each other: their (type-less) parameter lists are identical, but there
+  // is no code behind them to deduplicate.
+  // -------------------------------------------------------------------
+  {
+    id: "XF-N41",
+    mode: "functions",
+    category: "signature-only",
+    description:
+      "Overload signatures, ambient declarations, and abstract methods have no body, so there is nothing to deduplicate; the two implementations are the positive control",
+    files: {
+      "visitor.ts": `
+export function visitNode<TIn extends Node | undefined, TOut extends Node>(
+  node: TIn,
+  visitor: Visitor,
+  test: (node: Node) => node is TOut,
+): TOut | (TIn & undefined);
+export function visitNode<TIn extends Node | undefined>(
+  node: TIn,
+  visitor: Visitor,
+  test?: (node: Node) => boolean,
+): Node | (TIn & undefined);
+export function visitNode(node: Node | undefined, visitor: Visitor, test?: (node: Node) => boolean): Node | undefined {
+  if (node === undefined) {
+    return node;
+  }
+  const visited = visitor(node);
+  if (visited !== undefined && test && !test(visited)) {
+    throw new Error("visitor produced an unexpected node");
+  }
+  return visited;
+}
+
+export function walkNode(node: Node | undefined, visitor: Visitor, test?: (node: Node) => boolean): Node | undefined {
+  if (node === undefined) {
+    return node;
+  }
+  const visited = visitor(node);
+  if (visited !== undefined && test && !test(visited)) {
+    throw new Error("visitor produced an unexpected node");
+  }
+  return visited;
+}
+
+declare function readBuffer(
+  path: string,
+  encoding: "utf8",
+): string;
+declare function readBuffer(
+  path: string,
+  encoding: "binary",
+): Uint8Array;
+
+export abstract class RecordStore {
+  abstract find(
+    id: string,
+    tenant: string,
+  ): Promise<string>;
+  abstract remove(
+    id: string,
+    tenant: string,
+  ): Promise<string>;
+}
+`,
+    },
+    expectPairs: [["visitNode", "walkNode"]],
+    forbidPairs: [
+      ["readBuffer", "readBuffer"],
+      ["find", "remove"],
+    ],
+  },
 ];

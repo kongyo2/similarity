@@ -324,39 +324,72 @@ impl TypeExtractor {
         let mut types = Vec::new();
 
         for stmt in &ret.program.body {
-            match stmt {
-                Statement::TSInterfaceDeclaration(interface) => {
-                    if let Some(type_def) = self.extract_interface(interface) {
-                        types.push(type_def);
-                    }
-                }
-                Statement::TSTypeAliasDeclaration(type_alias) => {
-                    if let Some(type_def) = self.extract_type_alias(type_alias) {
-                        types.push(type_def);
-                    }
-                }
-                Statement::ExportNamedDeclaration(export) => {
-                    if let Some(decl) = &export.declaration {
-                        match decl {
-                            oxc_ast::ast::Declaration::TSInterfaceDeclaration(interface) => {
-                                if let Some(type_def) = self.extract_interface(interface) {
-                                    types.push(type_def);
-                                }
-                            }
-                            oxc_ast::ast::Declaration::TSTypeAliasDeclaration(type_alias) => {
-                                if let Some(type_def) = self.extract_type_alias(type_alias) {
-                                    types.push(type_def);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
+            self.extract_types_from_statement(stmt, &mut types);
         }
 
         Ok(types)
+    }
+
+    fn extract_types_from_statement(&self, stmt: &Statement, types: &mut Vec<TypeDefinition>) {
+        match stmt {
+            Statement::TSInterfaceDeclaration(interface) => {
+                if let Some(type_def) = self.extract_interface(interface) {
+                    types.push(type_def);
+                }
+            }
+            Statement::TSTypeAliasDeclaration(type_alias) => {
+                if let Some(type_def) = self.extract_type_alias(type_alias) {
+                    types.push(type_def);
+                }
+            }
+            Statement::TSModuleDeclaration(module) => {
+                self.extract_types_from_module(module, types);
+            }
+            Statement::ExportNamedDeclaration(export) => {
+                if let Some(decl) = &export.declaration {
+                    match decl {
+                        oxc_ast::ast::Declaration::TSInterfaceDeclaration(interface) => {
+                            if let Some(type_def) = self.extract_interface(interface) {
+                                types.push(type_def);
+                            }
+                        }
+                        oxc_ast::ast::Declaration::TSTypeAliasDeclaration(type_alias) => {
+                            if let Some(type_def) = self.extract_type_alias(type_alias) {
+                                types.push(type_def);
+                            }
+                        }
+                        oxc_ast::ast::Declaration::TSModuleDeclaration(module) => {
+                            self.extract_types_from_module(module, types);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `namespace`/`module` blocks (including `declare namespace` in
+    /// declaration files) are ordinary declaration scopes for the
+    /// interfaces and aliases inside them; they used to be skipped.
+    fn extract_types_from_module(
+        &self,
+        module: &oxc_ast::ast::TSModuleDeclaration,
+        types: &mut Vec<TypeDefinition>,
+    ) {
+        let Some(body) = &module.body else {
+            return;
+        };
+        match body {
+            oxc_ast::ast::TSModuleDeclarationBody::TSModuleDeclaration(inner) => {
+                self.extract_types_from_module(inner, types);
+            }
+            oxc_ast::ast::TSModuleDeclarationBody::TSModuleBlock(block) => {
+                for stmt in &block.body {
+                    self.extract_types_from_statement(stmt, types);
+                }
+            }
+        }
     }
 
     pub fn extract_type_literals(&self) -> Result<Vec<TypeLiteralDefinition>, String> {
@@ -630,7 +663,25 @@ impl TypeExtractor {
         })
     }
 
-    #[allow(clippy::only_used_in_recursion)]
+    /// Faithful spelling for type nodes without a structural renderer
+    /// (`typeof x`, conditional / mapped / template-literal types, `x is T`
+    /// predicates, `import("./m").T`, …). Collapsing all of them onto one
+    /// `unknown` token made every such property compare EQUAL — `guard: (v)
+    /// => v is string` matched `guard: (v) => v is number`. The source text,
+    /// with whitespace and comments normalized, keeps distinct spellings
+    /// distinct.
+    fn source_type_text(&self, ts_type: &TSType) -> String {
+        let (start, end) = ts_type_span(ts_type);
+        let (start, end) = (start as usize, end as usize);
+        if start < end && end <= self.source_text.len() {
+            let collapsed = collapse_whitespace_outside_strings(&self.source_text[start..end]);
+            if !collapsed.is_empty() {
+                return collapsed;
+            }
+        }
+        "unknown".to_string()
+    }
+
     fn extract_type_string(&self, ts_type: &TSType) -> String {
         match ts_type {
             TSType::TSStringKeyword(_) => "string".to_string(),
@@ -730,7 +781,7 @@ impl TypeExtractor {
                 }
                 oxc_ast::ast::TSLiteral::NumericLiteral(num_lit) => num_lit.value.to_string(),
                 oxc_ast::ast::TSLiteral::BooleanLiteral(bool_lit) => bool_lit.value.to_string(),
-                _ => "unknown".to_string(),
+                _ => self.source_type_text(ts_type),
             },
             TSType::TSFunctionType(func_type) => {
                 let params = self.extract_function_params(&func_type.params);
@@ -756,7 +807,7 @@ impl TypeExtractor {
                 members.sort();
                 format!("{{ {} }}", members.join("; "))
             }
-            _ => "unknown".to_string(),
+            _ => self.source_type_text(ts_type),
         }
     }
 
@@ -1326,5 +1377,52 @@ export type Bag<U> = U[];
         assert_eq!(bodies.len(), 2);
         assert_eq!(bodies[0], bodies[1], "positional substitution must unify {bodies:?}");
         assert!(bodies[0].contains("#0"));
+    }
+
+    #[test]
+    fn exotic_type_nodes_render_from_source() {
+        // XT-N17 shape: these all used to collapse onto one `unknown`.
+        let code = r"
+declare const stringSource: { read(): string };
+export interface Channel {
+  guard: (value: unknown) => value is string;
+  source: typeof stringSource;
+  mapped: { [K in keyof Options]?: Options[K] };
+  conditional: T extends string ? 'text' : 'other';
+  template: `${string}px`;
+}
+";
+        let types = extract_types_from_code(code, "test.ts").unwrap();
+        let channel = types.iter().find(|t| t.name == "Channel").unwrap();
+        let annotation = |name: &str| {
+            channel.properties.iter().find(|p| p.name == name).unwrap().type_annotation.clone()
+        };
+        assert_eq!(annotation("guard"), "(value: unknown) => value is string");
+        assert_eq!(annotation("source"), "typeof stringSource");
+        assert_eq!(annotation("mapped"), "{ [K in keyof Options]?: Options[K] }");
+        assert_eq!(annotation("conditional"), "T extends string ? 'text' : 'other'");
+        assert_eq!(annotation("template"), "`${string}px`");
+    }
+
+    #[test]
+    fn namespace_scoped_types_are_extracted() {
+        let code = r"
+export namespace Legacy {
+  export interface Options {
+    host: string;
+  }
+  export namespace Inner {
+    export type Mode = 'a' | 'b';
+  }
+}
+declare namespace Ambient {
+  interface Hidden {
+    id: number;
+  }
+}
+";
+        let types = extract_types_from_code(code, "test.ts").unwrap();
+        let names: Vec<&str> = types.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["Options", "Mode", "Hidden"]);
     }
 }
