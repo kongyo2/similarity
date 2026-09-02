@@ -1239,6 +1239,7 @@ export abstract class RecordStore {
     },
     expectPairs: [["visitNode", "walkNode"]],
     forbidPairs: [
+      ["visitNode", "visitNode"],
       ["readBuffer", "readBuffer"],
       ["find", "remove"],
     ],

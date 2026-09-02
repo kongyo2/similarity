@@ -1579,4 +1579,61 @@ export class ReceiptLookup {
     },
     expectPairs: [["constructor", "constructor"]],
   },
+  {
+    id: "XF-P47",
+    mode: "functions",
+    category: "declaration-scope",
+    description:
+      "Named function expressions that recurse through their own name; the inner names differ, the variables differ",
+    files: {
+      "a.ts": `
+export const factorial = function recur(n: number): number {
+  if (n <= 1) {
+    return 1;
+  }
+  return n * recur(n - 1);
+};
+`,
+      "b.ts": `
+export const fact = function go(n: number): number {
+  if (n <= 1) {
+    return 1;
+  }
+  return n * go(n - 1);
+};
+`,
+    },
+    expectPairs: [["factorial", "fact"]],
+  },
+  {
+    id: "XF-P48",
+    mode: "functions",
+    category: "declaration-scope",
+    description: "A method of a default-exported class vs the same method in a named class",
+    files: {
+      "relay.ts": `
+export default class Relay {
+  constructor(private readonly sink: (event: string) => void) {}
+  handle(event: string): void {
+    if (!event) {
+      return;
+    }
+    this.sink(event.trim());
+  }
+}
+`,
+      "tap-relay.ts": `
+export class TapRelay {
+  constructor(private readonly sink: (event: string) => void) {}
+  handle(event: string): void {
+    if (!event) {
+      return;
+    }
+    this.sink(event.trim());
+  }
+}
+`,
+    },
+    expectPairs: [["handle", "handle"]],
+  },
 ];

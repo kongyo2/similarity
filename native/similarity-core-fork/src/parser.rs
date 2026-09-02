@@ -3815,8 +3815,8 @@ fn function_body_to_tree_node(body: &FunctionBody, id_counter: &mut usize) -> Op
 /// Canonical constructor body. TypeScript parameter properties
 /// (`constructor(private readonly repo: Repo) {}`) are sugar for an
 /// explicit field assignment, so the body is converted with the
-/// `this.repo = repo;` statements the compiler emits — right after a
-/// leading `super(…)` call when there is one, at the top otherwise. The
+/// `this.repo = repo;` statements the compiler emits — right after the
+/// top-level `super(…)` call when there is one, at the top otherwise. The
 /// shorthand and the explicit `constructor(repo: Repo) { this.repo =
 /// repo; }` spelling then produce identical trees, in the function
 /// comparator and in the class comparator's method fingerprints alike.
@@ -3855,7 +3855,14 @@ fn constructor_body_to_tree_node(
         stmt.add_child(Rc::new(assign));
         synthesized.push(Rc::new(stmt));
     }
-    let insert_at = usize::from(statements.first().is_some_and(|first| node_is_super_call(first)));
+    // The compiler emits the assignments right after the constructor's
+    // top-level `super(…)` call, which (since TS 4.6) may be preceded by
+    // statements that do not touch `this`; a constructor without one gets
+    // them at the top.
+    let insert_at = statements
+        .iter()
+        .position(|stmt| node_is_super_call(stmt))
+        .map_or(0, |index| index + 1);
     statements.splice(insert_at..insert_at, synthesized);
     normalize_statement_nodes(&mut statements, id_counter);
     for child in statements {
@@ -4752,6 +4759,16 @@ function f(code: number) {
         assert_canonically_equal(
             "class A extends B { constructor(private readonly repo: Repo) { super(); } }",
             "class A extends B { constructor(repo: Repo) { super(); this.repo = repo; } }",
+        );
+        // Statements may precede `super()` (TS 4.6+); the assignments
+        // still land right after it, never ahead of it.
+        assert_canonically_equal(
+            "class A extends B { constructor(private readonly repo: Repo) { logStart(); super(); } }",
+            "class A extends B { constructor(repo: Repo) { logStart(); super(); this.repo = repo; } }",
+        );
+        assert_canonically_distinct(
+            "class A extends B { constructor(private readonly repo: Repo) { logStart(); super(); } }",
+            "class A extends B { constructor(repo: Repo) { this.repo = repo; logStart(); super(); } }",
         );
     }
 

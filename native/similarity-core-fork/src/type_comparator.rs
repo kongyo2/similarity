@@ -686,7 +686,7 @@ mod tests {
     fn heritage_is_part_of_the_contract() {
         // XT-N14 shape: identical own members, one side extends a base.
         let options = TypeComparisonOptions::default();
-        fn members<'a>(names: [&'a str; 3]) -> Vec<(&'a str, &'a str, bool, bool)> {
+        fn members(names: [&str; 3]) -> Vec<(&str, &str, bool, bool)> {
             names.iter().map(|name| (*name, "string", false, false)).collect()
         }
         let mut with_base = create_test_type("AuditEvent", members(["actorId", "action", "targetId"]));

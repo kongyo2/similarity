@@ -1149,6 +1149,99 @@ export interface ConnectionOptions {
 }
 `,
     },
-    expectPairs: [["Options", "ConnectionOptions"]],
+    expectPairs: [["Legacy.Options", "ConnectionOptions"]],
+  },
+
+  // -------------------------------------------------------------------
+  // heritage arguments — `extends Box<string>` and `extends Box<number>`
+  // inherit different members; the bare base name is not the contract.
+  // -------------------------------------------------------------------
+  {
+    id: "XT-N18",
+    mode: "types",
+    category: "heritage",
+    description:
+      "Identical own members under differently instantiated bases; the same instantiation is the positive control",
+    files: {
+      "string-box.ts": `
+export interface StringBox extends Box<string> {
+  id: number;
+  label: string;
+  createdAt: number;
+}
+`,
+      "number-box.ts": `
+export interface NumberBox extends Box<number> {
+  id: number;
+  label: string;
+  createdAt: number;
+}
+`,
+      "text-box.ts": `
+export interface TextBox extends Box<string> {
+  id: number;
+  label: string;
+  createdAt: number;
+}
+`,
+    },
+    expectPairs: [["StringBox", "TextBox"]],
+    forbidPairs: [
+      ["StringBox", "NumberBox"],
+      ["TextBox", "NumberBox"],
+    ],
+  },
+
+  // -------------------------------------------------------------------
+  // literal discriminants — signed numbers and bigints are literal types
+  // like any other: `-1` vs `-2` is a disjoint pair, not a near-match.
+  // -------------------------------------------------------------------
+  {
+    id: "XT-N19",
+    mode: "types",
+    category: "discriminant",
+    description: "Variants of a discriminated union whose `direction` literals are -1 and -2",
+    files: {
+      "moves.ts": `
+export interface MoveBackward {
+  direction: -1;
+  steps: number;
+  animate: boolean;
+  easing: string;
+}
+
+export interface MoveDoubleBackward {
+  direction: -2;
+  steps: number;
+  animate: boolean;
+  easing: string;
+}
+`,
+    },
+    forbidPairs: [["MoveBackward", "MoveDoubleBackward"]],
+  },
+  {
+    id: "XT-N20",
+    mode: "types",
+    category: "discriminant",
+    description: "Variants of a discriminated union whose `kind` literals are the bigints 1n and 2n",
+    files: {
+      "ledger.ts": `
+export interface AccountCredit {
+  kind: 1n;
+  amount: bigint;
+  account: string;
+  memo: string;
+}
+
+export interface AccountDebit {
+  kind: 2n;
+  amount: bigint;
+  account: string;
+  memo: string;
+}
+`,
+    },
+    forbidPairs: [["AccountCredit", "AccountDebit"]],
   },
 ];

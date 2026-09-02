@@ -1,4 +1,5 @@
 use crate::class_extractor::{ClassDefinition, ClassMethod, ClassProperty};
+use crate::module_scope::unqualified_name;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -79,13 +80,18 @@ pub fn normalize_class(class: &ClassDefinition) -> NormalizedClass {
         format!("({})", class.constructor_params.join(", "))
     };
 
+    // `implements A, B` and `implements B, A` promise the same contract.
+    let mut implements = class.implements.clone();
+    implements.sort();
+    implements.dedup();
+
     NormalizedClass {
         name: class.name.clone(),
         properties,
         methods,
         constructor_signature,
         extends: class.extends.clone(),
-        implements: class.implements.clone(),
+        implements,
     }
 }
 
@@ -217,8 +223,12 @@ pub fn compare_classes(
     let norm1 = normalize_class(class1);
     let norm2 = normalize_class(class2);
 
-    // Calculate naming similarity
-    let naming_similarity = calculate_name_similarity(&class1.name, &class2.name);
+    // Calculate naming similarity. Namespace qualifiers stay out of it:
+    // `Legacy.Pager` vs `Pager` is the same name, and two unrelated
+    // classes in the same namespace must not read as lexically related
+    // because they share its prefix.
+    let naming_similarity =
+        calculate_name_similarity(unqualified_name(&class1.name), unqualified_name(&class2.name));
 
     // Calculate structural similarity
     let (structural_similarity, differences) = calculate_structural_similarity(&norm1, &norm2);
@@ -538,11 +548,20 @@ fn calculate_structural_similarity(
         }
     }
 
+    // `implements` clauses are declared elements of the class shape: each
+    // interface a class promises is one more thing the other side has to
+    // promise too, so they join the member tally (one unmatched clause is
+    // one edit's worth) instead of being ignored.
+    let implements_total = (class1.implements.len() + class2.implements.len()) as f64;
+    let implements_matched =
+        class1.implements.iter().filter(|name| class2.implements.contains(name)).count() as f64;
+
     // Calculate overall structural similarity. Each side counts once, so
     // a "complete match" pair contributes 2 to the score and 2 to the
     // denominator — leaving the ratio at 1.0 for an exact match.
-    let total_elements = property_total_count + method_total_count;
-    let matched_elements = property_score + method_score;
+    let member_count = property_total_count + method_total_count;
+    let total_elements = member_count + implements_total;
+    let matched_elements = property_score + method_score + 2.0 * implements_matched;
 
     let structural_similarity = if total_elements > 0.0 {
         let mut ratio = (matched_elements / total_elements).min(1.0);
@@ -550,14 +569,16 @@ fn calculate_structural_similarity(
         // Foo { x = 1 }` and `class Bar { x = 1 }` agree on one field and
         // nothing else, so — like the member-less case below — a tiny shape
         // needs naming agreement to clear the default threshold.
-        if total_elements <= 2.0 {
+        if member_count <= 2.0 {
             ratio = ratio.min(0.85);
         }
-        // Inheriting from a base class is a contract the other side lacks
-        // (inherited members, `super` dispatch, `instanceof` identity):
-        // `class AuditLog extends EventEmitter { … }` is not a duplicate of
-        // a standalone class with the same own members.
-        if class1.extends.is_some() != class2.extends.is_some() {
+        // The base class is a contract the other side lacks or draws from
+        // elsewhere (inherited members, `super` dispatch, `instanceof`
+        // identity): `class AuditLog extends EventEmitter { … }` is not a
+        // duplicate of a standalone class with the same own members, nor
+        // of one that extends `Readable`. Only the same base — as written,
+        // type arguments included — leaves the score alone.
+        if class1.extends != class2.extends {
             ratio *= 0.7;
         }
         ratio
@@ -891,6 +912,107 @@ export class TraceLog extends EventEmitter {
             same_base.similarity >= 0.9,
             "shared heritage must not be penalized, got {}",
             same_base.similarity
+        );
+    }
+
+    #[test]
+    fn heritage_values_are_compared() {
+        // Same own members, different bases: different contracts.
+        let different_bases = compare_sources(
+            r"
+export class CsvExporter extends BaseExporter {
+  private rows: string[] = [];
+  push(row: string): void { this.rows.push(row); }
+  flush(): string { return this.rows.join('\n'); }
+}
+",
+            r"
+export class JsonExporter extends StreamWriter {
+  private rows: string[] = [];
+  push(row: string): void { this.rows.push(row); }
+  flush(): string { return this.rows.join('\n'); }
+}
+",
+        );
+        assert!(
+            different_bases.similarity < 0.8,
+            "different bases must stay below threshold, got {}",
+            different_bases.similarity
+        );
+
+        // A qualified base is still a base.
+        let qualified = compare_sources(
+            r"
+export class Widget extends React.Component {
+  private rows: string[] = [];
+  push(row: string): void { this.rows.push(row); }
+  flush(): string { return this.rows.join('\n'); }
+}
+",
+            r"
+export class Panel {
+  private rows: string[] = [];
+  push(row: string): void { this.rows.push(row); }
+  flush(): string { return this.rows.join('\n'); }
+}
+",
+        );
+        assert!(
+            qualified.similarity < 0.8,
+            "a qualified base is heritage too, got {}",
+            qualified.similarity
+        );
+    }
+
+    #[test]
+    fn implements_clauses_join_the_member_tally() {
+        let shared = compare_sources(
+            r"
+export class FileCache implements Cache, Disposable {
+  private items = new Map<string, string>();
+  get(key: string): string | undefined { return this.items.get(key); }
+  set(key: string, value: string): void { this.items.set(key, value); }
+  dispose(): void { this.items.clear(); }
+}
+",
+            r"
+export class MemoryStore implements Disposable, Cache {
+  private items = new Map<string, string>();
+  get(key: string): string | undefined { return this.items.get(key); }
+  set(key: string, value: string): void { this.items.set(key, value); }
+  dispose(): void { this.items.clear(); }
+}
+",
+        );
+        assert!(
+            (shared.structural_similarity - 1.0).abs() < 1e-9,
+            "the same clauses in any order are a full match, got {}",
+            shared.structural_similarity
+        );
+
+        let one_sided = compare_sources(
+            r"
+export class FileCache implements Cache, Disposable {
+  private items = new Map<string, string>();
+  get(key: string): string | undefined { return this.items.get(key); }
+  set(key: string, value: string): void { this.items.set(key, value); }
+  dispose(): void { this.items.clear(); }
+}
+",
+            r"
+export class MemoryStore {
+  private items = new Map<string, string>();
+  get(key: string): string | undefined { return this.items.get(key); }
+  set(key: string, value: string): void { this.items.set(key, value); }
+  dispose(): void { this.items.clear(); }
+}
+",
+        );
+        // Four members matched on both sides: 8 of 10 elements.
+        assert!(
+            (one_sided.structural_similarity - 0.8).abs() < 1e-9,
+            "two unmatched clauses are two edits, got {}",
+            one_sided.structural_similarity
         );
     }
 

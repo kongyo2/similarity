@@ -98,7 +98,11 @@ pub fn normalize_type(type_def: &TypeDefinition, options: &NormalizationOptions)
         optional_properties,
         readonly_properties,
         signature,
-        original_name: type_def.name.clone(),
+        // Namespace qualifiers stay out of name similarity: `Legacy.Options`
+        // vs `Options` is the same name, and two unrelated declarations in
+        // the same namespace must not read as lexically related because
+        // they share its prefix.
+        original_name: crate::module_scope::unqualified_name(&type_def.name).to_string(),
         kind: type_def.kind.clone(),
         extends,
     }
@@ -594,17 +598,46 @@ fn is_string_literal_type(type_name: &str) -> bool {
     type_name.len() >= 2 && type_name.starts_with('"') && type_name.ends_with('"')
 }
 
-/// A literal type: `"click"`, `42`, `true`.
+/// A numeric literal type: `42`, `-1`, `1.5`, `1e3`, `0x1f`, `1_000`.
+fn is_numeric_literal_type(type_name: &str) -> bool {
+    let body = type_name.strip_prefix('-').unwrap_or(type_name);
+    if !body.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    let digits: String = body.chars().filter(|c| *c != '_').collect();
+    if let Some(rest) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    if let Some(rest) = digits.strip_prefix("0o").or_else(|| digits.strip_prefix("0O")) {
+        return !rest.is_empty() && rest.chars().all(|c| ('0'..='7').contains(&c));
+    }
+    if let Some(rest) = digits.strip_prefix("0b").or_else(|| digits.strip_prefix("0B")) {
+        return !rest.is_empty() && rest.chars().all(|c| c == '0' || c == '1');
+    }
+    digits.parse::<f64>().is_ok()
+}
+
+/// A bigint literal type: `1n`, `-1n`, `0x1fn`.
+fn is_bigint_literal_type(type_name: &str) -> bool {
+    type_name
+        .strip_suffix('n')
+        .is_some_and(|rest| is_numeric_literal_type(rest) && !rest.contains('.'))
+}
+
+/// A literal type: `"click"`, `42`, `-1`, `1n`, `true`.
 fn is_literal_type(type_name: &str) -> bool {
     is_string_literal_type(type_name)
         || matches!(type_name, "true" | "false")
-        || type_name.parse::<f64>().is_ok()
+        || is_numeric_literal_type(type_name)
+        || is_bigint_literal_type(type_name)
 }
 
 /// Types that are equal only to themselves: references (nominal) and
-/// literal types (disjoint singletons).
+/// literal types (disjoint singletons). Signed numbers and bigints are
+/// literals too — `-1` vs `-2` used to fall through to edit distance and
+/// score 0.5, `1n` vs `2n` 0.2.
 fn is_nominal_atom(type_name: &str) -> bool {
-    is_bare_type_reference(type_name) || is_string_literal_type(type_name)
+    is_bare_type_reference(type_name) || is_literal_type(type_name)
 }
 
 /// Two normalized annotations that are both literal types, or both members
@@ -1046,6 +1079,22 @@ mod tests {
         // arguments of the generic are still seen.
         let normalized = normalize_type_name("Result<() => string, Error>");
         assert_eq!(normalized, "Result<() => string, Error>");
+    }
+
+    #[test]
+    fn signed_and_bigint_literals_are_nominal_atoms() {
+        assert!(calculate_type_similarity("-1", "-2").abs() < 1e-9);
+        assert!(calculate_type_similarity("1n", "2n").abs() < 1e-9);
+        assert!((calculate_type_similarity("-1n", "-1n") - 1.0).abs() < 1e-9);
+        assert!(calculate_type_similarity("0x1f", "0x20").abs() < 1e-9);
+        assert!((calculate_type_similarity("-1", "Level") - 0.2).abs() < 1e-9);
+        assert!(is_discriminant_mismatch("-1", "1"));
+        assert!(is_discriminant_mismatch("1n", "2n"));
+        assert!(is_literal_type("1_000"));
+        assert!(is_literal_type("1e3"));
+        assert!(!is_literal_type("-x"));
+        assert!(!is_literal_type("n"));
+        assert!(!is_literal_type("inf"));
     }
 
     #[test]

@@ -74,10 +74,13 @@ score as equal:
   method names when the canonical method bodies match
 
 Every declaration form takes part: function declarations, arrow and
-function expressions bound to a variable, class methods and arrow-function
-class fields, constructors, and declarations inside `namespace`/`module`
-blocks. Bodiless declarations — overload signatures, `declare function`,
-`abstract` methods — are never reported: there is no code behind them.
+function expressions bound to a variable (a named function expression keeps
+recursing through its own name), `export default` classes and functions,
+class methods and arrow-function class fields, constructors, and
+declarations inside `namespace`/`module` blocks, which are reported under
+their qualified name (`Legacy.Options`). Bodiless declarations — overload
+signatures, `declare function`, `abstract` methods — are never reported:
+there is no code behind them.
 
 Rewrites that change behavior keep their distinct shapes on purpose:
 swapped builtins (`.map` vs `.filter`, `Math.max` vs `Math.min`), a
@@ -93,19 +96,22 @@ stringify adjacent values (`` `${a}${b}` `` vs numeric `a + b`), and on
 the type side `Promise<ShopUser>` vs `Promise<ShopOrder>` payloads,
 `Map<K, V>` vs `Map<V, K>` swaps, index signatures vs concrete members,
 discriminated-union variants that differ in their `kind` literal or enum
-member, differing `extends` heritage, brand markers (`_fooBrand: any`),
-`typeof`/type-predicate members naming different things, and one- or
-two-member shapes whose only shared trait is a primitive. On the class side
-a constructor that does real work counts as a member, one-sided `extends`
-is a contract difference, and a single shared field is not a duplicate
-class. Twins that differ **only in data literals** (a table name, a status
-code, a locale string) are reported — parameterizing them is the refactor.
+member (signed numbers and bigints included), differing `extends` heritage
+(type arguments included: `Box<string>` is not `Box<number>`), brand
+markers (`_fooBrand: any`), `typeof`/type-predicate members naming
+different things, and one- or two-member shapes whose only shared trait is
+a primitive. On the class side a constructor that does real work counts as
+a member, a different, qualified-vs-absent, or one-sided base class is a
+contract difference, each `implements` clause is one more element to match,
+and a single shared field is not a duplicate class. Twins that differ
+**only in data literals** (a table name, a status code, a locale string)
+are reported — parameterizing them is the refactor.
 
 ## Accuracy
 
 Accuracy is tracked by a labeled benchmark (`bench/cases.ts` plus the
 extended corpora in `bench/cases/`) that mirrors the refactoring flow
-above: **289 ground-truth pairs** across functions, types, and classes —
+above: **300 ground-truth pairs** across functions, types, and classes —
 semantic duplicates a refactoring plan must see, and similarly-shaped
 lookalikes it must not flag — evaluated at the default threshold. The
 corpus covers whole-function renames, guard/negation/ternary spellings,
@@ -113,9 +119,11 @@ loop-form rewrites, destructuring, nullish sugar, literal-vs-behavior
 twins, realistic cross-file copy-paste, and — since 0.7.0 — the lookalike
 families found by auditing the engine's reports on a snapshot of the
 TypeScript compiler repository: bodiless overload signatures,
-discriminated-union variants, heritage, brand markers, tiny renamed
-shapes, `typeof`/predicate members, constructor work, and declarations
-inside namespaces.
+discriminated-union variants (enum members, string, signed-number and
+bigint literals), heritage (one-sided, differing, differently instantiated
+or qualified bases), brand markers, tiny renamed shapes, `typeof`/predicate
+members, constructor work, and declaration scopes — namespaces, default
+exports, named function expressions.
 
 | Engine | Corpus | Wrong labels | Error rate | Accuracy |
 | --- | --- | ---: | ---: | ---: |
@@ -124,8 +132,8 @@ inside namespaces.
 | v0.4.1 | 261 pairs | 89 / 261 | 34.10% | 65.90% |
 | v0.5.0 | 261 pairs | 7 / 261 | 2.68% | 97.32% |
 | v0.6.0 | 261 pairs | 0 / 261 | 0.00% | 100.00% |
-| v0.6.0 | 289 pairs | 20 / 289 | 6.92% | 93.08% |
-| **v0.7.0** | **289 pairs** | **0 / 289** | **0.00%** | **100.00%** |
+| v0.6.0 | 300 pairs | 29 / 300 | 9.67% | 90.33% |
+| **v0.7.0** | **300 pairs** | **0 / 300** | **0.00%** | **100.00%** |
 
 v0.7.0 was audited against real code: run over the TypeScript compiler's
 API package, its VS Code extension, and 1,482 conformance test files, the
@@ -181,7 +189,7 @@ of that metric; the operation-weight sensitivity they exploit is the
 paper's RQ3 finding that TSED's penalty weights are influential and
 language-dependent. Following that finding, the weights are re-validated
 against the labeled corpus on every accuracy release: for 0.7.0 every
-setting in rename 0.2–0.5 × delete/insert 0.8–1.0 classifies all 289 pairs
+setting in rename 0.2–0.5 × delete/insert 0.8–1.0 classifies all 300 pairs
 correctly and moves the tightest margins by less than 0.03, so the
 calibrated defaults stand.
 

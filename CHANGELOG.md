@@ -7,9 +7,9 @@ of the TypeScript compiler repository — the `packages/typescript/src` API
 package, the VS Code extension, the AST/protocol generator scripts, and
 1,482 conformance test files — and every class of reported pair was
 audited. The mislabel families found there were added to the labeled corpus
-as 28 new ground-truth pairs (corpus now **289 pairs**); the v0.6.0 engine
-gets 20 of them wrong (6.92% error rate on the extended corpus), v0.7.0
-classifies all 289 correctly and keeps the original 261 at 100% with
+as 39 new ground-truth pairs (corpus now **300 pairs**); the v0.6.0 engine
+gets 29 of them wrong (9.67% error rate on the extended corpus), v0.7.0
+classifies all 300 correctly and keeps the original 261 at 100% with
 unchanged margins.
 
 ### Detection accuracy
@@ -21,26 +21,41 @@ unchanged margins.
   compiler's `visitor.generated.ts`). (XF-N41)
 - **Functions — declaration scopes** (recall): function expressions bound
   to a variable (`const f = function () {…}`), functions declared inside
-  `namespace`/`module` blocks, and arrow-function class fields
-  (`handle = (event) => {…}`) are now extracted, so their twins can be
-  found at all. (XF-P43, XF-P44, XF-P45)
+  `namespace`/`module` blocks, arrow-function class fields
+  (`handle = (event) => {…}`), and `export default` classes, functions and
+  arrows are now extracted, so their twins can be found at all.
+  (XF-P43, XF-P44, XF-P45, XF-P48)
+- **Functions — named function expressions** (recall): `const factorial =
+  function recur(n) {…}` is compared under its own binding, so
+  `recur(n - 1)` keeps resolving to the function itself instead of becoming
+  a free identifier that differed between otherwise identical copies.
+  (XF-P47)
 - **Functions — constructor parameter properties** (recall): the canonical
   tree desugars `constructor(private readonly repo: Repo) {}` into the
-  `this.repo = repo;` assignments TypeScript emits (right after a leading
-  `super(…)` call when there is one), so the shorthand and the explicit
-  spelling compare as equal. (XF-P46)
+  `this.repo = repo;` assignments TypeScript emits — right after the
+  top-level `super(…)` call when there is one, even when statements precede
+  it — so the shorthand and the explicit spelling compare as equal.
+  (XF-P46, XC-P14)
+- **Functions — member names**: string-literal, numeric and computed method
+  keys are reported by their source (`alpha`, `0`, `[Symbol.iterator]`)
+  instead of `anonymous`.
 - **Types — nominal atoms**: qualified references (`SyntaxKind.Block`) and
-  literal types (`"click"`, `1`, `true`) compare nominally instead of by
-  edit distance of their spelling (`SyntaxKind.NonNullExpression` vs
-  `SyntaxKind.VoidExpression` scored 0.75 as *types*), and a same-named
-  member typed with differing literals or members of the same enum is a
-  discriminant mismatch that halves the structural evidence: the variants
-  of a discriminated union (`ForInStatement` vs `ForOfStatement`,
+  literal types (`"click"`, `1`, `-1`, `1n`, `true`) compare nominally
+  instead of by edit distance of their spelling
+  (`SyntaxKind.NonNullExpression` vs `SyntaxKind.VoidExpression` scored
+  0.75 as *types*, `-1` vs `-2` 0.5), and a same-named member typed with
+  differing literals or members of the same enum is a discriminant
+  mismatch that halves the structural evidence: the variants of a
+  discriminated union (`ForInStatement` vs `ForOfStatement`,
   `MouseEnterEvent` vs `MouseLeaveEvent`) are distinct types however many
-  members they share. (XT-N13)
-- **Types — heritage**: `extends` clauses are part of the contract. A
-  differing or one-sided clause discounts structural similarity (×0.7);
-  the same clauses in any order are unaffected. (XT-N14, XT-P21)
+  members they share. (XT-N13, XT-N19, XT-N20)
+- **Types — heritage**: `extends` clauses are part of the contract,
+  rendered like property annotations — qualified bases and type arguments
+  included, generic parameters positional — so `Box<string>` and
+  `Box<number>` are different bases while `A<T> extends Box<T>` and
+  `B<U> extends Box<U>` are the same one. A differing or one-sided clause
+  discounts structural similarity (×0.7); the same clauses in any order
+  are unaffected. (XT-N14, XT-N18, XT-P21)
 - **Types — rename evidence**: the rename-tolerant property phase needs a
   skeleton to stand on. One-member types never pair by rename, two-member
   shapes earn half credit, three or more full credit (the existing
@@ -55,21 +70,31 @@ unchanged margins.
   (XT-N17, XT-P22)
 - **Types and classes — namespaces**: interfaces, aliases and classes
   declared inside `namespace`/`module` blocks (including
-  `declare namespace` in declaration files) are extracted. (XT-P23, XC-P12)
+  `declare namespace` in declaration files) are extracted and reported
+  under their qualified name (`Legacy.Options`); the comparators score on
+  the bare name, so a shared namespace prefix is not lexical agreement and
+  a qualifier on one side does not hide a match. `export default interface`
+  is extracted too. (XT-P23, XC-P12)
 - **Classes — constructors**: a constructor that does real work is a
   member. Its signature and canonical body (parameter properties
   desugared) take part in the comparison, so same-fields-same-methods
   classes whose constructors differ (one schedules a refill timer, the
   other stores a limit) no longer compare as identical. Wiring-only
-  constructors (`super(…)` plus `this.x = x`, or the empty body of a
-  parameter-property constructor) add nothing the field list does not
-  already say and stay out, so a class that happens to have one is not
-  "missing" it on the other side. (XC-N07, XC-P11, XC-P13)
-- **Classes — heritage and tiny shapes**: one-sided `extends` discounts
-  structural similarity (×0.7), and a pair with a single member each is
-  capped like the member-less case (0.85 structural), so
-  `class Marker { id = 0 }` vs `class Slot { id = 0 }` needs naming
-  agreement to pass. (XC-N08, XC-N09)
+  constructors (`super(…)` plus `this.x = x` storing the constructor's own
+  parameters, or the empty body of a parameter-property constructor) add
+  nothing the field list does not already say and stay out, so a class
+  that happens to have one is not "missing" it on the other side; storing
+  anything else (`this.registry = globalRegistry`) is work.
+  (XC-N07, XC-P11, XC-P13)
+- **Classes — heritage and tiny shapes**: the base class is recorded as
+  written (qualified bases such as `React.Component`, mixin calls, type
+  arguments) and compared by value, so a different, one-sided, or
+  qualified-vs-absent `extends` discounts structural similarity (×0.7),
+  and `implements` clauses join the member tally (one unmatched clause is
+  one edit's worth; the same clauses in any order match). A pair with a
+  single member each is capped like the member-less case (0.85
+  structural), so `class Marker { id = 0 }` vs `class Slot { id = 0 }`
+  needs naming agreement to pass. (XC-N08, XC-N09, XC-N10, XC-N11)
 - **Classes — member keys**: `#private` members and computed keys
   (`[Symbol.iterator]`) are kept as members instead of being dropped,
   which left such classes looking member-less.
@@ -87,7 +112,7 @@ unchanged margins.
 - The APTED operation weights (rename 0.3, delete 1.0, insert 1.0) were
   re-validated against the extended corpus following the TSED paper's RQ3
   finding that they are influential: every setting in rename 0.2–0.5 ×
-  delete/insert 0.8–1.0 keeps 289/289 and moves the tightest margins by
+  delete/insert 0.8–1.0 keeps 300/300 and moves the tightest margins by
   less than 0.03, so the calibrated defaults stay.
 
 ### Real-world effect
@@ -113,8 +138,8 @@ package moved from 10.5 s to 11.4 s.
 
 | Engine | Corpus | Wrong labels | Error rate | Accuracy |
 | --- | --- | ---: | ---: | ---: |
-| v0.6.0 | 289 pairs | 20 / 289 | 6.92% | 93.08% |
-| v0.7.0 | 289 pairs | 0 / 289 | 0.00% | 100.00% |
+| v0.6.0 | 300 pairs | 29 / 300 | 9.67% | 90.33% |
+| v0.7.0 | 300 pairs | 0 / 300 | 0.00% | 100.00% |
 
 ## 0.6.0 — 2026-07-09
 

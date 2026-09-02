@@ -18,6 +18,7 @@ pub mod class_comparator;
 pub mod class_extractor;
 pub mod function_extractor;
 mod ignore_directive;
+mod module_scope;
 pub mod overlap_detector;
 pub mod parser;
 pub mod subtree_fingerprint;

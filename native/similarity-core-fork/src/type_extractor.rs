@@ -6,6 +6,8 @@ use oxc_ast::ast::{
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
+use crate::module_scope::{module_qualifier, qualified_name};
+
 /// Render a possibly-qualified type name (`React.FC`, `A.B.C`) as its
 /// full dotted path — collapsing to the rightmost segment would let
 /// `React.FC` compare equal to any other namespace's `FC`.
@@ -324,44 +326,64 @@ impl TypeExtractor {
         let mut types = Vec::new();
 
         for stmt in &ret.program.body {
-            self.extract_types_from_statement(stmt, &mut types);
+            self.extract_types_from_statement(stmt, &mut types, "");
         }
 
         Ok(types)
     }
 
-    fn extract_types_from_statement(&self, stmt: &Statement, types: &mut Vec<TypeDefinition>) {
+    /// `qualifier` is the dotted path of the enclosing `namespace`/`module`
+    /// blocks (`""` at the top level); see [`crate::module_scope`].
+    fn extract_types_from_statement(
+        &self,
+        stmt: &Statement,
+        types: &mut Vec<TypeDefinition>,
+        qualifier: &str,
+    ) {
         match stmt {
             Statement::TSInterfaceDeclaration(interface) => {
-                if let Some(type_def) = self.extract_interface(interface) {
+                if let Some(type_def) = self.extract_interface(interface, qualifier) {
                     types.push(type_def);
                 }
             }
             Statement::TSTypeAliasDeclaration(type_alias) => {
-                if let Some(type_def) = self.extract_type_alias(type_alias) {
+                if let Some(type_def) = self.extract_type_alias(type_alias, qualifier) {
                     types.push(type_def);
                 }
             }
             Statement::TSModuleDeclaration(module) => {
-                self.extract_types_from_module(module, types);
+                self.extract_types_from_module(module, types, qualifier);
             }
             Statement::ExportNamedDeclaration(export) => {
                 if let Some(decl) = &export.declaration {
                     match decl {
                         oxc_ast::ast::Declaration::TSInterfaceDeclaration(interface) => {
-                            if let Some(type_def) = self.extract_interface(interface) {
+                            if let Some(type_def) = self.extract_interface(interface, qualifier) {
                                 types.push(type_def);
                             }
                         }
                         oxc_ast::ast::Declaration::TSTypeAliasDeclaration(type_alias) => {
-                            if let Some(type_def) = self.extract_type_alias(type_alias) {
+                            if let Some(type_def) = self.extract_type_alias(type_alias, qualifier)
+                            {
                                 types.push(type_def);
                             }
                         }
                         oxc_ast::ast::Declaration::TSModuleDeclaration(module) => {
-                            self.extract_types_from_module(module, types);
+                            self.extract_types_from_module(module, types, qualifier);
                         }
                         _ => {}
+                    }
+                }
+            }
+            // `export default interface Foo { … }` is a declaration like
+            // any other.
+            Statement::ExportDefaultDeclaration(export) => {
+                if let oxc_ast::ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(
+                    interface,
+                ) = &export.declaration
+                {
+                    if let Some(type_def) = self.extract_interface(interface, qualifier) {
+                        types.push(type_def);
                     }
                 }
             }
@@ -371,22 +393,25 @@ impl TypeExtractor {
 
     /// `namespace`/`module` blocks (including `declare namespace` in
     /// declaration files) are ordinary declaration scopes for the
-    /// interfaces and aliases inside them; they used to be skipped.
+    /// interfaces and aliases inside them; they used to be skipped. Their
+    /// members are reported under the qualified name (`Legacy.Options`).
     fn extract_types_from_module(
         &self,
         module: &oxc_ast::ast::TSModuleDeclaration,
         types: &mut Vec<TypeDefinition>,
+        qualifier: &str,
     ) {
         let Some(body) = &module.body else {
             return;
         };
+        let qualifier = module_qualifier(&module.id, qualifier);
         match body {
             oxc_ast::ast::TSModuleDeclarationBody::TSModuleDeclaration(inner) => {
-                self.extract_types_from_module(inner, types);
+                self.extract_types_from_module(inner, types, &qualifier);
             }
             oxc_ast::ast::TSModuleDeclarationBody::TSModuleBlock(block) => {
                 for stmt in &block.body {
-                    self.extract_types_from_statement(stmt, types);
+                    self.extract_types_from_statement(stmt, types, &qualifier);
                 }
             }
         }
@@ -423,45 +448,55 @@ impl TypeExtractor {
         if generics.is_empty() {
             return;
         }
-        let replace_tokens = |input: &str| -> String {
-            let mut result = String::with_capacity(input.len());
-            let mut token = String::new();
-            let flush = |token: &mut String, result: &mut String| {
-                if token.is_empty() {
-                    return;
-                }
-                if let Some(position) = generics.iter().position(|generic| generic == token) {
-                    result.push_str(&format!("#{position}"));
-                } else {
-                    result.push_str(token);
-                }
-                token.clear();
-            };
-            for ch in input.chars() {
-                if ch.is_alphanumeric() || ch == '_' || ch == '$' {
-                    token.push(ch);
-                } else {
-                    flush(&mut token, &mut result);
-                    result.push(ch);
-                }
-            }
-            flush(&mut token, &mut result);
-            result
-        };
         for property in properties.iter_mut() {
-            property.type_annotation = replace_tokens(&property.type_annotation);
+            property.type_annotation =
+                Self::substitute_generic_tokens(&property.type_annotation, generics);
         }
     }
 
-    fn extract_interface(&self, interface: &TSInterfaceDeclaration) -> Option<TypeDefinition> {
-        let name = interface.id.name.as_str().to_string();
+    /// The token replacement behind [`Self::substitute_generic_params`],
+    /// for one rendered type.
+    fn substitute_generic_tokens(input: &str, generics: &[String]) -> String {
+        let mut result = String::with_capacity(input.len());
+        let mut token = String::new();
+        let flush = |token: &mut String, result: &mut String| {
+            if token.is_empty() {
+                return;
+            }
+            if let Some(position) = generics.iter().position(|generic| generic == token) {
+                result.push_str(&format!("#{position}"));
+            } else {
+                result.push_str(token);
+            }
+            token.clear();
+        };
+        for ch in input.chars() {
+            if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+                token.push(ch);
+            } else {
+                flush(&mut token, &mut result);
+                result.push(ch);
+            }
+        }
+        flush(&mut token, &mut result);
+        result
+    }
+
+    /// `qualifier` is the dotted path of the enclosing `namespace`/`module`
+    /// blocks (`""` at the top level); see [`crate::module_scope`].
+    fn extract_interface(
+        &self,
+        interface: &TSInterfaceDeclaration,
+        qualifier: &str,
+    ) -> Option<TypeDefinition> {
+        let name = qualified_name(qualifier, interface.id.name.as_str());
         let start_line = self.get_line_number(interface.span.start as usize);
         let end_line = self.get_line_number(interface.span.end as usize);
 
         let mut properties = self.extract_interface_properties(&interface.body.body);
         let generics = self.extract_generics(interface.type_parameters.as_ref());
         Self::substitute_generic_params(&mut properties, &generics);
-        let extends = self.extract_extends(Some(&interface.extends));
+        let extends = self.extract_extends(&interface.extends, &generics);
 
         Some(TypeDefinition {
             name,
@@ -476,8 +511,12 @@ impl TypeExtractor {
         })
     }
 
-    fn extract_type_alias(&self, type_alias: &TSTypeAliasDeclaration) -> Option<TypeDefinition> {
-        let name = type_alias.id.name.as_str().to_string();
+    fn extract_type_alias(
+        &self,
+        type_alias: &TSTypeAliasDeclaration,
+        qualifier: &str,
+    ) -> Option<TypeDefinition> {
+        let name = qualified_name(qualifier, type_alias.id.name.as_str());
         let start_line = self.get_line_number(type_alias.span.start as usize);
         let end_line = self.get_line_number(type_alias.span.end as usize);
 
@@ -845,23 +884,50 @@ impl TypeExtractor {
         }
     }
 
+    /// Heritage clauses rendered the way property annotations are —
+    /// qualified names and type arguments included, generic parameters
+    /// positional — so `extends Box<string>` and `extends Box<number>`
+    /// are different contracts while `A<T> extends Box<T>` and
+    /// `B<U> extends Box<U>` are the same one. Only a bare identifier
+    /// used to survive; everything else was dropped.
     fn extract_extends(
         &self,
-        extends: Option<&oxc_allocator::Vec<oxc_ast::ast::TSInterfaceHeritage>>,
+        heritage_clauses: &[oxc_ast::ast::TSInterfaceHeritage],
+        generics: &[String],
     ) -> Vec<String> {
-        if let Some(heritage_clauses) = extends {
-            heritage_clauses
-                .iter()
-                .filter_map(|heritage| match &heritage.expression {
+        use oxc_span::GetSpan;
+        heritage_clauses
+            .iter()
+            .map(|heritage| {
+                let base = match &heritage.expression {
                     oxc_ast::ast::Expression::Identifier(ident) => {
-                        Some(ident.name.as_str().to_string())
+                        ident.name.as_str().to_string()
                     }
-                    _ => None,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
+                    other => {
+                        let span = other.span();
+                        let (start, end) = (span.start as usize, span.end as usize);
+                        if start < end && end <= self.source_text.len() {
+                            collapse_whitespace_outside_strings(&self.source_text[start..end])
+                        } else {
+                            "unknown".to_string()
+                        }
+                    }
+                };
+                let rendered = match &heritage.type_arguments {
+                    Some(args) if !args.params.is_empty() => {
+                        let rendered: Vec<String> =
+                            args.params.iter().map(|param| self.extract_type_string(param)).collect();
+                        format!("{base}<{}>", rendered.join(", "))
+                    }
+                    _ => base,
+                };
+                if generics.is_empty() {
+                    rendered
+                } else {
+                    Self::substitute_generic_tokens(&rendered, generics)
+                }
+            })
+            .collect()
     }
 
     fn extract_type_literals_from_statement(
@@ -1405,6 +1471,19 @@ export interface Channel {
     }
 
     #[test]
+    fn heritage_keeps_type_arguments_and_qualified_bases() {
+        let code = r"
+interface StringBox extends Box<string>, Legacy.Tagged { id: number; }
+interface Generic<T> extends Box<T> { id: number; }
+export default interface Marker { id: number; }
+";
+        let types = extract_types_from_code(code, "test.ts").unwrap();
+        assert_eq!(types[0].extends, vec!["Box<string>", "Legacy.Tagged"]);
+        assert_eq!(types[1].extends, vec!["Box<#0>"]);
+        assert_eq!(types[2].name, "Marker");
+    }
+
+    #[test]
     fn namespace_scoped_types_are_extracted() {
         let code = r"
 export namespace Legacy {
@@ -1423,6 +1502,6 @@ declare namespace Ambient {
 ";
         let types = extract_types_from_code(code, "test.ts").unwrap();
         let names: Vec<&str> = types.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["Options", "Mode", "Hidden"]);
+        assert_eq!(names, vec!["Legacy.Options", "Legacy.Inner.Mode", "Ambient.Hidden"]);
     }
 }

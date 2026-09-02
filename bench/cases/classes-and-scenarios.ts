@@ -1816,6 +1816,131 @@ export class CursorPager {
 }
 `,
     },
-    expectPairs: [["TokenPager", "CursorPager"]],
+    expectPairs: [["Legacy.TokenPager", "CursorPager"]],
+  },
+
+  // -------------------------------------------------------------------
+  // heritage values — the base class is the contract, not its presence:
+  // two classes with the same own members but different (or qualified
+  // vs. absent) bases inherit different things.
+  // -------------------------------------------------------------------
+  {
+    id: "XC-N10",
+    mode: "classes",
+    category: "heritage",
+    description: "Identical own members, but the classes extend different base classes",
+    files: {
+      "csv.ts": `
+export class CsvExporter extends BaseExporter {
+  private rows: string[] = [];
+  push(row: string): void {
+    this.rows.push(row);
+  }
+  flush(): string {
+    return this.rows.join("\\n");
+  }
+}
+`,
+      "json.ts": `
+export class JsonExporter extends StreamWriter {
+  private rows: string[] = [];
+  push(row: string): void {
+    this.rows.push(row);
+  }
+  flush(): string {
+    return this.rows.join("\\n");
+  }
+}
+`,
+    },
+    forbidPairs: [["CsvExporter", "JsonExporter"]],
+  },
+  {
+    id: "XC-N11",
+    mode: "classes",
+    category: "heritage",
+    description:
+      "Identical own members, but one class extends the qualified `React.Component` and the other stands alone",
+    files: {
+      "widget.ts": `
+import * as React from "react";
+
+export class Widget extends React.Component<WidgetProps> {
+  private rows: string[] = [];
+  push(row: string): void {
+    this.rows.push(row);
+  }
+  flush(): string {
+    return this.rows.join("\\n");
+  }
+}
+`,
+      "panel.ts": `
+export class Panel {
+  private rows: string[] = [];
+  push(row: string): void {
+    this.rows.push(row);
+  }
+  flush(): string {
+    return this.rows.join("\\n");
+  }
+}
+`,
+    },
+    forbidPairs: [["Widget", "Panel"]],
+  },
+  {
+    id: "XC-P14",
+    mode: "classes",
+    category: "heritage",
+    description:
+      "Parameter property with a statement before super() vs the explicit assignment after super(): the same constructor",
+    files: {
+      "a.ts": `
+interface InvoiceRepo {
+  fetchInvoice(id: string): Promise<{ total: number } | null>;
+}
+
+export class BaseLookup {
+  protected hits = 0;
+}
+
+export class InvoiceLookup extends BaseLookup {
+  constructor(private readonly repo: InvoiceRepo) {
+    trace("lookup:start");
+    super();
+  }
+  async totalFor(id: string): Promise<number> {
+    const found = await this.repo.fetchInvoice(id);
+    this.hits += 1;
+    return found ? found.total : 0;
+  }
+}
+`,
+      "b.ts": `
+interface ReceiptRepo {
+  fetchInvoice(id: string): Promise<{ total: number } | null>;
+}
+
+export class BaseLookup {
+  protected hits = 0;
+}
+
+export class ReceiptLookup extends BaseLookup {
+  private readonly repo: ReceiptRepo;
+  constructor(repo: ReceiptRepo) {
+    trace("lookup:start");
+    super();
+    this.repo = repo;
+  }
+  async totalFor(id: string): Promise<number> {
+    const found = await this.repo.fetchInvoice(id);
+    this.hits += 1;
+    return found ? found.total : 0;
+  }
+}
+`,
+    },
+    expectPairs: [["InvoiceLookup", "ReceiptLookup"]],
   },
 ];

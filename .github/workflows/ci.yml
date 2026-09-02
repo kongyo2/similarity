@@ -46,7 +46,7 @@ jobs:
         run: cargo test --manifest-path native/similarity-core-fork/Cargo.toml
 
   # Builds the real WASM engine and runs the full vitest suite against it,
-  # including the labeled-corpus accuracy gate (287 pairs): every labeled
+  # including the labeled-corpus accuracy gate (300 pairs): every labeled
   # pair must classify correctly — any mislabel fails the suite.
   tests-and-accuracy:
     runs-on: ubuntu-latest
