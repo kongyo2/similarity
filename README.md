@@ -102,8 +102,9 @@ markers (`_fooBrand: any`), `typeof`/type-predicate members naming
 different things, and one- or two-member shapes whose only shared trait is
 a primitive. On the class side a constructor that does real work counts as
 a member, a different, qualified-vs-absent, or one-sided base class is a
-contract difference, each `implements` clause is one more element to match,
-and a single shared field is not a duplicate class. Twins that differ
+contract difference, an `implements` clause the other side lacks is one
+more difference, and a single shared field is not a duplicate class. Twins
+that differ
 **only in data literals** (a table name, a status code, a locale string)
 are reported — parameterizing them is the refactor.
 
@@ -143,7 +144,7 @@ the next, and thousands of single-field conformance classes as twins,
 while never extracting function expressions, arrow-function class fields,
 or anything declared inside a `namespace`. v0.7.0 fixes each family (type
 pairs on the 108-file API package drop from 685 to 419, conformance class
-pairs from 15,062 to 6,061, and the newly extracted declaration forms
+pairs from 15,062 to 5,793, and the newly extracted declaration forms
 surface their twins), adds the families to the corpus, and keeps the
 original 261 pairs at 100% with unchanged margins. Reports are also
 deterministic now — type mode used to compare declarations in hash-map

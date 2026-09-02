@@ -548,20 +548,23 @@ fn calculate_structural_similarity(
         }
     }
 
-    // `implements` clauses are declared elements of the class shape: each
-    // interface a class promises is one more thing the other side has to
-    // promise too, so they join the member tally (one unmatched clause is
-    // one edit's worth) instead of being ignored.
-    let implements_total = (class1.implements.len() + class2.implements.len()) as f64;
-    let implements_matched =
-        class1.implements.iter().filter(|name| class2.implements.contains(name)).count() as f64;
+    // `implements` clauses are declared elements of the class shape: an
+    // interface one side promises and the other does not is one edit's
+    // worth of difference, so unmatched clauses join the denominator.
+    // Matched clauses add nothing — sharing an interface is what unrelated
+    // implementations of it do, not evidence of duplication (two one-method
+    // `implements I` classes with different bodies must not pass on the
+    // strength of the clause).
+    let unmatched_implements =
+        class1.implements.iter().filter(|name| !class2.implements.contains(name)).count()
+            + class2.implements.iter().filter(|name| !class1.implements.contains(name)).count();
 
     // Calculate overall structural similarity. Each side counts once, so
     // a "complete match" pair contributes 2 to the score and 2 to the
     // denominator — leaving the ratio at 1.0 for an exact match.
     let member_count = property_total_count + method_total_count;
-    let total_elements = member_count + implements_total;
-    let matched_elements = property_score + method_score + 2.0 * implements_matched;
+    let total_elements = member_count + unmatched_implements as f64;
+    let matched_elements = property_score + method_score;
 
     let structural_similarity = if total_elements > 0.0 {
         let mut ratio = (matched_elements / total_elements).min(1.0);
@@ -1013,6 +1016,20 @@ export class MemoryStore {
             (one_sided.structural_similarity - 0.8).abs() < 1e-9,
             "two unmatched clauses are two edits, got {}",
             one_sided.structural_similarity
+        );
+
+        // Sharing an interface is not evidence of duplication: two
+        // one-method implementations of `I` with different bodies (the
+        // conformance suite's `symbolProperty23`/`symbolProperty24`) stay
+        // apart.
+        let same_interface = compare_sources(
+            "export class C implements I { [Symbol.toPrimitive]() { return true; } }",
+            "export class C implements I { [Symbol.toPrimitive]() { return ''; } }",
+        );
+        assert!(
+            same_interface.similarity < 0.8,
+            "a shared clause must not lift different bodies over the threshold, got {}",
+            same_interface.similarity
         );
     }
 

@@ -90,11 +90,12 @@ unchanged margins.
   written (qualified bases such as `React.Component`, mixin calls, type
   arguments) and compared by value, so a different, one-sided, or
   qualified-vs-absent `extends` discounts structural similarity (×0.7),
-  and `implements` clauses join the member tally (one unmatched clause is
-  one edit's worth; the same clauses in any order match). A pair with a
-  single member each is capped like the member-less case (0.85
-  structural), so `class Marker { id = 0 }` vs `class Slot { id = 0 }`
-  needs naming agreement to pass. (XC-N08, XC-N09, XC-N10, XC-N11)
+  and an `implements` clause one side lacks is one edit's worth of
+  difference (the same clauses in any order are neutral: sharing an
+  interface is not evidence of duplication). A pair with a single member
+  each is capped like the member-less case (0.85 structural), so
+  `class Marker { id = 0 }` vs `class Slot { id = 0 }` needs naming
+  agreement to pass. (XC-N08, XC-N09, XC-N10, XC-N11)
 - **Classes — member keys**: `#private` members and computed keys
   (`[Symbol.iterator]`) are kept as members instead of being dropped,
   which left such classes looking member-less.
@@ -125,14 +126,16 @@ repository snapshot the release was audited against:
 | `packages/typescript/src` (108 files) | types | 685 | 419 |
 | `packages/typescript/src` | functions | 926 | 925 |
 | VS Code extension + generator scripts (27 files) | types | 16 | 5 |
-| conformance tests (1,482 files) | classes | 15,062 | 6,061 |
-| conformance tests | types | 823 | 937 |
+| conformance tests (1,482 files) | classes | 15,062 | 5,793 |
+| conformance tests | types | 823 | 945 |
 
 The removed type pairs are the AST-node and protocol-parameter interfaces
 that differ only in their `kind` discriminant, their heritage, or a single
-renamed member; the added conformance pairs are namespace-scoped
+renamed member; the removed conformance class pairs are single-field
+lookalikes and same-member classes under different (or differently
+instantiated) bases; the added conformance pairs are namespace-scoped
 declarations that were previously invisible. Scan time on the 108-file
-package moved from 10.5 s to 11.4 s.
+package moved from 10.5 s to 11.8 s.
 
 ### Accuracy
 
