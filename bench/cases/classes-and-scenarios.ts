@@ -1566,4 +1566,381 @@ export function stampReportDateEu(date: Date): string {
     },
     expectPairs: [["stampReportDateIso", "stampReportDateEu"]],
   },
+
+  // -------------------------------------------------------------------
+  // Part 3: classes — real-world lookalikes from the TypeScript
+  // conformance suite and compiler sources that v0.6.0 reported as
+  // duplicates (constructors and heritage were invisible to the
+  // comparator, and a single shared field scored as a full match), plus
+  // the positive controls those rules must keep.
+  // -------------------------------------------------------------------
+  {
+    id: "XC-N07",
+    mode: "classes",
+    category: "constructor-divergence",
+    description:
+      "Same fields and methods, but one constructor only stores the limit while the other also schedules a refill timer",
+    files: {
+      "a.ts": `
+export class RetryBudget {
+  remaining: number;
+  constructor(limit: number) {
+    this.remaining = limit;
+  }
+  spend(): boolean {
+    if (this.remaining <= 0) {
+      return false;
+    }
+    this.remaining -= 1;
+    return true;
+  }
+}
+`,
+      "b.ts": `
+export class TokenBucket {
+  remaining: number;
+  constructor(limit: number, refillMs: number) {
+    this.remaining = limit;
+    setInterval(() => {
+      this.remaining = limit;
+    }, refillMs);
+  }
+  spend(): boolean {
+    if (this.remaining <= 0) {
+      return false;
+    }
+    this.remaining -= 1;
+    return true;
+  }
+}
+`,
+    },
+    forbidPairs: [["RetryBudget", "TokenBucket"]],
+  },
+  {
+    id: "XC-N08",
+    mode: "classes",
+    category: "heritage",
+    description:
+      "Identical own members, but one class extends EventEmitter and the other stands alone",
+    files: {
+      "a.ts": `
+import { EventEmitter } from "node:events";
+
+export class AuditLog extends EventEmitter {
+  private entries: string[] = [];
+  record(entry: string): void {
+    this.entries.push(entry);
+  }
+  snapshot(): string[] {
+    return [...this.entries];
+  }
+}
+`,
+      "b.ts": `
+export class TraceLog {
+  private entries: string[] = [];
+  record(entry: string): void {
+    this.entries.push(entry);
+  }
+  snapshot(): string[] {
+    return [...this.entries];
+  }
+}
+`,
+    },
+    forbidPairs: [["AuditLog", "TraceLog"]],
+  },
+  {
+    id: "XC-N09",
+    mode: "classes",
+    category: "tiny-shape",
+    description:
+      "Single-field classes with unrelated names: one shared `id = 0` field is not a duplicate class",
+    files: {
+      "a.ts": `
+export class Marker {
+  id = 0;
+}
+`,
+      "b.ts": `
+export class Slot {
+  id = 0;
+}
+`,
+    },
+    forbidPairs: [["Marker", "Slot"]],
+  },
+  {
+    id: "XC-P11",
+    mode: "classes",
+    category: "heritage",
+    description:
+      "Same base class on both sides; parameter-property constructor with super() vs explicit field assignment after super()",
+    files: {
+      "a.ts": `
+interface InvoiceRepo {
+  fetchInvoice(id: string): Promise<{ total: number } | null>;
+}
+
+export class BaseLookup {
+  protected hits = 0;
+}
+
+export class InvoiceLookup extends BaseLookup {
+  constructor(private readonly repo: InvoiceRepo) {
+    super();
+  }
+  async totalFor(id: string): Promise<number> {
+    const found = await this.repo.fetchInvoice(id);
+    this.hits += 1;
+    return found ? found.total : 0;
+  }
+}
+`,
+      "b.ts": `
+interface ReceiptRepo {
+  fetchInvoice(id: string): Promise<{ total: number } | null>;
+}
+
+export class BaseLookup {
+  protected hits = 0;
+}
+
+export class ReceiptLookup extends BaseLookup {
+  private readonly repo: ReceiptRepo;
+  constructor(repo: ReceiptRepo) {
+    super();
+    this.repo = repo;
+  }
+  async totalFor(id: string): Promise<number> {
+    const found = await this.repo.fetchInvoice(id);
+    this.hits += 1;
+    return found ? found.total : 0;
+  }
+}
+`,
+    },
+    expectPairs: [["InvoiceLookup", "ReceiptLookup"]],
+  },
+  {
+    id: "XC-P13",
+    mode: "classes",
+    category: "constructor-wiring",
+    description:
+      "A wiring-only constructor (a parameter property with a default) vs a field initializer: the same class, so the constructor must not count as a missing member",
+    files: {
+      "a.ts": `
+export class CodeWriter {
+  private lines: string[] = [];
+  private indent = 0;
+  constructor(private indentStr = "\\t") {}
+  write(line = ""): void {
+    if (line === "") {
+      this.lines.push("");
+    } else {
+      this.lines.push(this.indentStr.repeat(this.indent) + line);
+    }
+  }
+  push(): void {
+    this.indent++;
+  }
+  pop(): void {
+    this.indent--;
+  }
+  toString(): string {
+    return this.lines.join("\\n");
+  }
+}
+`,
+      "b.ts": `
+export class SourceWriter {
+  private lines: string[] = [];
+  private indent = 0;
+  private indentStr = "\\t";
+  write(line = ""): void {
+    if (line === "") {
+      this.lines.push("");
+    } else {
+      this.lines.push(this.indentStr.repeat(this.indent) + line);
+    }
+  }
+  push(): void {
+    this.indent++;
+  }
+  pop(): void {
+    this.indent--;
+  }
+  toString(): string {
+    return this.lines.join("\\n");
+  }
+}
+`,
+    },
+    expectPairs: [["CodeWriter", "SourceWriter"]],
+  },
+  {
+    id: "XC-P12",
+    mode: "classes",
+    category: "declaration-scope",
+    description: "Class declared inside a namespace block vs a top-level class with identical members",
+    files: {
+      "legacy.ts": `
+export namespace Legacy {
+  export class TokenPager {
+    private cursor: string | null = null;
+    advance(next: string | null): void {
+      this.cursor = next;
+    }
+    hasMore(): boolean {
+      return this.cursor !== null;
+    }
+    current(): string | null {
+      return this.cursor;
+    }
+  }
+}
+`,
+      "pager.ts": `
+export class CursorPager {
+  private cursor: string | null = null;
+  advance(next: string | null): void {
+    this.cursor = next;
+  }
+  hasMore(): boolean {
+    return this.cursor !== null;
+  }
+  current(): string | null {
+    return this.cursor;
+  }
+}
+`,
+    },
+    expectPairs: [["Legacy.TokenPager", "CursorPager"]],
+  },
+
+  // -------------------------------------------------------------------
+  // heritage values — the base class is the contract, not its presence:
+  // two classes with the same own members but different (or qualified
+  // vs. absent) bases inherit different things.
+  // -------------------------------------------------------------------
+  {
+    id: "XC-N10",
+    mode: "classes",
+    category: "heritage",
+    description: "Identical own members, but the classes extend different base classes",
+    files: {
+      "csv.ts": `
+export class CsvExporter extends BaseExporter {
+  private rows: string[] = [];
+  push(row: string): void {
+    this.rows.push(row);
+  }
+  flush(): string {
+    return this.rows.join("\\n");
+  }
+}
+`,
+      "json.ts": `
+export class JsonExporter extends StreamWriter {
+  private rows: string[] = [];
+  push(row: string): void {
+    this.rows.push(row);
+  }
+  flush(): string {
+    return this.rows.join("\\n");
+  }
+}
+`,
+    },
+    forbidPairs: [["CsvExporter", "JsonExporter"]],
+  },
+  {
+    id: "XC-N11",
+    mode: "classes",
+    category: "heritage",
+    description:
+      "Identical own members, but one class extends the qualified `React.Component` and the other stands alone",
+    files: {
+      "widget.ts": `
+import * as React from "react";
+
+export class Widget extends React.Component<WidgetProps> {
+  private rows: string[] = [];
+  push(row: string): void {
+    this.rows.push(row);
+  }
+  flush(): string {
+    return this.rows.join("\\n");
+  }
+}
+`,
+      "panel.ts": `
+export class Panel {
+  private rows: string[] = [];
+  push(row: string): void {
+    this.rows.push(row);
+  }
+  flush(): string {
+    return this.rows.join("\\n");
+  }
+}
+`,
+    },
+    forbidPairs: [["Widget", "Panel"]],
+  },
+  {
+    id: "XC-P14",
+    mode: "classes",
+    category: "heritage",
+    description:
+      "Parameter property with a statement before super() vs the explicit assignment after super(): the same constructor",
+    files: {
+      "a.ts": `
+interface InvoiceRepo {
+  fetchInvoice(id: string): Promise<{ total: number } | null>;
+}
+
+export class BaseLookup {
+  protected hits = 0;
+}
+
+export class InvoiceLookup extends BaseLookup {
+  constructor(private readonly repo: InvoiceRepo) {
+    trace("lookup:start");
+    super();
+  }
+  async totalFor(id: string): Promise<number> {
+    const found = await this.repo.fetchInvoice(id);
+    this.hits += 1;
+    return found ? found.total : 0;
+  }
+}
+`,
+      "b.ts": `
+interface ReceiptRepo {
+  fetchInvoice(id: string): Promise<{ total: number } | null>;
+}
+
+export class BaseLookup {
+  protected hits = 0;
+}
+
+export class ReceiptLookup extends BaseLookup {
+  private readonly repo: ReceiptRepo;
+  constructor(repo: ReceiptRepo) {
+    trace("lookup:start");
+    super();
+    this.repo = repo;
+  }
+  async totalFor(id: string): Promise<number> {
+    const found = await this.repo.fetchInvoice(id);
+    this.hits += 1;
+    return found ? found.total : 0;
+  }
+}
+`,
+    },
+    expectPairs: [["InvoiceLookup", "ReceiptLookup"]],
+  },
 ];

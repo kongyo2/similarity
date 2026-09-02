@@ -1,9 +1,10 @@
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{ClassElement, MethodDefinitionKind, Statement};
+use oxc_ast::ast::{ClassElement, MethodDefinitionKind, PropertyKey, Statement};
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 
 use crate::ignore_directive::has_similarity_ignore_directive;
+use crate::module_scope::{module_qualifier, qualified_name};
 
 #[derive(Debug, Clone)]
 pub struct ClassDefinition {
@@ -263,34 +264,32 @@ impl ClassExtractor {
         param_strings.join(", ")
     }
 
-    fn extract_class(&self, class: &oxc_ast::ast::Class) -> ClassDefinition {
-        let name = class
-            .id
-            .as_ref()
-            .map(|id| id.name.as_str().to_string())
-            .unwrap_or_else(|| "AnonymousClass".to_string());
+    /// `qualifier` is the dotted path of the enclosing `namespace`/`module`
+    /// blocks (`""` at the top level); see [`crate::module_scope`].
+    fn extract_class(&self, class: &oxc_ast::ast::Class, qualifier: &str) -> ClassDefinition {
+        let name = qualified_name(
+            qualifier,
+            class.id.as_ref().map_or("AnonymousClass", |id| id.name.as_str()),
+        );
 
         let start_line = self.get_line_number(class.span.start as usize);
         let end_line = self.get_line_number(class.span.end as usize);
 
-        let extends = class.super_class.as_ref().and_then(|super_class| {
-            if let oxc_ast::ast::Expression::Identifier(ident) = super_class {
-                Some(ident.name.as_str().to_string())
-            } else {
-                None
+        // Heritage is recorded as written. Only bare identifiers used to
+        // survive, so a qualified base (`React.Component`), a mixin call
+        // (`Mixin(Base)`) or type arguments (`Base<string>`) all looked
+        // like *no* superclass — invisible to the comparator's heritage
+        // check.
+        let extends = class.super_class.as_ref().map(|super_class| {
+            let mut text = self.heritage_text(super_class.span());
+            if let Some(args) = &class.super_type_arguments {
+                text.push_str(&self.heritage_text(args.span));
             }
+            text
         });
 
-        let implements = class
-            .implements
-            .iter()
-            .filter_map(|impl_clause| match &impl_clause.expression {
-                oxc_ast::ast::TSTypeName::IdentifierReference(ident) => {
-                    Some(ident.name.as_str().to_string())
-                }
-                _ => None,
-            })
-            .collect();
+        let implements =
+            class.implements.iter().map(|clause| self.heritage_text(clause.span)).collect();
 
         let mut properties = Vec::new();
         let mut methods = Vec::new();
@@ -299,14 +298,8 @@ impl ClassExtractor {
         for element in &class.body.body {
             match element {
                 ClassElement::PropertyDefinition(prop) => {
-                    let name = match &prop.key {
-                        oxc_ast::ast::PropertyKey::StaticIdentifier(ident) => {
-                            ident.name.as_str().to_string()
-                        }
-                        oxc_ast::ast::PropertyKey::StringLiteral(str_lit) => {
-                            str_lit.value.as_str().to_string()
-                        }
-                        _ => continue,
+                    let Some(name) = self.member_key_name(&prop.key, prop.computed) else {
+                        continue;
                     };
 
                     // `handle = (event) => { … }` class fields are methods
@@ -351,14 +344,8 @@ impl ClassExtractor {
                     });
                 }
                 ClassElement::MethodDefinition(method) => {
-                    let name = match &method.key {
-                        oxc_ast::ast::PropertyKey::StaticIdentifier(ident) => {
-                            ident.name.as_str().to_string()
-                        }
-                        oxc_ast::ast::PropertyKey::StringLiteral(str_lit) => {
-                            str_lit.value.as_str().to_string()
-                        }
-                        _ => continue,
+                    let Some(name) = self.member_key_name(&method.key, method.computed) else {
+                        continue;
                     };
 
                     let kind = match method.kind {
@@ -424,6 +411,32 @@ impl ClassExtractor {
                                 ),
                                 is_readonly: param.readonly,
                                 is_optional: false,
+                            });
+                        }
+                        // A constructor that does real work is a member
+                        // like any other: two classes with the same fields
+                        // and methods but a constructor that spawns a
+                        // timer, validates, or delegates used to compare as
+                        // identical because the constructor was skipped.
+                        // Wiring-only constructors (`super(…)` plus
+                        // `this.x = x`, or the empty body of a
+                        // parameter-property constructor) add nothing the
+                        // field list doesn't already say, so they stay
+                        // out — otherwise a class that happens to have one
+                        // would be "missing" it on the other side.
+                        if !Self::is_wiring_only_constructor(&method.value) {
+                            methods.push(ClassMethod {
+                                name,
+                                parameters: vec![
+                                    self.extract_function_params(&method.value.params),
+                                ],
+                                return_type: "void".to_string(),
+                                is_static: false,
+                                is_private: false,
+                                is_async: false,
+                                is_generator: false,
+                                kind: MethodKind::Constructor,
+                                body_fingerprint: self.constructor_fingerprint(&method.value),
                             });
                         }
                     } else {
@@ -529,6 +542,99 @@ impl ClassExtractor {
         Some(hasher.finish())
     }
 
+    /// Fingerprint for a constructor. Parsed inside a class wrapper so the
+    /// canonicalizer's parameter-property desugaring applies:
+    /// `constructor(private readonly repo: Repo) {}` and
+    /// `constructor(repo: Repo) { this.repo = repo; }` hash identically.
+    fn constructor_fingerprint(&self, function: &oxc_ast::ast::Function) -> Option<u64> {
+        let body = function.body.as_ref()?;
+        let params_text = self.source_slice(function.params.span)?;
+        let body_text = self.source_slice(body.span)?;
+        let wrapped = format!("class __C__ {{ constructor{params_text} {body_text} }}");
+        Self::fingerprint_wrapped_function(&wrapped)
+    }
+
+    fn source_slice(&self, span: oxc_span::Span) -> Option<&str> {
+        let start = span.start as usize;
+        let end = span.end as usize;
+        if start < end && end <= self.source_text.len() {
+            Some(&self.source_text[start..end])
+        } else {
+            None
+        }
+    }
+
+    /// A heritage clause as written, minus whitespace (`React.Component`,
+    /// `Base<string>`, `Mixin(Base)`). Compared only for equality, so a
+    /// stable spelling is all that matters.
+    fn heritage_text(&self, span: oxc_span::Span) -> String {
+        self.source_slice(span)
+            .map(|text| text.chars().filter(|c| !c.is_whitespace()).collect())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// Member name for a class element key. Private names keep their `#`,
+    /// computed keys keep their bracketed source (`[Symbol.iterator]`) —
+    /// both used to be dropped, which left classes made of private fields
+    /// or well-known-symbol methods looking member-less.
+    fn member_key_name(&self, key: &PropertyKey, computed: bool) -> Option<String> {
+        Some(match key {
+            PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_string(),
+            PropertyKey::StringLiteral(str_lit) => str_lit.value.as_str().to_string(),
+            PropertyKey::PrivateIdentifier(ident) => format!("#{}", ident.name.as_str()),
+            other => {
+                let text = self.source_slice(other.span())?;
+                if computed {
+                    format!("[{text}]")
+                } else {
+                    text.to_string()
+                }
+            }
+        })
+    }
+
+    /// Whether a constructor body only forwards to `super(…)` and stores
+    /// its own parameters into `this` fields (or is empty). Storing
+    /// anything else — a module-level singleton, a computed value — is
+    /// work the class does, and counts as a member. See the call site.
+    fn is_wiring_only_constructor(function: &oxc_ast::ast::Function) -> bool {
+        use oxc_ast::ast::{AssignmentOperator, AssignmentTarget, Expression, Statement};
+        let Some(body) = &function.body else {
+            return true;
+        };
+        let parameters: std::collections::HashSet<&str> = function
+            .params
+            .items
+            .iter()
+            .map(|param| &param.pattern)
+            .chain(function.params.rest.as_ref().map(|rest| &rest.rest.argument))
+            .flat_map(|pattern| pattern.get_binding_identifiers())
+            .map(|ident| ident.name.as_str())
+            .collect();
+        body.statements.iter().all(|stmt| {
+            let Statement::ExpressionStatement(expr_stmt) = stmt else {
+                return false;
+            };
+            match &expr_stmt.expression {
+                Expression::CallExpression(call) => matches!(call.callee, Expression::Super(_)),
+                Expression::AssignmentExpression(assign) => {
+                    assign.operator == AssignmentOperator::Assign
+                        && matches!(
+                            &assign.left,
+                            AssignmentTarget::StaticMemberExpression(member)
+                                if matches!(member.object, Expression::ThisExpression(_))
+                        )
+                        && matches!(
+                            &assign.right,
+                            Expression::Identifier(ident)
+                                if parameters.contains(ident.name.as_str())
+                        )
+                }
+                _ => false,
+            }
+        })
+    }
+
     /// Fingerprint for an arrow-function class field, shaped exactly like
     /// [`Self::method_body_fingerprint`] so `handle = () => {…}` and
     /// `handle() {…}` with equal bodies hash identically.
@@ -610,29 +716,71 @@ impl ClassExtractor {
 
         // Walk through all statements and find classes
         for statement in &ret.program.body {
-            match statement {
-                Statement::ExportDefaultDeclaration(export) => {
-                    if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class) =
-                        &export.declaration
-                    {
-                        classes.push(self.extract_class(class));
-                    }
-                }
-                Statement::ExportNamedDeclaration(export) => {
-                    if let Some(oxc_ast::ast::Declaration::ClassDeclaration(class)) =
-                        &export.declaration
-                    {
-                        classes.push(self.extract_class(class));
-                    }
-                }
-                Statement::ClassDeclaration(class) => {
-                    classes.push(self.extract_class(class));
-                }
-                _ => {}
-            }
+            self.extract_classes_from_statement(statement, &mut classes, "");
         }
 
         Ok(classes)
+    }
+
+    /// `qualifier` is the dotted path of the enclosing `namespace`/`module`
+    /// blocks (`""` at the top level); see [`crate::module_scope`].
+    fn extract_classes_from_statement(
+        &self,
+        statement: &Statement,
+        classes: &mut Vec<ClassDefinition>,
+        qualifier: &str,
+    ) {
+        match statement {
+            Statement::ExportDefaultDeclaration(export) => {
+                if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class) =
+                    &export.declaration
+                {
+                    classes.push(self.extract_class(class, qualifier));
+                }
+            }
+            Statement::ExportNamedDeclaration(export) => match &export.declaration {
+                Some(oxc_ast::ast::Declaration::ClassDeclaration(class)) => {
+                    classes.push(self.extract_class(class, qualifier));
+                }
+                Some(oxc_ast::ast::Declaration::TSModuleDeclaration(module)) => {
+                    self.extract_classes_from_module(module, classes, qualifier);
+                }
+                _ => {}
+            },
+            Statement::ClassDeclaration(class) => {
+                classes.push(self.extract_class(class, qualifier));
+            }
+            // `namespace`/`module` blocks are ordinary declaration scopes
+            // for the classes inside them; they used to be skipped. Their
+            // classes are reported under the qualified name
+            // (`Legacy.Pager`).
+            Statement::TSModuleDeclaration(module) => {
+                self.extract_classes_from_module(module, classes, qualifier);
+            }
+            _ => {}
+        }
+    }
+
+    fn extract_classes_from_module(
+        &self,
+        module: &oxc_ast::ast::TSModuleDeclaration,
+        classes: &mut Vec<ClassDefinition>,
+        qualifier: &str,
+    ) {
+        let Some(body) = &module.body else {
+            return;
+        };
+        let qualifier = module_qualifier(&module.id, qualifier);
+        match body {
+            oxc_ast::ast::TSModuleDeclarationBody::TSModuleDeclaration(inner) => {
+                self.extract_classes_from_module(inner, classes, &qualifier);
+            }
+            oxc_ast::ast::TSModuleDeclarationBody::TSModuleBlock(block) => {
+                for stmt in &block.body {
+                    self.extract_classes_from_statement(stmt, classes, &qualifier);
+                }
+            }
+        }
     }
 }
 
@@ -681,5 +829,127 @@ class IgnoredService {
 
         let ignored = classes.iter().find(|class| class.name == "IgnoredService").unwrap();
         assert!(ignored.has_ignore_directive);
+    }
+
+    #[test]
+    fn working_constructors_are_members_with_desugared_parameter_properties() {
+        let shorthand = extract_classes_from_code(
+            "export class A extends B { constructor(private readonly repo: Repo) { super(); this.repo.warm(); } }",
+            "a.ts",
+        )
+        .unwrap();
+        let explicit = extract_classes_from_code(
+            "export class C extends B { private readonly repo: Repo; constructor(repo: Repo) { super(); this.repo = repo; this.repo.warm(); } }",
+            "b.ts",
+        )
+        .unwrap();
+        let ctor = |class: &ClassDefinition| {
+            class
+                .methods
+                .iter()
+                .find(|m| m.kind == MethodKind::Constructor)
+                .cloned()
+                .expect("constructor member")
+        };
+        let (a, c) = (ctor(&shorthand[0]), ctor(&explicit[0]));
+        assert_eq!(a.name, "constructor");
+        assert!(a.body_fingerprint.is_some());
+        assert_eq!(
+            a.body_fingerprint, c.body_fingerprint,
+            "shorthand and explicit wiring must fingerprint identically"
+        );
+
+        let divergent = extract_classes_from_code(
+            "export class D extends B { private readonly repo: Repo; constructor(repo: Repo) { super(); this.repo = repo; this.repo.warm(); this.repo.prime(); } }",
+            "d.ts",
+        )
+        .unwrap();
+        assert_ne!(ctor(&divergent[0]).body_fingerprint, c.body_fingerprint);
+    }
+
+    #[test]
+    fn wiring_only_constructors_are_not_members() {
+        for source in [
+            "export class A { constructor(private readonly repo: Repo) {} }",
+            "export class B extends Base { constructor(private readonly repo: Repo) { super(); } }",
+            "export class C { private repo: Repo; constructor(repo: Repo) { this.repo = repo; } }",
+        ] {
+            let classes = extract_classes_from_code(source, "wiring.ts").unwrap();
+            assert!(
+                classes[0].methods.iter().all(|m| m.kind != MethodKind::Constructor),
+                "wiring-only constructor must not be a member: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn computed_and_private_member_keys_are_kept() {
+        let classes = extract_classes_from_code(
+            "export class C { #count = 0; [Symbol.iterator]() { return this; } get [Symbol.toStringTag]() { return 'C'; } }",
+            "c.ts",
+        )
+        .unwrap();
+        let props: Vec<&str> = classes[0].properties.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(props, vec!["#count"]);
+        let methods: Vec<&str> = classes[0].methods.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(methods, vec!["[Symbol.iterator]", "[Symbol.toStringTag]"]);
+    }
+
+    #[test]
+    fn heritage_is_recorded_as_written() {
+        let classes = extract_classes_from_code(
+            r"
+export class Widget extends React.Component<Props, State> implements ts.Node, Disposable {}
+export class Mixed extends Mixin( Base ) {}
+export class Plain extends Base {}
+",
+            "h.ts",
+        )
+        .unwrap();
+        assert_eq!(classes[0].extends.as_deref(), Some("React.Component<Props,State>"));
+        assert_eq!(classes[0].implements, vec!["ts.Node", "Disposable"]);
+        assert_eq!(classes[1].extends.as_deref(), Some("Mixin(Base)"));
+        assert_eq!(classes[2].extends.as_deref(), Some("Base"));
+    }
+
+    #[test]
+    fn constructors_storing_non_parameters_are_work() {
+        // `this.registry = globalRegistry` stores something the parameter
+        // list never mentions; that is work, not wiring.
+        let classes = extract_classes_from_code(
+            "export class A { private registry: Registry; constructor() { this.registry = globalRegistry; } }",
+            "work.ts",
+        )
+        .unwrap();
+        assert!(classes[0].methods.iter().any(|m| m.kind == MethodKind::Constructor));
+
+        // Destructured and rest parameters are still parameters.
+        for source in [
+            "export class B { constructor({ host, port }: Opts) { this.host = host; this.port = port; } }",
+            "export class C { constructor(...items: string[]) { this.items = items; } }",
+        ] {
+            let classes = extract_classes_from_code(source, "wiring.ts").unwrap();
+            assert!(
+                classes[0].methods.iter().all(|m| m.kind != MethodKind::Constructor),
+                "parameter wiring must not be a member: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_scoped_classes_are_extracted() {
+        let source = r"
+export namespace Legacy {
+    export class Pager {
+        advance(): void {}
+    }
+    namespace Inner {
+        class Hidden {}
+    }
+}
+";
+        let classes = extract_classes_from_code(source, "test.ts").unwrap();
+        let names: Vec<&str> = classes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Legacy.Pager", "Legacy.Inner.Hidden"]);
     }
 }

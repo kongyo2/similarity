@@ -82,9 +82,17 @@ pub fn compare_types(
     let property_matches =
         find_property_matches(&normalized1, &normalized2, options.property_match_threshold);
 
-    // Calculate structural similarity
+    // Calculate structural similarity. Heritage is part of the contract: an
+    // interface that `extends` a base carries every member of that base, so
+    // two declarations with identical own members but different (or
+    // one-sided) `extends` clauses are different shapes — the compiler's
+    // `NonNullExpression extends LeftHandSideExpressionBase` vs
+    // `VoidExpression extends UnaryExpressionBase` twins used to score as
+    // near-duplicates on their shared `expression` member alone.
+    let heritage_factor = if normalized1.extends == normalized2.extends { 1.0 } else { 0.7 };
     let structural_similarity =
-        calculate_structural_similarity(&normalized1, &normalized2, &property_matches);
+        calculate_structural_similarity(&normalized1, &normalized2, &property_matches)
+            * heritage_factor;
 
     // Calculate naming similarity
     let naming_similarity =
@@ -169,8 +177,28 @@ fn calculate_structural_similarity(
     // Calculate similarity based on matched properties
     let average_match_quality = total_match_score / matched_count as f64;
     let coverage_ratio = (matched_count * 2) as f64 / (total_props1 + total_props2) as f64;
+    let mut structural = average_match_quality * coverage_ratio;
 
-    average_match_quality * coverage_ratio
+    // Discriminant mismatch: a same-named member typed with a literal (or
+    // with members of the same enum) on both sides but with DIFFERENT
+    // values is the discriminated-union pattern — `kind:
+    // SyntaxKind.ForInStatement` vs `kind: SyntaxKind.ForOfStatement`.
+    // Such variants are disjoint types by construction however many other
+    // members they share (the compiler's AST interfaces share five), so
+    // the structural evidence is halved rather than diluted one member's
+    // worth.
+    let discriminant_mismatch = matches.iter().any(|property_match| {
+        property_match.prop1 == property_match.prop2
+            && crate::type_normalizer::is_discriminant_mismatch(
+                &type1.properties[&property_match.prop1],
+                &type2.properties[&property_match.prop2],
+            )
+    });
+    if discriminant_mismatch {
+        structural *= 0.5;
+    }
+
+    structural
 }
 
 /// Calculate naming similarity between two normalized types
@@ -652,5 +680,64 @@ mod tests {
         let type4 = create_test_type("Empty", vec![]);
         let same = compare_types(&type3, &type4, &options);
         assert!(same.similarity >= 0.9, "identical empty names must match, got {}", same.similarity);
+    }
+
+    #[test]
+    fn heritage_is_part_of_the_contract() {
+        // XT-N14 shape: identical own members, one side extends a base.
+        let options = TypeComparisonOptions::default();
+        fn members(names: [&str; 3]) -> Vec<(&str, &str, bool, bool)> {
+            names.iter().map(|name| (*name, "string", false, false)).collect()
+        }
+        let mut with_base = create_test_type("AuditEvent", members(["actorId", "action", "targetId"]));
+        with_base.extends = vec!["EventBase".to_string()];
+        let without_base = create_test_type("AuditRecord", members(["actorId", "action", "targetId"]));
+        let result = compare_types(&with_base, &without_base, &options);
+        assert!(
+            result.similarity < 0.8,
+            "one-sided extends must stay below threshold, got {}",
+            result.similarity
+        );
+
+        let mut same_base = create_test_type("ChargeEvent", members(["actorId", "action", "targetId"]));
+        same_base.extends = vec!["EventBase".to_string()];
+        let same = compare_types(&with_base, &same_base, &options);
+        assert!(same.similarity > 0.95, "shared heritage must not be penalized, got {}", same.similarity);
+    }
+
+    #[test]
+    fn discriminant_mismatch_halves_structural_evidence() {
+        // The compiler's `ForInStatement` / `ForOfStatement` interfaces:
+        // five shared members, one enum-member discriminant apart.
+        let options = TypeComparisonOptions::default();
+        let variant = |name: &str, kind: &str| {
+            create_test_type(
+                name,
+                vec![
+                    ("kind", kind, false, false),
+                    ("awaitModifier", "AwaitKeyword", true, false),
+                    ("initializer", "ForInitializer", false, false),
+                    ("expression", "Expression", false, false),
+                    ("statement", "Statement", false, false),
+                ],
+            )
+        };
+        let for_in = variant("ForInStatement", "SyntaxKind.ForInStatement");
+        let for_of = variant("ForOfStatement", "SyntaxKind.ForOfStatement");
+        let result = compare_types(&for_in, &for_of, &options);
+        assert!(
+            result.similarity < 0.7,
+            "distinct discriminants must stay well below threshold, got {}",
+            result.similarity
+        );
+        let twin = variant("ForInLoop", "SyntaxKind.ForInStatement");
+        let same = compare_types(&for_in, &twin, &options);
+        assert!(same.similarity > 0.95, "same discriminant is a plain twin, got {}", same.similarity);
+
+        // String-literal discriminants behave the same way.
+        let click = create_test_type("ClickEvt", vec![("kind", "\"click\"", false, false), ("x", "number", false, false), ("y", "number", false, false)]);
+        let tap = create_test_type("TapEvt", vec![("kind", "\"tap\"", false, false), ("x", "number", false, false), ("y", "number", false, false)]);
+        let literal = compare_types(&click, &tap, &options);
+        assert!(literal.similarity < 0.7, "got {}", literal.similarity);
     }
 }

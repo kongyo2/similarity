@@ -66,11 +66,13 @@ pub struct FunctionDefinition {
     /// arrows, and constructors this is always `Normal`.
     pub method_kind: MethodKind,
     /// The exact source text of the method key (`"alpha"`, `#load`,
-    /// `[Symbol.iterator]`, …) or, for functions and arrows, the
-    /// declaration name. Used in the normalization wrapper so a
-    /// `static "alpha"()` and a `static "beta"()` do not collapse onto
-    /// the same `anonymous` placeholder the simple `name` field uses.
-    /// Falls back to `name` when the underlying span can't be recovered.
+    /// `[Symbol.iterator]`, …) or, for functions and arrows, the name the
+    /// body is bound under — the declaration name, or a named function
+    /// expression's own name (`recur` in `const f = function recur() {…}`).
+    /// Used in the normalization wrapper so a `static "alpha"()` and a
+    /// `static "beta"()` do not collapse onto one placeholder, and so
+    /// recursive self-references keep resolving. Falls back to `name`
+    /// when the underlying span can't be recovered.
     pub display_name: String,
     pub start_line: u32,
     pub end_line: u32,
@@ -217,210 +219,45 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
     match stmt {
         Statement::FunctionDeclaration(func) => {
             if let Some(name) = &func.id {
-                let func_name = name.name.to_string();
-                let params = extract_parameters(&func.params);
-                let start_line = ctx.line_number(func.span.start);
-                ctx.functions.push(FunctionDefinition {
-                    name: func_name.clone(),
-                    function_type: FunctionType::Function,
-                    parameters: params,
-                    body_span: func.span,
-                    params_span: func.params.span,
-                    body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
-                    is_arrow_expression: false,
-                    is_async: func.r#async,
-                    is_generator: func.generator,
-                    is_static: false,
-                    method_kind: MethodKind::Normal,
-                    display_name: func_name.clone(),
-                    start_line,
-                    end_line: ctx.line_number(func.span.end),
-                    class_name: None,
-                    parent_function: ctx.parent_function.clone(),
-                    has_ignore_directive: has_similarity_ignore_directive(
-                        ctx.source_text,
-                        start_line as usize,
-                    ),
-                });
-
-                // Extract nested functions within the function body
-                if let Some(body) = &func.body {
-                    let saved_parent = ctx.parent_function.clone();
-                    ctx.parent_function = Some(func_name);
-                    extract_from_function_body(body, ctx);
-                    ctx.parent_function = saved_parent;
-                }
+                push_function_like(func, name.name.to_string(), ctx);
             }
         }
-        Statement::ClassDeclaration(class) => {
-            let class_name = class.id.as_ref().map(|id| id.name.to_string());
-            let saved_class_name = ctx.class_name.clone();
-            ctx.class_name = class_name.clone();
-
-            for element in &class.body.body {
-                if let ClassElement::MethodDefinition(method) = element {
-                    let method_name = match &method.key {
-                        PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
-                        PropertyKey::PrivateIdentifier(ident) => format!("#{}", ident.name),
-                        _ => "anonymous".to_string(),
-                    };
-
-                    let params = extract_parameters(&method.value.params);
-                    let function_type = if method.kind == MethodDefinitionKind::Constructor {
-                        FunctionType::Constructor
-                    } else {
-                        FunctionType::Method
-                    };
-                    let method_kind = match method.kind {
-                        MethodDefinitionKind::Get => MethodKind::Getter,
-                        MethodDefinitionKind::Set => MethodKind::Setter,
-                        _ => MethodKind::Normal,
-                    };
-                    // Capture the original source text of the method key so
-                    // string/number literal and computed keys (which the
-                    // simple `method_name` resolver flattens to
-                    // `"anonymous"`) still differentiate during
-                    // comparison, and so private `#name` methods survive
-                    // the normalization wrapper instead of collapsing onto
-                    // a `__sim__` placeholder.
-                    let method_display_name = method_key_source_text(&method.key, ctx.source_text)
-                        .unwrap_or_else(|| method_name.clone());
-
-                    let method_full_name = if let Some(ref class) = class_name {
-                        format!("{class}.{method_name}")
-                    } else {
-                        method_name.clone()
-                    };
-                    let start_line = ctx.line_number(method.span.start);
-
-                    ctx.functions.push(FunctionDefinition {
-                        name: method_name.clone(),
-                        function_type,
-                        parameters: params,
-                        body_span: method.span,
-                        params_span: method.value.params.span,
-                        body_block_span: method
-                            .value
-                            .body
-                            .as_ref()
-                            .map(|b| b.span)
-                            .unwrap_or(method.span),
-                        is_arrow_expression: false,
-                        is_async: method.value.r#async,
-                        is_generator: method.value.generator,
-                        is_static: method.r#static,
-                        method_kind,
-                        display_name: method_display_name.clone(),
-                        start_line,
-                        end_line: ctx.line_number(method.span.end),
-                        class_name: class_name.clone(),
-                        parent_function: ctx.parent_function.clone(),
-                        has_ignore_directive: has_similarity_ignore_directive(
-                            ctx.source_text,
-                            start_line as usize,
-                        ),
-                    });
-
-                    // Extract nested functions within method body
-                    if let Some(body) = &method.value.body {
-                        let saved_parent = ctx.parent_function.clone();
-                        ctx.parent_function = Some(method_full_name);
-                        extract_from_function_body(body, ctx);
-                        ctx.parent_function = saved_parent;
-                    }
-                }
-            }
-
-            ctx.class_name = saved_class_name;
-        }
-        Statement::VariableDeclaration(var_decl) => {
-            for decl in &var_decl.declarations {
-                if let Some(Expression::ArrowFunctionExpression(arrow)) = &decl.init {
-                    if let BindingPattern::BindingIdentifier(ident) = &decl.id {
-                        let params = extract_parameters(&arrow.params);
-                        let arrow_name = ident.name.to_string();
-                        let start_line = ctx.line_number(arrow.span.start);
-                        ctx.functions.push(FunctionDefinition {
-                            name: arrow_name.clone(),
-                            function_type: FunctionType::Arrow,
-                            parameters: params,
-                            body_span: arrow.span,
-                            params_span: arrow.params.span,
-                            body_block_span: arrow.body.span,
-                            is_arrow_expression: arrow.expression,
-                            is_async: arrow.r#async,
-                            is_generator: false,
-                            is_static: false,
-                            method_kind: MethodKind::Normal,
-                            display_name: arrow_name.clone(),
-                            start_line,
-                            end_line: ctx.line_number(arrow.span.end),
-                            class_name: None,
-                            parent_function: ctx.parent_function.clone(),
-                            has_ignore_directive: has_similarity_ignore_directive(
-                                ctx.source_text,
-                                start_line as usize,
-                            ),
-                        });
-
-                        // Extract nested functions within arrow function body
-                        if !arrow.expression {
-                            let saved_parent = ctx.parent_function.clone();
-                            ctx.parent_function = Some(arrow_name);
-                            extract_from_function_body(&arrow.body, ctx);
-                            ctx.parent_function = saved_parent;
-                        }
-                    }
-                }
-            }
-        }
+        Statement::ClassDeclaration(class) => extract_class_members(class, ctx),
+        Statement::VariableDeclaration(var_decl) => extract_variable_functions(var_decl, ctx),
+        // `namespace`/`module` blocks are ordinary declaration scopes for
+        // the functions they contain (`namespace ts { export function
+        // isBlock(node) {…} }` is the classic TypeScript-compiler style);
+        // skipping them hid every function declared that way.
+        Statement::TSModuleDeclaration(module) => extract_module_body(module, ctx),
         Statement::ExportNamedDeclaration(export) => {
             if let Some(decl) = &export.declaration {
                 extract_from_declaration(decl, ctx);
             }
         }
-        Statement::ExportDefaultDeclaration(export) => {
-            if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
+        // `export default` takes a declaration or an expression; the class
+        // and expression forms used to contribute nothing, so an arrow
+        // field or method in `export default class Relay {…}` never met
+        // its twin in a named class.
+        Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
                 let name = func
                     .id
                     .as_ref()
                     .map(|id| id.name.to_string())
                     .unwrap_or_else(|| "default".to_string());
-                let params = extract_parameters(&func.params);
-                let func_name = name.clone();
-                let start_line = ctx.line_number(func.span.start);
-                ctx.functions.push(FunctionDefinition {
-                    name: func_name.clone(),
-                    function_type: FunctionType::Function,
-                    parameters: params,
-                    body_span: func.span,
-                    params_span: func.params.span,
-                    body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
-                    is_arrow_expression: false,
-                    is_async: func.r#async,
-                    is_generator: func.generator,
-                    is_static: false,
-                    method_kind: MethodKind::Normal,
-                    display_name: func_name.clone(),
-                    start_line,
-                    end_line: ctx.line_number(func.span.end),
-                    class_name: None,
-                    parent_function: ctx.parent_function.clone(),
-                    has_ignore_directive: has_similarity_ignore_directive(
-                        ctx.source_text,
-                        start_line as usize,
-                    ),
-                });
-
-                // Extract nested functions within the function body
-                if let Some(body) = &func.body {
-                    let saved_parent = ctx.parent_function.clone();
-                    ctx.parent_function = Some(func_name);
-                    extract_from_function_body(body, ctx);
-                    ctx.parent_function = saved_parent;
-                }
+                push_function_like(func, name, ctx);
             }
-        }
+            ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                extract_class_members(class, ctx);
+            }
+            ExportDefaultDeclarationKind::FunctionExpression(func) => {
+                push_function_like(func, "default".to_string(), ctx);
+            }
+            ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
+                push_arrow_binding(arrow, "default".to_string(), ctx);
+            }
+            _ => {}
+        },
         _ => {}
     }
 }
@@ -429,25 +266,207 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
     match decl {
         Declaration::FunctionDeclaration(func) => {
             if let Some(name) = &func.id {
-                let func_name = name.name.to_string();
-                let params = extract_parameters(&func.params);
-                let start_line = ctx.line_number(func.span.start);
+                push_function_like(func, name.name.to_string(), ctx);
+            }
+        }
+        Declaration::ClassDeclaration(class) => extract_class_members(class, ctx),
+        Declaration::VariableDeclaration(var) => extract_variable_functions(var, ctx),
+        Declaration::TSModuleDeclaration(module) => extract_module_body(module, ctx),
+        _ => {}
+    }
+}
+
+/// Walk a `namespace`/`module` body (including the nested-name form
+/// `namespace a.b.c { … }`, which oxc represents as nested declarations).
+fn extract_module_body(module: &TSModuleDeclaration, ctx: &mut ExtractionContext) {
+    let Some(body) = &module.body else {
+        return;
+    };
+    match body {
+        TSModuleDeclarationBody::TSModuleDeclaration(inner) => extract_module_body(inner, ctx),
+        TSModuleDeclarationBody::TSModuleBlock(block) => {
+            for stmt in &block.body {
+                extract_from_statement(stmt, ctx);
+            }
+        }
+    }
+}
+
+/// Record a `function` (declaration, default export, or a function
+/// expression bound to a variable) under `name` and walk its body for
+/// nested functions.
+///
+/// Bodiless declarations — overload signatures, `declare function …;`,
+/// ambient members — are skipped entirely: there is no code to
+/// deduplicate, and comparing their (type-less) parameter lists used to
+/// report every overload of the same function as a 1.0 duplicate of the
+/// next one.
+fn push_function_like(func: &Function, name: String, ctx: &mut ExtractionContext) {
+    let Some(body) = &func.body else {
+        return;
+    };
+    // A named function expression (`const factorial = function recur(n)
+    // {…}`) binds its own name inside its body. The comparison fragment
+    // is rebuilt under that binding so `recur(n - 1)` keeps resolving to
+    // the function itself; rebuilding it under the variable name used to
+    // leave `recur` as a free identifier that differed between otherwise
+    // identical copies.
+    let binding_name = func.id.as_ref().map_or_else(|| name.clone(), |id| id.name.to_string());
+    let start_line = ctx.line_number(func.span.start);
+    ctx.functions.push(FunctionDefinition {
+        name: name.clone(),
+        function_type: FunctionType::Function,
+        parameters: extract_parameters(&func.params),
+        body_span: func.span,
+        params_span: func.params.span,
+        body_block_span: body.span,
+        is_arrow_expression: false,
+        is_async: func.r#async,
+        is_generator: func.generator,
+        is_static: false,
+        method_kind: MethodKind::Normal,
+        display_name: binding_name,
+        start_line,
+        end_line: ctx.line_number(func.span.end),
+        class_name: None,
+        parent_function: ctx.parent_function.clone(),
+        has_ignore_directive: has_similarity_ignore_directive(ctx.source_text, start_line as usize),
+    });
+
+    let saved_parent = ctx.parent_function.clone();
+    ctx.parent_function = Some(name);
+    extract_from_function_body(body, ctx);
+    ctx.parent_function = saved_parent;
+}
+
+/// Record an arrow function bound to a variable (`const f = (x) => …`).
+fn push_arrow_binding(arrow: &ArrowFunctionExpression, name: String, ctx: &mut ExtractionContext) {
+    let start_line = ctx.line_number(arrow.span.start);
+    ctx.functions.push(FunctionDefinition {
+        name: name.clone(),
+        function_type: FunctionType::Arrow,
+        parameters: extract_parameters(&arrow.params),
+        body_span: arrow.span,
+        params_span: arrow.params.span,
+        body_block_span: arrow.body.span,
+        is_arrow_expression: arrow.expression,
+        is_async: arrow.r#async,
+        is_generator: false,
+        is_static: false,
+        method_kind: MethodKind::Normal,
+        display_name: name.clone(),
+        start_line,
+        end_line: ctx.line_number(arrow.span.end),
+        class_name: None,
+        parent_function: ctx.parent_function.clone(),
+        has_ignore_directive: has_similarity_ignore_directive(ctx.source_text, start_line as usize),
+    });
+
+    if !arrow.expression {
+        let saved_parent = ctx.parent_function.clone();
+        ctx.parent_function = Some(name);
+        extract_from_function_body(&arrow.body, ctx);
+        ctx.parent_function = saved_parent;
+    }
+}
+
+/// `const f = (x) => …` and `const f = function (x) { … }` both bind a
+/// function to a name; the function-expression spelling used to be
+/// invisible to the scan.
+fn extract_variable_functions(var_decl: &VariableDeclaration, ctx: &mut ExtractionContext) {
+    for decl in &var_decl.declarations {
+        let BindingPattern::BindingIdentifier(ident) = &decl.id else {
+            continue;
+        };
+        match &decl.init {
+            Some(Expression::ArrowFunctionExpression(arrow)) => {
+                push_arrow_binding(arrow, ident.name.to_string(), ctx);
+            }
+            Some(Expression::FunctionExpression(func)) => {
+                push_function_like(func, ident.name.to_string(), ctx);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Member name for a class element key: identifiers as written, private
+/// names with their `#`, string-literal keys by value, numeric and
+/// computed keys by their source text (`0`, `[Symbol.iterator]`). Every
+/// non-identifier key used to collapse onto `anonymous`, which made the
+/// reported name useless even though `display_name` kept such methods
+/// apart during comparison.
+fn class_member_name(key: &PropertyKey, computed: bool, source: &str) -> String {
+    match key {
+        PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
+        PropertyKey::PrivateIdentifier(ident) => format!("#{}", ident.name),
+        PropertyKey::StringLiteral(literal) => literal.value.to_string(),
+        _ => method_key_display_text(key, computed, source)
+            .unwrap_or_else(|| "anonymous".to_string()),
+    }
+}
+
+/// Exact source text of a member key, bracketed when the key is computed
+/// so the text re-parses as a key inside the synthetic class wrapper.
+fn method_key_display_text(key: &PropertyKey, computed: bool, source: &str) -> Option<String> {
+    let text = method_key_source_text(key, source)?;
+    Some(if computed && !text.starts_with('[') { format!("[{text}]") } else { text })
+}
+
+fn extract_class_members(class: &Class, ctx: &mut ExtractionContext) {
+    let class_name = class.id.as_ref().map(|id| id.name.to_string());
+    let saved_class_name = ctx.class_name.clone();
+    ctx.class_name = class_name.clone();
+
+    for element in &class.body.body {
+        match element {
+            ClassElement::MethodDefinition(method) => {
+                // Abstract methods and overload signatures have no body —
+                // nothing to compare (see `push_function_like`).
+                let Some(body) = &method.value.body else {
+                    continue;
+                };
+                let method_name = class_member_name(&method.key, method.computed, ctx.source_text);
+                let function_type = if method.kind == MethodDefinitionKind::Constructor {
+                    FunctionType::Constructor
+                } else {
+                    FunctionType::Method
+                };
+                let method_kind = match method.kind {
+                    MethodDefinitionKind::Get => MethodKind::Getter,
+                    MethodDefinitionKind::Set => MethodKind::Setter,
+                    _ => MethodKind::Normal,
+                };
+                // Capture the original source text of the method key so
+                // string/number literal and computed keys keep their exact
+                // spelling during comparison, and so private `#name`
+                // methods survive the normalization wrapper instead of
+                // collapsing onto a `__sim__` placeholder.
+                let method_display_name =
+                    method_key_display_text(&method.key, method.computed, ctx.source_text)
+                        .unwrap_or_else(|| method_name.clone());
+                let method_full_name = match &class_name {
+                    Some(class) => format!("{class}.{method_name}"),
+                    None => method_name.clone(),
+                };
+                let start_line = ctx.line_number(method.span.start);
+
                 ctx.functions.push(FunctionDefinition {
-                    name: func_name.clone(),
-                    function_type: FunctionType::Function,
-                    parameters: params,
-                    body_span: func.span,
-                    params_span: func.params.span,
-                    body_block_span: func.body.as_ref().map(|b| b.span).unwrap_or(func.span),
+                    name: method_name,
+                    function_type,
+                    parameters: extract_parameters(&method.value.params),
+                    body_span: method.span,
+                    params_span: method.value.params.span,
+                    body_block_span: body.span,
                     is_arrow_expression: false,
-                    is_async: func.r#async,
-                    is_generator: func.generator,
-                    is_static: false,
-                    method_kind: MethodKind::Normal,
-                    display_name: func_name.clone(),
+                    is_async: method.value.r#async,
+                    is_generator: method.value.generator,
+                    is_static: method.r#static,
+                    method_kind,
+                    display_name: method_display_name,
                     start_line,
-                    end_line: ctx.line_number(func.span.end),
-                    class_name: None,
+                    end_line: ctx.line_number(method.span.end),
+                    class_name: class_name.clone(),
                     parent_function: ctx.parent_function.clone(),
                     has_ignore_directive: has_similarity_ignore_directive(
                         ctx.source_text,
@@ -455,139 +474,65 @@ fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
                     ),
                 });
 
-                // Extract nested functions within the function body
-                if let Some(body) = &func.body {
+                let saved_parent = ctx.parent_function.clone();
+                ctx.parent_function = Some(method_full_name);
+                extract_from_function_body(body, ctx);
+                ctx.parent_function = saved_parent;
+            }
+            // `handle = (event) => { … }` class fields are methods in
+            // everything but declaration syntax (the class comparator
+            // already treats them that way); extract them so an
+            // arrow-field method and its `handle(event) { … }` twin meet
+            // in the function scan.
+            ClassElement::PropertyDefinition(prop) => {
+                let Some(Expression::ArrowFunctionExpression(arrow)) = &prop.value else {
+                    continue;
+                };
+                let field_name = class_member_name(&prop.key, prop.computed, ctx.source_text);
+                let display_name =
+                    method_key_display_text(&prop.key, prop.computed, ctx.source_text)
+                        .unwrap_or_else(|| field_name.clone());
+                let field_full_name = match &class_name {
+                    Some(class) => format!("{class}.{field_name}"),
+                    None => field_name.clone(),
+                };
+                let start_line = ctx.line_number(prop.span.start);
+
+                ctx.functions.push(FunctionDefinition {
+                    name: field_name,
+                    function_type: FunctionType::Method,
+                    parameters: extract_parameters(&arrow.params),
+                    body_span: arrow.span,
+                    params_span: arrow.params.span,
+                    body_block_span: arrow.body.span,
+                    is_arrow_expression: arrow.expression,
+                    is_async: arrow.r#async,
+                    is_generator: false,
+                    is_static: prop.r#static,
+                    method_kind: MethodKind::Normal,
+                    display_name,
+                    start_line,
+                    end_line: ctx.line_number(prop.span.end),
+                    class_name: class_name.clone(),
+                    parent_function: ctx.parent_function.clone(),
+                    has_ignore_directive: has_similarity_ignore_directive(
+                        ctx.source_text,
+                        start_line as usize,
+                    ),
+                });
+
+                if !arrow.expression {
                     let saved_parent = ctx.parent_function.clone();
-                    ctx.parent_function = Some(func_name);
-                    extract_from_function_body(body, ctx);
+                    ctx.parent_function = Some(field_full_name);
+                    extract_from_function_body(&arrow.body, ctx);
                     ctx.parent_function = saved_parent;
                 }
             }
+            _ => {}
         }
-        Declaration::ClassDeclaration(class) => {
-            let class_name = class.id.as_ref().map(|id| id.name.to_string());
-            let saved_class_name = ctx.class_name.clone();
-            ctx.class_name = class_name.clone();
-
-            for element in &class.body.body {
-                if let ClassElement::MethodDefinition(method) = element {
-                    let method_name = match &method.key {
-                        PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
-                        PropertyKey::PrivateIdentifier(ident) => format!("#{}", ident.name),
-                        _ => "anonymous".to_string(),
-                    };
-
-                    let params = extract_parameters(&method.value.params);
-                    let function_type = if method.kind == MethodDefinitionKind::Constructor {
-                        FunctionType::Constructor
-                    } else {
-                        FunctionType::Method
-                    };
-                    let method_kind = match method.kind {
-                        MethodDefinitionKind::Get => MethodKind::Getter,
-                        MethodDefinitionKind::Set => MethodKind::Setter,
-                        _ => MethodKind::Normal,
-                    };
-                    // Capture the original source text of the method key so
-                    // string/number literal and computed keys (which the
-                    // simple `method_name` resolver flattens to
-                    // `"anonymous"`) still differentiate during
-                    // comparison, and so private `#name` methods survive
-                    // the normalization wrapper instead of collapsing onto
-                    // a `__sim__` placeholder.
-                    let method_display_name = method_key_source_text(&method.key, ctx.source_text)
-                        .unwrap_or_else(|| method_name.clone());
-
-                    let method_full_name = if let Some(ref class) = class_name {
-                        format!("{class}.{method_name}")
-                    } else {
-                        method_name.clone()
-                    };
-                    let start_line = ctx.line_number(method.span.start);
-
-                    ctx.functions.push(FunctionDefinition {
-                        name: method_name.clone(),
-                        function_type,
-                        parameters: params,
-                        body_span: method.span,
-                        params_span: method.value.params.span,
-                        body_block_span: method
-                            .value
-                            .body
-                            .as_ref()
-                            .map(|b| b.span)
-                            .unwrap_or(method.span),
-                        is_arrow_expression: false,
-                        is_async: method.value.r#async,
-                        is_generator: method.value.generator,
-                        is_static: method.r#static,
-                        method_kind,
-                        display_name: method_display_name.clone(),
-                        start_line,
-                        end_line: ctx.line_number(method.span.end),
-                        class_name: class_name.clone(),
-                        parent_function: ctx.parent_function.clone(),
-                        has_ignore_directive: has_similarity_ignore_directive(
-                            ctx.source_text,
-                            start_line as usize,
-                        ),
-                    });
-
-                    // Extract nested functions within method body
-                    if let Some(body) = &method.value.body {
-                        let saved_parent = ctx.parent_function.clone();
-                        ctx.parent_function = Some(method_full_name);
-                        extract_from_function_body(body, ctx);
-                        ctx.parent_function = saved_parent;
-                    }
-                }
-            }
-
-            ctx.class_name = saved_class_name;
-        }
-        Declaration::VariableDeclaration(var) => {
-            for decl in &var.declarations {
-                if let Some(Expression::ArrowFunctionExpression(arrow)) = &decl.init {
-                    if let BindingPattern::BindingIdentifier(ident) = &decl.id {
-                        let params = extract_parameters(&arrow.params);
-                        let arrow_name = ident.name.to_string();
-                        let start_line = ctx.line_number(arrow.span.start);
-                        ctx.functions.push(FunctionDefinition {
-                            name: arrow_name.clone(),
-                            function_type: FunctionType::Arrow,
-                            parameters: params,
-                            body_span: arrow.span,
-                            params_span: arrow.params.span,
-                            body_block_span: arrow.body.span,
-                            is_arrow_expression: arrow.expression,
-                            is_async: arrow.r#async,
-                            is_generator: false,
-                            is_static: false,
-                            method_kind: MethodKind::Normal,
-                            display_name: arrow_name.clone(),
-                            start_line,
-                            end_line: ctx.line_number(arrow.span.end),
-                            class_name: None,
-                            parent_function: ctx.parent_function.clone(),
-                            has_ignore_directive: has_similarity_ignore_directive(
-                                ctx.source_text,
-                                start_line as usize,
-                            ),
-                        });
-
-                        // Extract nested functions within arrow function body
-                        if !arrow.expression {
-                            let saved_parent = ctx.parent_function.clone();
-                            ctx.parent_function = Some(arrow_name);
-                            extract_from_function_body(&arrow.body, ctx);
-                            ctx.parent_function = saved_parent;
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
     }
+
+    ctx.class_name = saved_class_name;
 }
 
 fn extract_parameters(params: &oxc_ast::ast::FormalParameters) -> Vec<String> {
@@ -1297,7 +1242,19 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
         }
     };
 
-    let body_text = safe_slice(func.body_block_span.start, func.body_block_span.end);
+    let raw_body_text = safe_slice(func.body_block_span.start, func.body_block_span.end);
+    // Wrap a single-expression arrow body in an explicit `return` so it
+    // ends up shaped like a block-bodied function. Without this an
+    // `(x) => x + 1` would parse as a top-level `ExpressionStatement →
+    // ArrowFunctionExpression`, adding a structural wrapper that an
+    // equivalent `function f(x) { return x + 1; }` would not have. Arrow
+    // class fields (`handle = (event) => event.id`) take the same wrapping
+    // on the method path below.
+    let body_text: String = if func.is_arrow_expression {
+        format!("{{ return {raw_body_text}; }}")
+    } else {
+        raw_body_text.to_string()
+    };
 
     match func.function_type {
         FunctionType::Method | FunctionType::Constructor => {
@@ -1381,21 +1338,11 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
             // Top-level functions and arrow declarations always bind to
             // an ordinary identifier, so the sanitizer is enough — there
             // is no private-method / string-literal-key path here.
-            let name_text = sanitize_function_name(&func.name);
-            if func.is_arrow_expression {
-                // Wrap a single-expression arrow body in an explicit
-                // `return` so it ends up shaped like a block-bodied
-                // function. Without this an `(x) => x + 1` would parse as
-                // a top-level `ExpressionStatement → ArrowFunctionExpression`,
-                // adding a structural wrapper that an equivalent
-                // `function f(x) { return x + 1; }` would not have.
-                format!(
-                    "{} {}{} {{ return {}; }}",
-                    prefix, name_text, params_text, body_text
-                )
-            } else {
-                format!("{} {}{} {}", prefix, name_text, params_text, body_text)
-            }
+            // `display_name` is the name the body is bound under: the
+            // declaration name, or a named function expression's own
+            // name, which its recursive calls refer to.
+            let name_text = sanitize_function_name(&func.display_name);
+            format!("{} {}{} {}", prefix, name_text, params_text, body_text)
         }
     }
 }
@@ -1412,10 +1359,14 @@ fn is_plain_identifier(name: &str) -> bool {
 }
 
 fn sanitize_function_name(name: &str) -> String {
-    if is_plain_identifier(name) {
-        name.to_string()
-    } else {
+    if !is_plain_identifier(name) {
         "__sim__".to_string()
+    } else if is_reserved_function_name(name) {
+        // `export default function () {…}` is recorded as `default`,
+        // which cannot head a `function` declaration.
+        format!("__f_{name}")
+    } else {
+        name.to_string()
     }
 }
 
@@ -2414,5 +2365,219 @@ export function ignoredExport() {
 
         let ignored_export = functions.iter().find(|f| f.name == "ignoredExport").unwrap();
         assert!(ignored_export.has_ignore_directive);
+    }
+
+    #[test]
+    fn bodiless_declarations_are_not_extracted() {
+        let code = r"
+export function visit(node: Node | undefined, test: (node: Node) => boolean): Node;
+export function visit(node: Node | undefined, test?: (node: Node) => boolean): Node | undefined;
+export function visit(node: Node | undefined, test?: (node: Node) => boolean): Node | undefined {
+    return node;
+}
+declare function readBuffer(path: string): string;
+export abstract class Store {
+    abstract find(id: string): Promise<string>;
+    remove(id: string): Promise<string> {
+        return Promise.resolve(id);
+    }
+}
+";
+        let functions = extract_functions("test.ts", code).unwrap();
+        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["visit", "remove"]);
+    }
+
+    #[test]
+    fn function_expressions_namespaces_and_arrow_fields_are_extracted() {
+        let code = r"
+export const parse = function (line: string): string {
+    return line.trim();
+};
+export namespace Legacy {
+    export function normalize(raw: string): string {
+        return raw.trim();
+    }
+    export namespace Inner {
+        export function deep(raw: string): string {
+            return raw.trim();
+        }
+    }
+}
+export class Relay {
+    handle = (event: string): void => {
+        console.log(event);
+    };
+    static tick = (): number => 1;
+}
+";
+        let functions = extract_functions("test.ts", code).unwrap();
+        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["parse", "normalize", "deep", "handle", "tick"]);
+        assert_eq!(functions[0].function_type, FunctionType::Function);
+        let handle = functions.iter().find(|f| f.name == "handle").unwrap();
+        assert_eq!(handle.function_type, FunctionType::Method);
+        assert_eq!(handle.class_name.as_deref(), Some("Relay"));
+        assert!(!handle.is_arrow_expression);
+        let tick = functions.iter().find(|f| f.name == "tick").unwrap();
+        assert!(tick.is_static);
+        assert!(tick.is_arrow_expression);
+    }
+
+    #[test]
+    fn arrow_field_and_method_twins_are_reported() {
+        // XF-P45 shape.
+        let code = r"
+export class ClickRelay {
+    handle = (event: string): void => {
+        if (!event) {
+            return;
+        }
+        this.sink(event.trim());
+    };
+}
+export class TapRelay {
+    handle(event: string): void {
+        if (!event) {
+            return;
+        }
+        this.sink(event.trim());
+    }
+}
+";
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(pairs.len(), 1, "arrow field vs method must report one pair");
+        assert!((pairs[0].similarity - 1.0).abs() < 1e-9, "got {}", pairs[0].similarity);
+    }
+
+    #[test]
+    fn named_function_expressions_keep_their_self_binding() {
+        // `const factorial = function recur(n) { … recur(n - 1) … }`: the
+        // fragment used to be rebuilt as `function factorial`, leaving
+        // `recur` a free identifier that differed from the twin's `go`.
+        let code = r"
+export const factorial = function recur(n: number): number {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * recur(n - 1);
+};
+export const fact = function go(n: number): number {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * go(n - 1);
+};
+";
+        let functions = extract_functions("test.ts", code).unwrap();
+        assert_eq!(functions[0].name, "factorial");
+        assert_eq!(functions[0].display_name, "recur");
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(pairs.len(), 1, "recursive twins must pair");
+        assert!((pairs[0].similarity - 1.0).abs() < 1e-9, "got {}", pairs[0].similarity);
+    }
+
+    #[test]
+    fn default_exports_take_part() {
+        let code = r"
+export default class Relay {
+    handle(event: string): void {
+        if (!event) {
+            return;
+        }
+        this.sink(event.trim());
+    }
+}
+export class TapRelay {
+    handle(event: string): void {
+        if (!event) {
+            return;
+        }
+        this.sink(event.trim());
+    }
+}
+";
+        let functions = extract_functions("test.ts", code).unwrap();
+        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["handle", "handle"]);
+        assert_eq!(functions[0].class_name.as_deref(), Some("Relay"));
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(pairs.len(), 1, "default-exported class methods must pair");
+
+        let expressions = extract_functions(
+            "test.ts",
+            "export default function (line: string): string {\n    return line.trim();\n}\n",
+        )
+        .unwrap();
+        assert_eq!(expressions[0].name, "default");
+        assert_eq!(
+            build_normalized_fragment(
+                &expressions[0],
+                "export default function (line: string): string {\n    return line.trim();\n}\n"
+            ),
+            "function __f_default(line: string) {\n    return line.trim();\n}"
+        );
+        let arrows =
+            extract_functions("test.ts", "export default (line: string) => line.trim();\n").unwrap();
+        assert_eq!(arrows[0].name, "default");
+        assert!(arrows[0].is_arrow_expression);
+    }
+
+    #[test]
+    fn non_identifier_member_keys_are_named_by_source() {
+        let code = r#"
+export class Mapper {
+    "alpha"(value: number): number { return value + 1; }
+    [Symbol.iterator]() { return this; }
+    0() { return 0; }
+    #hidden() { return 1; }
+    ["dyn" + "amic"] = (): void => {};
+}
+"#;
+        let functions = extract_functions("test.ts", code).unwrap();
+        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "[Symbol.iterator]", "0", "#hidden", "[\"dyn\" + \"amic\"]"]
+        );
+        let display: Vec<&str> = functions.iter().map(|f| f.display_name.as_str()).collect();
+        assert_eq!(
+            display,
+            vec!["\"alpha\"", "[Symbol.iterator]", "0", "#hidden", "[\"dyn\" + \"amic\"]"]
+        );
+    }
+
+    #[test]
+    fn overload_signatures_never_pair() {
+        // XF-N41 shape: identical (type-less) parameter lists across
+        // overload signatures used to score 1.0 against each other.
+        let code = r"
+export function visitNode<TIn extends Node | undefined, TOut extends Node>(
+    node: TIn,
+    visitor: Visitor,
+    test: (node: Node) => node is TOut,
+): TOut | (TIn & undefined);
+export function visitNode<TIn extends Node | undefined>(
+    node: TIn,
+    visitor: Visitor,
+    test?: (node: Node) => boolean,
+): Node | (TIn & undefined);
+export function visitNode(node: Node | undefined, visitor: Visitor, test?: (node: Node) => boolean): Node | undefined {
+    if (node === undefined) {
+        return node;
+    }
+    return visitor(node);
+}
+";
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "overload signatures must not pair, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
     }
 }

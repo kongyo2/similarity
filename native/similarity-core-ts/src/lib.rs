@@ -200,6 +200,19 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
             );
         }
 
+        // `extract_types_from_files` hands back a HashMap keyed by file, so
+        // the comparison order — and with it which side of a pair drives
+        // the greedy rename-tolerant property matching — used to change
+        // from run to run (the same corpus pair scored 0.830 on one run and
+        // 0.823 on the next). Sort so the same input always yields the same
+        // report.
+        all_types.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.name.cmp(&b.name))
+        });
+
         let mut options = TypeComparisonOptions::default();
         if let Some(allow_cross_kind) = input.allow_cross_kind {
             options.allow_cross_kind_comparison = allow_cross_kind;

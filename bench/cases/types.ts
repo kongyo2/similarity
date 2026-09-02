@@ -10,7 +10,9 @@
  * Negatives (XT-N*) are pairs that look similar (same property names or
  * similar shapes) but are genuinely different contracts: differing property
  * types, optionality flips, different generic arguments, different union
- * members, or different index-signature value types.
+ * members, different index-signature value types, distinct discriminants,
+ * different heritage, brand markers, tiny renamed shapes, and `typeof` /
+ * predicate members naming different things.
  */
 
 import type { BenchCase } from "../cases.js";
@@ -834,5 +836,412 @@ export interface FeatureToggle {
 `,
     },
     forbidPairs: [["FeatureFlags", "FeatureToggle"]],
+  },
+
+  // -------------------------------------------------------------------
+  // Real-world lookalikes from the TypeScript compiler's own AST and
+  // protocol declarations (`ast.generated.ts`, `proto.generated.ts`,
+  // `types.ts`), every one reported as a duplicate by v0.6.0.
+  // -------------------------------------------------------------------
+  {
+    id: "XT-N13",
+    mode: "types",
+    category: "discriminant-literal",
+    description:
+      "Discriminated-union members whose only own difference is the `kind` discriminant (an enum member or a string literal) — different node types, not one type spelled twice",
+    files: {
+      "a.ts": `
+declare const enum SyntaxKind {
+  DeleteExpression,
+  VoidExpression,
+}
+interface UnaryExpressionBase {
+  readonly flags: number;
+}
+interface Expression {
+  readonly pos: number;
+}
+
+export interface DeleteExpression extends UnaryExpressionBase {
+  readonly kind: SyntaxKind.DeleteExpression;
+  readonly expression: Expression;
+}
+
+export interface VoidExpression extends UnaryExpressionBase {
+  readonly kind: SyntaxKind.VoidExpression;
+  readonly expression: Expression;
+}
+
+export interface MouseEnterEvent {
+  kind: "mouse-enter";
+  x: number;
+  y: number;
+}
+
+export interface MouseLeaveEvent {
+  kind: "mouse-leave";
+  x: number;
+  y: number;
+}
+`,
+      "statements.ts": `
+declare const enum SyntaxKind {
+  ForInStatement,
+  ForOfStatement,
+}
+interface StatementBase {
+  readonly flags: number;
+}
+interface AwaitKeyword {
+  readonly pos: number;
+}
+interface ForInitializer {
+  readonly pos: number;
+}
+interface Expression {
+  readonly pos: number;
+}
+interface Statement {
+  readonly pos: number;
+}
+
+export interface ForInStatement extends StatementBase {
+  readonly kind: SyntaxKind.ForInStatement;
+  readonly awaitModifier?: AwaitKeyword;
+  readonly initializer: ForInitializer;
+  readonly expression: Expression;
+  readonly statement: Statement;
+}
+
+export interface ForOfStatement extends StatementBase {
+  readonly kind: SyntaxKind.ForOfStatement;
+  readonly awaitModifier?: AwaitKeyword;
+  readonly initializer: ForInitializer;
+  readonly expression: Expression;
+  readonly statement: Statement;
+}
+`,
+    },
+    forbidPairs: [
+      ["DeleteExpression", "VoidExpression"],
+      ["MouseEnterEvent", "MouseLeaveEvent"],
+      ["ForInStatement", "ForOfStatement"],
+    ],
+  },
+  {
+    id: "XT-N14",
+    mode: "types",
+    category: "heritage",
+    description:
+      "Identical own members under different (or one-sided) `extends` clauses: the inherited members make them different shapes",
+    files: {
+      "a.ts": `
+interface Type {
+  readonly id: number;
+}
+interface ObjectType extends Type {
+  readonly objectFlags: number;
+}
+
+export interface TypeReference extends ObjectType {
+  getTarget(): Type;
+}
+
+export interface StringMappingType extends Type {
+  getTarget(): Type;
+}
+
+interface EventBase {
+  readonly id: string;
+  readonly at: Date;
+}
+
+export interface AuditEvent extends EventBase {
+  actorId: string;
+  action: string;
+  targetId: string;
+}
+
+export interface AuditRecord {
+  actorId: string;
+  action: string;
+  targetId: string;
+}
+`,
+    },
+    forbidPairs: [
+      ["TypeReference", "StringMappingType"],
+      ["AuditEvent", "AuditRecord"],
+    ],
+  },
+  {
+    id: "XT-P21",
+    mode: "types",
+    category: "heritage",
+    description:
+      "Same heritage on both sides (also with the clause reordered) with renamed types is still one shape",
+    files: {
+      "a.ts": `
+interface EventBase {
+  readonly id: string;
+  readonly at: Date;
+}
+interface Tagged {
+  readonly tags: string[];
+}
+
+export interface PaymentCaptured extends EventBase, Tagged {
+  amountCents: number;
+  currency: string;
+  customerId: string;
+}
+
+export interface ChargeSettled extends Tagged, EventBase {
+  amountCents: number;
+  currency: string;
+  customerId: string;
+}
+`,
+    },
+    expectPairs: [["PaymentCaptured", "ChargeSettled"]],
+  },
+  {
+    id: "XT-N15",
+    mode: "types",
+    category: "brand-marker",
+    description:
+      "Brand interfaces carry one `any`-typed marker property each; a marker exists to make types distinct, so renamed markers are not a rename twin",
+    files: {
+      "a.ts": `
+interface NodeBase {
+  readonly pos: number;
+  readonly end: number;
+}
+
+export interface ExpressionBase extends NodeBase {
+  readonly _expressionBrand: any;
+}
+
+export interface StatementBase extends NodeBase {
+  readonly _statementBrand: any;
+}
+
+export interface TypeNodeBase extends NodeBase {
+  readonly _typeNodeBrand: any;
+}
+`,
+    },
+    forbidPairs: [
+      ["ExpressionBase", "StatementBase"],
+      ["ExpressionBase", "TypeNodeBase"],
+      ["StatementBase", "TypeNodeBase"],
+    ],
+  },
+  {
+    id: "XT-N16",
+    mode: "types",
+    category: "tiny-shape",
+    description:
+      "One- and two-member shapes with a renamed member share nothing but a primitive; the exact-name single-member pair is the positive control",
+    files: {
+      "a.ts": `
+export interface PackageInfo {
+  name: string;
+  version: string;
+}
+
+export interface KindMarkerInfo {
+  name: string;
+  value: string;
+}
+
+export type LSServerStart = {
+  version: string;
+};
+
+export type LSConnectionError = {
+  resultingAction: string;
+};
+
+export interface StradaVersion {
+  version: string;
+}
+`,
+    },
+    expectPairs: [["LSServerStart", "StradaVersion"]],
+    forbidPairs: [
+      ["PackageInfo", "KindMarkerInfo"],
+      ["LSServerStart", "LSConnectionError"],
+    ],
+  },
+  {
+    id: "XT-N17",
+    mode: "types",
+    category: "exotic-types",
+    description:
+      "`typeof` queries and type predicates naming different things are different contracts, not one opaque `unknown`",
+    files: {
+      "a.ts": `
+declare const stringSource: { read(): string };
+declare const numberSource: { read(): number };
+
+export interface StringChannel {
+  guard: (value: unknown) => value is string;
+  source: typeof stringSource;
+  label: string;
+}
+
+export interface NumberChannel {
+  guard: (value: unknown) => value is number;
+  source: typeof numberSource;
+  label: string;
+}
+`,
+    },
+    forbidPairs: [["StringChannel", "NumberChannel"]],
+  },
+  {
+    id: "XT-P22",
+    mode: "types",
+    category: "exotic-types",
+    description: "The same `typeof` query and predicate members under renamed types still match",
+    files: {
+      "a.ts": `
+declare const stringSource: { read(): string };
+
+export interface StringChannel {
+  guard: (value: unknown) => value is string;
+  source: typeof stringSource;
+  label: string;
+}
+
+export interface TextChannel {
+  guard: (input: unknown) => input is string;
+  source: typeof stringSource;
+  label: string;
+}
+`,
+    },
+    expectPairs: [["StringChannel", "TextChannel"]],
+  },
+  {
+    id: "XT-P23",
+    mode: "types",
+    category: "declaration-scope",
+    description: "Interface declared inside a namespace block vs a top-level interface with the same members",
+    files: {
+      "legacy.ts": `
+export namespace Legacy {
+  export interface Options {
+    host: string;
+    port: number;
+    secure: boolean;
+    retries: number;
+  }
+}
+`,
+      "options.ts": `
+export interface ConnectionOptions {
+  host: string;
+  port: number;
+  secure: boolean;
+  retries: number;
+}
+`,
+    },
+    expectPairs: [["Legacy.Options", "ConnectionOptions"]],
+  },
+
+  // -------------------------------------------------------------------
+  // heritage arguments — `extends Box<string>` and `extends Box<number>`
+  // inherit different members; the bare base name is not the contract.
+  // -------------------------------------------------------------------
+  {
+    id: "XT-N18",
+    mode: "types",
+    category: "heritage",
+    description:
+      "Identical own members under differently instantiated bases; the same instantiation is the positive control",
+    files: {
+      "string-box.ts": `
+export interface StringBox extends Box<string> {
+  id: number;
+  label: string;
+  createdAt: number;
+}
+`,
+      "number-box.ts": `
+export interface NumberBox extends Box<number> {
+  id: number;
+  label: string;
+  createdAt: number;
+}
+`,
+      "text-box.ts": `
+export interface TextBox extends Box<string> {
+  id: number;
+  label: string;
+  createdAt: number;
+}
+`,
+    },
+    expectPairs: [["StringBox", "TextBox"]],
+    forbidPairs: [
+      ["StringBox", "NumberBox"],
+      ["TextBox", "NumberBox"],
+    ],
+  },
+
+  // -------------------------------------------------------------------
+  // literal discriminants — signed numbers and bigints are literal types
+  // like any other: `-1` vs `-2` is a disjoint pair, not a near-match.
+  // -------------------------------------------------------------------
+  {
+    id: "XT-N19",
+    mode: "types",
+    category: "discriminant",
+    description: "Variants of a discriminated union whose `direction` literals are -1 and -2",
+    files: {
+      "moves.ts": `
+export interface MoveBackward {
+  direction: -1;
+  steps: number;
+  animate: boolean;
+  easing: string;
+}
+
+export interface MoveDoubleBackward {
+  direction: -2;
+  steps: number;
+  animate: boolean;
+  easing: string;
+}
+`,
+    },
+    forbidPairs: [["MoveBackward", "MoveDoubleBackward"]],
+  },
+  {
+    id: "XT-N20",
+    mode: "types",
+    category: "discriminant",
+    description: "Variants of a discriminated union whose `kind` literals are the bigints 1n and 2n",
+    files: {
+      "ledger.ts": `
+export interface AccountCredit {
+  kind: 1n;
+  amount: bigint;
+  account: string;
+  memo: string;
+}
+
+export interface AccountDebit {
+  kind: 2n;
+  amount: bigint;
+  account: string;
+  memo: string;
+}
+`,
+    },
+    forbidPairs: [["AccountCredit", "AccountDebit"]],
   },
 ];

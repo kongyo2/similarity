@@ -11,8 +11,9 @@
  * defaults (threshold 0.8, minLines 3); missing any pair is a false
  * negative. This file measures recall only — no `forbidPairs`.
  *
- * IDs XF-P01..XF-P56 across categories: rename-alpha, guard-style,
- * negation-swap, logic-sugar, destructure, loop-form, micro-idiom, combo.
+ * IDs XF-P01..XF-P46 across categories: rename-alpha, guard-style,
+ * negation-swap, logic-sugar, destructure, loop-form, micro-idiom, combo,
+ * declaration-scope.
  */
 
 import type { BenchCase } from "../cases.js";
@@ -1432,5 +1433,207 @@ export function meanResponseTime(readings: number[]): number {
 `,
     },
     expectPairs: [["averageLatency", "meanResponseTime"]],
+  },
+
+  // -------------------------------------------------------------------
+  // declaration-scope — duplicates that v0.6.0 never extracted at all:
+  // function expressions bound to a `const`, functions declared inside a
+  // `namespace` block (the TypeScript compiler's own house style), arrow
+  // function class fields, and constructors whose parameter properties
+  // are the shorthand for explicit field assignments.
+  // -------------------------------------------------------------------
+  {
+    id: "XF-P43",
+    mode: "functions",
+    category: "declaration-scope",
+    description: "Function expression bound to a const vs function declaration, identical bodies",
+    files: {
+      "a.ts": `
+export const parseHeaderLine = function (line: string): [string, string] {
+  const separator = line.indexOf(":");
+  if (separator === -1) {
+    throw new Error("malformed header: " + line);
+  }
+  const name = line.slice(0, separator).trim().toLowerCase();
+  const value = line.slice(separator + 1).trim();
+  return [name, value];
+};
+`,
+      "b.ts": `
+export function splitHeaderLine(line: string): [string, string] {
+  const separator = line.indexOf(":");
+  if (separator === -1) {
+    throw new Error("malformed header: " + line);
+  }
+  const name = line.slice(0, separator).trim().toLowerCase();
+  const value = line.slice(separator + 1).trim();
+  return [name, value];
+}
+`,
+    },
+    expectPairs: [["parseHeaderLine", "splitHeaderLine"]],
+  },
+  {
+    id: "XF-P44",
+    mode: "functions",
+    category: "declaration-scope",
+    description: "Function exported from a namespace block vs a top-level function, renamed",
+    files: {
+      "legacy.ts": `
+export namespace LegacyIds {
+  export function normalizeId(raw: string): string {
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) {
+      throw new Error("empty id");
+    }
+    return trimmed.toLowerCase().split(" ").join("-");
+  }
+}
+`,
+      "ids.ts": `
+export function canonicalId(input: string): string {
+  const cleaned = input.trim();
+  if (cleaned.length === 0) {
+    throw new Error("empty id");
+  }
+  return cleaned.toLowerCase().split(" ").join("-");
+}
+`,
+    },
+    expectPairs: [["normalizeId", "canonicalId"]],
+  },
+  {
+    id: "XF-P45",
+    mode: "functions",
+    category: "declaration-scope",
+    description: "Arrow-function class field vs regular method with the same body",
+    files: {
+      "a.ts": `
+export class ClickRelay {
+  constructor(private sink: (event: string) => void) {}
+  handle = (event: string): void => {
+    if (!event) {
+      return;
+    }
+    this.sink(event.trim());
+  };
+}
+`,
+      "b.ts": `
+export class TapRelay {
+  constructor(private sink: (event: string) => void) {}
+  handle(event: string): void {
+    if (!event) {
+      return;
+    }
+    this.sink(event.trim());
+  }
+}
+`,
+    },
+    expectPairs: [["handle", "handle"]],
+  },
+  {
+    id: "XF-P46",
+    mode: "functions",
+    category: "declaration-scope",
+    description: "Constructor parameter properties vs explicit field assignments, same wiring",
+    files: {
+      "a.ts": `
+interface InvoiceRepo {
+  fetchInvoice(id: string): Promise<{ total: number } | null>;
+}
+interface Clock {
+  now(): number;
+}
+
+export class InvoiceLookup {
+  startedAt: number;
+  constructor(
+    private readonly repo: InvoiceRepo,
+    private readonly clock: Clock,
+  ) {
+    this.startedAt = clock.now();
+  }
+}
+`,
+      "b.ts": `
+interface ReceiptRepo {
+  fetchInvoice(id: string): Promise<{ total: number } | null>;
+}
+interface Clock {
+  now(): number;
+}
+
+export class ReceiptLookup {
+  private readonly repo: ReceiptRepo;
+  private readonly clock: Clock;
+  startedAt: number;
+  constructor(repo: ReceiptRepo, clock: Clock) {
+    this.repo = repo;
+    this.clock = clock;
+    this.startedAt = clock.now();
+  }
+}
+`,
+    },
+    expectPairs: [["constructor", "constructor"]],
+  },
+  {
+    id: "XF-P47",
+    mode: "functions",
+    category: "declaration-scope",
+    description:
+      "Named function expressions that recurse through their own name; the inner names differ, the variables differ",
+    files: {
+      "a.ts": `
+export const factorial = function recur(n: number): number {
+  if (n <= 1) {
+    return 1;
+  }
+  return n * recur(n - 1);
+};
+`,
+      "b.ts": `
+export const fact = function go(n: number): number {
+  if (n <= 1) {
+    return 1;
+  }
+  return n * go(n - 1);
+};
+`,
+    },
+    expectPairs: [["factorial", "fact"]],
+  },
+  {
+    id: "XF-P48",
+    mode: "functions",
+    category: "declaration-scope",
+    description: "A method of a default-exported class vs the same method in a named class",
+    files: {
+      "relay.ts": `
+export default class Relay {
+  constructor(private readonly sink: (event: string) => void) {}
+  handle(event: string): void {
+    if (!event) {
+      return;
+    }
+    this.sink(event.trim());
+  }
+}
+`,
+      "tap-relay.ts": `
+export class TapRelay {
+  constructor(private readonly sink: (event: string) => void) {}
+  handle(event: string): void {
+    if (!event) {
+      return;
+    }
+    this.sink(event.trim());
+  }
+}
+`,
+    },
+    expectPairs: [["handle", "handle"]],
   },
 ];
