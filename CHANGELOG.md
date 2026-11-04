@@ -2,14 +2,13 @@
 
 ## 0.8.0 — 2026-11-04
 
-Accuracy work driven by three more real codebases and by the review
-findings left open on the v0.7.0 pull request (kongyo2/similarity#30). The
-engine was run over the fallow analyzer (its VS Code extension, tools, npm
-packages and visualization frontend), tsrs (its npm package, tools and
-playground, and the 116 standard-library declaration files it bundles),
-and the current TypeScript repository (the API package, which now ships
-sync and async siblings, the VS Code extension, the generator scripts, and
-1,381 conformance tests), and every class of reported pair was audited. The
+Accuracy work driven by three more real codebases. The engine was run over
+the fallow analyzer (its VS Code extension, tools, npm packages and
+visualization frontend), tsrs (its npm package, tools and playground, and
+the 116 standard-library declaration files it bundles), and the current
+TypeScript repository (the API package, which now ships sync and async
+siblings, the VS Code extension, the generator scripts, and 1,381
+conformance tests), and every class of reported pair was audited. The
 mislabel families were added to the labeled corpus as 25 new ground-truth
 pairs (corpus now **325 pairs**); the v0.7.0 engine gets 22 of them wrong
 (6.77% error rate on the extended corpus), v0.8.0 classifies all 325
