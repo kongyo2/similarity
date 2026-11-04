@@ -18,13 +18,15 @@ correctly and keeps the original 300 at 100%.
 
 - **Functions — call contracts** (precision): an `async` function returns a
   promise and a generator an iterator, so a plain twin with the same body is
-  a different contract. Such pairs cap at 0.72 — unless the sync side chains
-  the promise the async side awaits (`return fetch(u).then((r) => …)` vs
-  `const r = await fetch(u); …`, which the canonicalizer already lowers to
-  the same `await`). The sync and async API packages' `getSymbol` twins
-  scored 0.970, and static async methods and accessors, whose class wrapper
-  never carried the `async` marker, scored 1.000 against their sync
-  versions. (XF-N42, XF-N43, XF-N44)
+  a different contract. Such pairs cap at 0.72 unless the sync side visibly
+  returns a promise: it declares `Promise<…>`/`PromiseLike<…>`, returns
+  `new Promise(…)` or a `Promise.*(…)` call, or chains the promise the async
+  side awaits (`return fetch(u).then((r) => …)` vs `const r = await
+  fetch(u); …`, which the canonicalizer already lowers to the same `await`).
+  The sync and async API packages' `getSymbol` twins scored 0.970, and
+  static async methods and accessors, whose class wrapper never carried the
+  `async` marker, scored 1.000 against their sync versions. (XF-N42,
+  XF-N43, XF-N44)
 - **Functions — named function expressions** (recall): `const factorial =
   function recur(n) {…}` may recurse through either name. The body is
   compared under the function's own binding, and the variable binding is
@@ -70,16 +72,19 @@ correctly and keeps the original 300 at 100%.
   nested references (`Promise<User>` rendered as `Promise`), and rendered
   literal, tuple, `keyof`, `readonly` and `typeof` types as `any`. Fields
   without an annotation are typed by a literal or `new` initializer
-  (`count = 0` is a `number`, `cache = new Map<string, User>()` a
-  `Map<string, User>`), signatures keep optional and rest parameters, and
-  the rename tolerance for class-reference types no longer erases the
-  segments of a qualified name. (XC-N12)
+  (`count = 0` and `offset = -1` are `number`s, `cache = new Map<string,
+  User>()` a `Map<string, User>`), signatures keep optional and rest
+  parameters, and the rename tolerance for class-reference types no longer
+  erases the segments of a qualified name. (XC-N12)
 - **Classes — generic parameters** (recall): class type parameters are
   spelled positionally in member annotations and in `extends`/`implements`
   clauses, as type mode does for interfaces, so `ItemList<TItem> extends
   Collection<TItem>` and `EntryList<U> extends Collection<U>` are the same
   contract (the heritage mismatch used to cost 30%); a method's own type
-  parameters are positional within the method. (XC-P15)
+  parameters are positional within the method. In both modes only type
+  references are substituted: string-literal text (`"Node"`) and qualified
+  name segments (`ts.Node`) that spell a parameter name keep their
+  spelling. (XC-P15)
 - **Classes — constructor wiring** (precision): where a constructor stores
   its parameters — fields assigned `this.x = p`, parameter properties,
   `super(…)` argument slots — is recorded and compared through the field

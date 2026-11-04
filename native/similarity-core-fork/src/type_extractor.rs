@@ -463,36 +463,112 @@ impl TypeExtractor {
     /// [`Self::substitute_generic_tokens`] with a caller-chosen marker, so
     /// nested generic scopes (a generic method inside a generic class) get
     /// distinct positional tokens.
+    ///
+    /// Only type references are substituted. The text of string and
+    /// template literals (`"Node"`, `` `on${T}` `` outside its `${…}`) is
+    /// data, and a segment of a qualified name (`ts.Node`, `Node.Kind`)
+    /// names a namespace member: with a type parameter `Node`, rewriting
+    /// those made `kind: "Node"` and `root: ts.Node` differ from the same
+    /// members under a type parameter of another name.
     pub(crate) fn substitute_generic_tokens_with(
         input: &str,
         generics: &[String],
         marker: &str,
     ) -> String {
+        #[derive(Clone, Copy)]
+        enum Mode {
+            Code,
+            Quote(char),
+            Template,
+            /// Inside `${…}` of a template literal, with its brace depth.
+            TemplateExpression(u32),
+        }
+
         if generics.is_empty() {
             return input.to_string();
         }
-        let mut result = String::with_capacity(input.len());
-        let mut token = String::new();
-        let flush = |token: &mut String, result: &mut String| {
-            if token.is_empty() {
-                return;
-            }
-            if let Some(position) = generics.iter().position(|generic| generic == token) {
-                result.push_str(&format!("{marker}{position}"));
-            } else {
-                result.push_str(token);
-            }
-            token.clear();
+        let chars: Vec<char> = input.chars().collect();
+        let is_token_char = |ch: char| ch.is_alphanumeric() || ch == '_' || ch == '$';
+        // A `.` joining two name segments, as opposed to a spread `...`.
+        let is_qualifier_dot = |position: usize| {
+            chars.get(position) == Some(&'.')
+                && (position == 0 || chars[position - 1] != '.')
+                && chars.get(position + 1) != Some(&'.')
         };
-        for ch in input.chars() {
-            if ch.is_alphanumeric() || ch == '_' || ch == '$' {
-                token.push(ch);
-            } else {
-                flush(&mut token, &mut result);
-                result.push(ch);
+        let mut modes = vec![Mode::Code];
+        let mut result = String::with_capacity(input.len());
+        let mut index = 0;
+        while index < chars.len() {
+            let ch = chars[index];
+            match modes.last().copied().unwrap_or(Mode::Code) {
+                Mode::Quote(quote) => {
+                    result.push(ch);
+                    if ch == '\\' {
+                        if let Some(&escaped) = chars.get(index + 1) {
+                            result.push(escaped);
+                            index += 1;
+                        }
+                    } else if ch == quote {
+                        modes.pop();
+                    }
+                    index += 1;
+                }
+                Mode::Template => {
+                    result.push(ch);
+                    if ch == '\\' {
+                        if let Some(&escaped) = chars.get(index + 1) {
+                            result.push(escaped);
+                            index += 1;
+                        }
+                    } else if ch == '`' {
+                        modes.pop();
+                    } else if ch == '$' && chars.get(index + 1) == Some(&'{') {
+                        result.push('{');
+                        index += 1;
+                        modes.push(Mode::TemplateExpression(1));
+                    }
+                    index += 1;
+                }
+                Mode::Code | Mode::TemplateExpression(_) => {
+                    if is_token_char(ch) {
+                        let start = index;
+                        while index < chars.len() && is_token_char(chars[index]) {
+                            index += 1;
+                        }
+                        let token: String = chars[start..index].iter().collect();
+                        let qualified =
+                            (start > 0 && is_qualifier_dot(start - 1)) || is_qualifier_dot(index);
+                        match generics.iter().position(|generic| *generic == token) {
+                            Some(position) if !qualified => {
+                                result.push_str(&format!("{marker}{position}"));
+                            }
+                            _ => result.push_str(&token),
+                        }
+                        continue;
+                    }
+                    match ch {
+                        '"' | '\'' => modes.push(Mode::Quote(ch)),
+                        '`' => modes.push(Mode::Template),
+                        '{' => {
+                            if let Some(Mode::TemplateExpression(depth)) = modes.last_mut() {
+                                *depth += 1;
+                            }
+                        }
+                        '}' => {
+                            if let Some(Mode::TemplateExpression(depth)) = modes.last_mut() {
+                                *depth -= 1;
+                                if *depth == 0 {
+                                    modes.pop();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    result.push(ch);
+                    index += 1;
+                }
             }
         }
-        flush(&mut token, &mut result);
         result
     }
 

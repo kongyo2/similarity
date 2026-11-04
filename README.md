@@ -103,18 +103,19 @@ different free callee (`sendEmail` vs `sendSms`), flipped operators (`*` vs
 `/`, `&&` vs `||`, `<` vs `<=`), `??` vs `||`, `x == null` vs `x === null`,
 optional chaining vs plain access, `for-of` vs `for-in`, an added `break`,
 reordered statements that share data, `async` vs sync and generator vs
-plain contracts (a sync twin is the same code only when it chains the
-promise the async one awaits), `then(onFulfilled, onRejected)`,
-fall-through `switch` cases, `Object.assign` with a mutated target, string
-prepend vs append folds (`trail = trail + seg` vs `trail = seg + trail`),
-boundary indexes (`.at(-1)` vs `.at(0)`, `.slice(0, n)` vs `.slice(n)`),
-templates that stringify adjacent values (`` `${a}${b}` `` vs numeric `a +
-b`), and on the type side `Promise<ShopUser>` vs `Promise<ShopOrder>`
-payloads, `Map<K, V>` vs `Map<V, K>` swaps, index signatures vs concrete
-members, discriminated-union variants that differ in their `kind` literal
-or enum member (signed numbers and bigints included), differing `extends`
-heritage (type arguments included: `Box<string>` is not `Box<number>`),
-brand markers (`_fooBrand: any`), `typeof`/type-predicate members naming
+plain contracts (a sync twin is the same code only when it visibly returns
+a promise: a `Promise<…>` return type, a returned `Promise.resolve(…)`, or
+a chained `.then`), `then(onFulfilled, onRejected)`, fall-through `switch`
+cases, `Object.assign` with a mutated target, string prepend vs append
+folds (`trail = trail + seg` vs `trail = seg + trail`), boundary indexes
+(`.at(-1)` vs `.at(0)`, `.slice(0, n)` vs `.slice(n)`), templates that
+stringify adjacent values (`` `${a}${b}` `` vs numeric `a + b`), and on the
+type side `Promise<ShopUser>` vs `Promise<ShopOrder>` payloads, `Map<K, V>`
+vs `Map<V, K>` swaps, index signatures vs concrete members,
+discriminated-union variants that differ in their `kind` literal or enum
+member (signed numbers and bigints included), differing `extends` heritage
+(type arguments included: `Box<string>` is not `Box<number>`), brand
+markers (`_fooBrand: any`), `typeof`/type-predicate members naming
 different things, qualified generic bases (`React.ComponentType<P>` vs
 `Preact.ComponentType<P>`), one- or two-member shapes whose only shared
 trait is a primitive, and aliases of a single atom (`type GLsizei =

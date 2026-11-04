@@ -127,11 +127,28 @@ impl ClassExtractor {
     /// rendering all of them `any` made `enabled = false` and `enabled =
     /// 0` the same member while `count = 0` and `count: number` differed.
     fn initializer_type(&self, initializer: &Expression) -> String {
+        use oxc_ast::ast::UnaryOperator;
         match initializer.get_inner_expression() {
             Expression::NumericLiteral(_) => "number".to_string(),
             Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => "string".to_string(),
             Expression::BooleanLiteral(_) => "boolean".to_string(),
             Expression::BigIntLiteral(_) => "bigint".to_string(),
+            // A signed literal is still a literal: `offset = -1` is the
+            // same `number` field as `offset = 0`.
+            Expression::UnaryExpression(unary) => {
+                match (unary.operator, unary.argument.get_inner_expression()) {
+                    (
+                        UnaryOperator::UnaryNegation | UnaryOperator::UnaryPlus,
+                        Expression::NumericLiteral(_),
+                    ) => "number".to_string(),
+                    (UnaryOperator::UnaryNegation, Expression::BigIntLiteral(_)) => {
+                        "bigint".to_string()
+                    }
+                    (UnaryOperator::LogicalNot, _) => "boolean".to_string(),
+                    (UnaryOperator::Typeof, _) => "string".to_string(),
+                    _ => "any".to_string(),
+                }
+            }
             Expression::NewExpression(new_expr) => {
                 let callee = match new_expr.callee.get_inner_expression() {
                     Expression::Identifier(ident) => ident.name.to_string(),
@@ -1087,6 +1104,14 @@ export class Widget {
         );
         let load = &classes[0].methods[0];
         assert_eq!(load.return_type, "Promise<User>");
+        let signed = extract_classes_from_code(
+            "export class Cursor { offset = -1; step = +2; big = -1n; open = !0; kind = typeof window; }",
+            "s.ts",
+        )
+        .unwrap();
+        let types: Vec<&str> =
+            signed[0].properties.iter().map(|p| p.type_annotation.as_str()).collect();
+        assert_eq!(types, vec!["number", "number", "bigint", "boolean", "string"]);
         let accessors = extract_classes_from_code(
             "export class Counter { accessor count = 0; static accessor label: string; }",
             "a.ts",
@@ -1120,6 +1145,24 @@ export class Beta<U> extends Base<U> implements Store<U> {
             "g.ts",
         )
         .unwrap();
+        // Literal text and qualified-name segments that happen to spell a
+        // type parameter are not references to it.
+        let spelled = extract_classes_from_code(
+            r#"
+export class Walker<Node> extends ts.Visitor<Node> {
+  root: ts.Node;
+  kind: "Node" = "Node";
+  label: `${Node}-walker`;
+  current: Node;
+}
+"#,
+            "w.ts",
+        )
+        .unwrap();
+        assert_eq!(spelled[0].extends.as_deref(), Some("ts.Visitor<#0>"));
+        let annotations: Vec<&str> =
+            spelled[0].properties.iter().map(|p| p.type_annotation.as_str()).collect();
+        assert_eq!(annotations, vec!["ts.Node", "\"Node\"", "`${#0}-walker`", "#0"]);
         for class in &classes {
             assert_eq!(class.extends.as_deref(), Some("Base<#0>"));
             assert_eq!(class.implements, vec!["Store<#0>"]);

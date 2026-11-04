@@ -58,6 +58,10 @@ pub struct FunctionDefinition {
     /// `*foo() ...`. Generators differ structurally from non-generator
     /// counterparts and have to survive normalization.
     pub is_generator: bool,
+    /// True when the declared return type is `Promise<…>`/`PromiseLike<…>`:
+    /// a sync function with that annotation has the same call contract as
+    /// an `async` twin.
+    pub declares_promise_return: bool,
     /// True only for class methods declared `static`. Static and
     /// instance methods with identical bodies are runtime-distinct,
     /// so the normalized fragment carries this prefix forward.
@@ -339,6 +343,7 @@ fn push_function_like(func: &Function, name: String, ctx: &mut ExtractionContext
         is_arrow_expression: false,
         is_async: func.r#async,
         is_generator: func.generator,
+        declares_promise_return: is_promise_annotation(func.return_type.as_deref()),
         is_static: false,
         method_kind: MethodKind::Normal,
         display_name: binding_name,
@@ -369,6 +374,7 @@ fn push_arrow_binding(arrow: &ArrowFunctionExpression, name: String, ctx: &mut E
         is_arrow_expression: arrow.expression,
         is_async: arrow.r#async,
         is_generator: false,
+        declares_promise_return: is_promise_annotation(arrow.return_type.as_deref()),
         is_static: false,
         method_kind: MethodKind::Normal,
         display_name: name.clone(),
@@ -487,6 +493,7 @@ fn push_object_method(
         is_arrow_expression: false,
         is_async: func.r#async,
         is_generator: func.generator,
+        declares_promise_return: is_promise_annotation(func.return_type.as_deref()),
         is_static: false,
         method_kind,
         display_name,
@@ -575,6 +582,9 @@ fn extract_class_members(class: &Class, ctx: &mut ExtractionContext) {
                     is_arrow_expression: false,
                     is_async: method.value.r#async,
                     is_generator: method.value.generator,
+                    declares_promise_return: is_promise_annotation(
+                        method.value.return_type.as_deref(),
+                    ),
                     is_static: method.r#static,
                     method_kind,
                     display_name: method_display_name,
@@ -625,6 +635,7 @@ fn extract_class_members(class: &Class, ctx: &mut ExtractionContext) {
                     is_arrow_expression: arrow.expression,
                     is_async: arrow.r#async,
                     is_generator: false,
+                    declares_promise_return: is_promise_annotation(arrow.return_type.as_deref()),
                     is_static: prop.r#static,
                     method_kind: MethodKind::Normal,
                     display_name,
@@ -866,8 +877,12 @@ fn compare_function_trees(
 }
 
 /// Whether the two functions expose different call contracts: generator vs
-/// plain, or `async` vs sync where the sync side does not itself await
-/// (see the call site).
+/// plain, or `async` vs a sync function that cannot be shown to return a
+/// promise (see the call site). A sync function returns a promise when it
+/// declares `Promise<…>`/`PromiseLike<…>`, chains a promise the
+/// canonicalizer lowered to `await`, or returns `new Promise(…)` or a
+/// `Promise.*(…)` call; without any of those, nothing in the syntax says
+/// its callers get a promise.
 fn call_contract_differs(
     tree1: &crate::tree::TreeNode,
     tree2: &crate::tree::TreeNode,
@@ -880,21 +895,35 @@ fn call_contract_differs(
     if func1.is_async == func2.is_async {
         return false;
     }
-    let sync_tree = if func1.is_async { tree2 } else { tree1 };
-    !fragment_awaits(sync_tree)
+    let (sync_func, sync_tree) = if func1.is_async { (func2, tree2) } else { (func1, tree1) };
+    !(sync_func.declares_promise_return
+        || fragment_awaits(sync_tree)
+        || fragment_returns_promise(sync_tree))
+}
+
+/// `Promise<…>` or `PromiseLike<…>` as a declared return type.
+fn is_promise_annotation(annotation: Option<&TSTypeAnnotation>) -> bool {
+    let Some(TSType::TSTypeReference(reference)) = annotation.map(|a| &a.type_annotation) else {
+        return false;
+    };
+    matches!(
+        &reference.type_name,
+        TSTypeName::IdentifierReference(ident)
+            if matches!(ident.name.as_str(), "Promise" | "PromiseLike")
+    )
+}
+
+fn is_function_like_node(value: &str) -> bool {
+    matches!(
+        value,
+        "FunctionDeclaration" | "FunctionExpression" | "ArrowFunctionExpression" | "MethodDefinition"
+    )
 }
 
 /// Whether the comparison fragment's own function body contains an
 /// `await` (or `for await`) — awaits inside nested functions belong to
 /// those functions, not to the fragment.
 fn fragment_awaits(tree: &crate::tree::TreeNode) -> bool {
-    fn is_function_like(value: &str) -> bool {
-        matches!(
-            value,
-            "FunctionDeclaration" | "FunctionExpression" | "ArrowFunctionExpression"
-                | "MethodDefinition"
-        )
-    }
     fn walk(node: &crate::tree::TreeNode, inside_fragment: bool) -> bool {
         if inside_fragment
             && (node.value == "AwaitExpression" || node.label == "ForAwaitOfStatement")
@@ -902,9 +931,46 @@ fn fragment_awaits(tree: &crate::tree::TreeNode) -> bool {
             return true;
         }
         node.children.iter().any(|child| {
-            if is_function_like(&child.value) {
+            if is_function_like_node(&child.value) {
                 // The first function-like node is the fragment itself;
                 // any function inside it awaits for its own sake.
+                !inside_fragment && walk(child, true)
+            } else {
+                walk(child, inside_fragment)
+            }
+        })
+    }
+    walk(tree, false)
+}
+
+/// Whether one of the fragment's own `return`s yields `new Promise(…)` or
+/// a `Promise.resolve(…)`-style call.
+fn fragment_returns_promise(tree: &crate::tree::TreeNode) -> bool {
+    fn is_promise_global(node: &crate::tree::TreeNode) -> bool {
+        node.value == "Identifier" && node.label == "Promise"
+    }
+    fn returns_promise(node: &crate::tree::TreeNode) -> bool {
+        let Some(argument) = node.children.first() else {
+            return false;
+        };
+        let Some(callee) = argument.children.first() else {
+            return false;
+        };
+        match argument.value.as_str() {
+            "NewExpression" => is_promise_global(callee),
+            "CallExpression" => {
+                callee.value == "StaticMemberExpression"
+                    && callee.children.first().is_some_and(|object| is_promise_global(object))
+            }
+            _ => false,
+        }
+    }
+    fn walk(node: &crate::tree::TreeNode, inside_fragment: bool) -> bool {
+        if inside_fragment && node.value == "ReturnStatement" && returns_promise(node) {
+            return true;
+        }
+        node.children.iter().any(|child| {
+            if is_function_like_node(&child.value) {
                 !inside_fragment && walk(child, true)
             } else {
                 walk(child, inside_fragment)
@@ -2981,6 +3047,39 @@ export async function readOrder(id: string): Promise<unknown> {
 "#,
         );
         assert!(then_chain >= 0.8, "got {then_chain}");
+
+        // A sync function that declares a promise, or returns one it
+        // builds, has the async twin's contract.
+        let declared = compare(
+            r#"
+export function loadUser(id: string): Promise<User> {
+    const url = "/api/users/" + id;
+    log("load", url);
+    return fetch(url).json();
+}
+export async function loadUserAsync(id: string): Promise<User> {
+    const url = "/api/users/" + id;
+    log("load", url);
+    return fetch(url).json();
+}
+"#,
+        );
+        assert!(declared >= 0.8, "got {declared}");
+        let built = compare(
+            r#"
+export function settle(result: Result) {
+    const value = normalize(result);
+    record(value);
+    return Promise.resolve(value);
+}
+export async function settleAsync(result: Result) {
+    const value = normalize(result);
+    record(value);
+    return Promise.resolve(value);
+}
+"#,
+        );
+        assert!(built >= 0.8, "got {built}");
 
         // An await inside a nested callback is the callback's own.
         let nested = compare(
