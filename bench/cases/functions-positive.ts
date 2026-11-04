@@ -11,7 +11,7 @@
  * defaults (threshold 0.8, minLines 3); missing any pair is a false
  * negative. This file measures recall only — no `forbidPairs`.
  *
- * IDs XF-P01..XF-P46 across categories: rename-alpha, guard-style,
+ * IDs XF-P01..XF-P54 across categories: rename-alpha, guard-style,
  * negation-swap, logic-sugar, destructure, loop-form, micro-idiom, combo,
  * declaration-scope.
  */
@@ -1774,5 +1774,81 @@ export default {
 `,
     },
     expectPairs: [["pipeline.hooks.transform", "default.transform"]],
+  },
+
+  // -------------------------------------------------------------------
+  // 0.8.1 — object members that recurse through their own name
+  // -------------------------------------------------------------------
+  {
+    id: "XF-P53",
+    mode: "functions",
+    category: "declaration-scope",
+    description:
+      "Object members holding named function expressions that recurse through their own names, which differ between the copies",
+    files: {
+      "printer.ts": `
+export const printer = {
+  print: function printNode(node: SyntaxNode): string {
+    if (node.children.length === 0) {
+      return node.text;
+    }
+    const parts: string[] = [];
+    for (const child of node.children) {
+      parts.push(printNode(child));
+    }
+    return parts.join(" ");
+  },
+};
+`,
+      "formatter.ts": `
+export const formatter = {
+  print: function emit(node: SyntaxNode): string {
+    if (node.children.length === 0) {
+      return node.text;
+    }
+    const parts: string[] = [];
+    for (const child of node.children) {
+      parts.push(emit(child));
+    }
+    return parts.join(" ");
+  },
+};
+`,
+    },
+    expectPairs: [["printer.print", "formatter.print"]],
+  },
+  {
+    id: "XF-P54",
+    mode: "functions",
+    category: "declaration-scope",
+    description:
+      "A recursive dispatch-table entry under a computed key copied into a second table with its own name renamed",
+    files: {
+      "evaluate.ts": `
+export const evaluators = {
+  [OpKind.Sum]: function evaluateSum(expr: Expr): number {
+    if (expr.kind === OpKind.Literal) {
+      return expr.value;
+    }
+    const left = evaluateSum(expr.left);
+    const right = evaluateSum(expr.right);
+    return left + right;
+  },
+};
+`,
+      "legacy-evaluate.ts": `
+export const legacyEvaluators = {
+  [OpKind.Sum]: function sumExpression(node: Expr): number {
+    if (node.kind === OpKind.Literal) {
+      return node.value;
+    }
+    const left = sumExpression(node.left);
+    const right = sumExpression(node.right);
+    return left + right;
+  },
+};
+`,
+    },
+    expectPairs: [["evaluators[OpKind.Sum]", "legacyEvaluators[OpKind.Sum]"]],
   },
 ];

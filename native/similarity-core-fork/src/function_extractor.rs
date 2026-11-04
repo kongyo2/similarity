@@ -80,8 +80,9 @@ pub struct FunctionDefinition {
     pub display_name: String,
     /// The other name a named function expression is reachable under:
     /// `factorial` in `const factorial = function recur(n) {…}`, where the
-    /// body may recurse through either binding. `None` when the function
-    /// has a single name.
+    /// body may recurse through either binding, or `walk` in an object
+    /// member `visit: function walk(node) {…}`, whose fragment is declared
+    /// under the key. `None` when the function has a single name.
     pub self_alias: Option<String>,
     pub start_line: u32,
     pub end_line: u32,
@@ -482,6 +483,13 @@ fn push_object_method(
     };
     let display_name = method_key_display_text(&prop.key, prop.computed, ctx.source_text)
         .unwrap_or_else(|| name.clone());
+    // `visit: function walk(node) {… walk(node.left) …}`: the property key
+    // is not a binding inside the body, but the function expression's own
+    // name is. The fragment is declared under the key, so the own name
+    // becomes an alias of the fragment's declaration: recursion through it
+    // alpha-renames with the function instead of staying a free identifier
+    // that differs between otherwise identical copies.
+    let self_alias = func.id.as_ref().map(|id| id.name.to_string());
     let start_line = ctx.line_number(prop.span.start);
     ctx.functions.push(FunctionDefinition {
         name: name.clone(),
@@ -497,7 +505,7 @@ fn push_object_method(
         is_static: false,
         method_kind,
         display_name,
-        self_alias: None,
+        self_alias,
         start_line,
         end_line: ctx.line_number(prop.span.end),
         class_name: None,
@@ -1515,21 +1523,16 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
             // their runtime contracts are tied to the class shape and the
             // existing relative scoring for those forms is calibrated
             // against it.
-            if matches!(func.function_type, FunctionType::Method)
-                && matches!(func.method_kind, MethodKind::Normal)
-                && !func.is_static
-            {
-                if let Some(name_text) = method_fragment_name(&func.display_name) {
-                    let mut prefix = String::new();
-                    if func.is_async {
-                        prefix.push_str("async ");
-                    }
-                    prefix.push_str("function");
-                    if func.is_generator {
-                        prefix.push('*');
-                    }
-                    return format!("{prefix} {name_text}{params_text} {body_text}");
+            if let Some(name_text) = method_function_fragment_name(func) {
+                let mut prefix = String::new();
+                if func.is_async {
+                    prefix.push_str("async ");
                 }
+                prefix.push_str("function");
+                if func.is_generator {
+                    prefix.push('*');
+                }
+                return format!("{prefix} {name_text}{params_text} {body_text}");
             }
             // Remaining method shapes can't be parsed in isolation, so keep
             // the synthetic class wrapper. Preserve `static`, getter/setter,
@@ -1564,7 +1567,7 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
                 func.display_name.clone()
             };
             format!(
-                "class __C__ {{ {}{}{} {} }}",
+                "class {CLASS_WRAPPER_NAME} {{ {}{}{} {} }}",
                 prefix, method_name_text, params_text, body_text
             )
         }
@@ -1592,6 +1595,39 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
             let name_text = sanitize_function_name(&func.display_name);
             format!("{} {}{} {}", prefix, name_text, params_text, body_text)
         }
+    }
+}
+
+/// Name of the synthetic class that wraps method fragments which cannot be
+/// parsed on their own (see [`build_normalized_fragment`]).
+const CLASS_WRAPPER_NAME: &str = "__C__";
+
+/// The function name a method's fragment is declared under when the
+/// method normalizes to a standalone `function` fragment: plain instance
+/// methods with an identifier key. `None` for the shapes that keep the
+/// synthetic class wrapper — static methods, accessors, constructors, and
+/// non-identifier keys.
+fn method_function_fragment_name(func: &FunctionDefinition) -> Option<String> {
+    if matches!(func.function_type, FunctionType::Method)
+        && matches!(func.method_kind, MethodKind::Normal)
+        && !func.is_static
+    {
+        method_fragment_name(&func.display_name)
+    } else {
+        None
+    }
+}
+
+/// The top-level binding the normalized fragment of `func` declares, which
+/// is what a self-alias resolves to: the function name of a
+/// function-shaped fragment, or the synthetic class of a class-wrapped
+/// method, whose key is not a binding (both copies of a class-wrapped
+/// method resolve their own name to the wrapper alike).
+fn fragment_binding_name(func: &FunctionDefinition) -> String {
+    match func.function_type {
+        FunctionType::Method | FunctionType::Constructor => method_function_fragment_name(func)
+            .unwrap_or_else(|| CLASS_WRAPPER_NAME.to_string()),
+        FunctionType::Function | FunctionType::Arrow => sanitize_function_name(&func.display_name),
     }
 }
 
@@ -1701,7 +1737,7 @@ fn parse_function_fragment(
 ) -> Result<std::rc::Rc<crate::tree::TreeNode>, String> {
     match function_type {
         FunctionType::Method | FunctionType::Constructor => {
-            let wrapped = format!("class __C__ {{ {body_text} }}");
+            let wrapped = format!("class {CLASS_WRAPPER_NAME} {{ {body_text} }}");
             parse_and_convert_to_tree_canonical(filename, &wrapped)
         }
         FunctionType::Function | FunctionType::Arrow => {
@@ -1710,7 +1746,7 @@ fn parse_function_fragment(
             match parse_and_convert_to_tree_canonical(filename, body_text) {
                 Ok(tree) => Ok(tree),
                 Err(_) => {
-                    let wrapped = format!("class __C__ {{ {body_text} }}");
+                    let wrapped = format!("class {CLASS_WRAPPER_NAME} {{ {body_text} }}");
                     parse_and_convert_to_tree_canonical(filename, &wrapped)
                 }
             }
@@ -1730,12 +1766,12 @@ fn parse_function_for_comparison(
 ) -> Result<std::rc::Rc<crate::tree::TreeNode>, String> {
     let fragment = build_normalized_fragment(func, source);
     let parsed = match &func.self_alias {
-        // The fragment declares the function under `display_name`; the
-        // other name it is bound under resolves to the same declaration.
+        // The fragment declares the function under one binding; the other
+        // name it is reachable under resolves to the same declaration.
         Some(alias) => crate::parser::parse_and_convert_to_tree_canonical_with_aliases(
             filename,
             &fragment,
-            vec![(alias.clone(), sanitize_function_name(&func.display_name))],
+            vec![(alias.clone(), fragment_binding_name(func))],
         ),
         None => parse_and_convert_to_tree_canonical(filename, &fragment),
     };
@@ -2984,6 +3020,85 @@ export function persist(document: Doc): void {
         let pairs = find_similar_functions_in_file("test.ts", twins, 0.8, &options).unwrap();
         assert_eq!(pairs.len(), 1);
         assert!((pairs[0].similarity - 1.0).abs() < 1e-9, "got {}", pairs[0].similarity);
+    }
+
+    #[test]
+    fn object_members_recurse_through_their_own_name() {
+        // `visit: function walk(node) {… walk(node.left) …}` recurses
+        // through the function expression's own name, which the property
+        // key does not bind. Identifier keys (function-shaped fragment),
+        // reserved-word keys and computed keys (class-wrapped fragment) all
+        // resolve it.
+        let options = TSEDOptions::default();
+        for (left_key, right_key) in [
+            ("visit", "visit"),
+            ("delete", "delete"),
+            ("[Kind.Sum]", "[Kind.Sum]"),
+        ] {
+            let code = format!(
+                r"
+export const visitorA = {{
+    {left_key}: function walk(node: TreeNode): number {{
+        if (node.leaf) {{
+            return node.value;
+        }}
+        const left = walk(node.left);
+        const right = walk(node.right);
+        return left + right;
+    }},
+}};
+export const visitorB = {{
+    {right_key}: function traverse(node: TreeNode): number {{
+        if (node.leaf) {{
+            return node.value;
+        }}
+        const left = traverse(node.left);
+        const right = traverse(node.right);
+        return left + right;
+    }},
+}};
+"
+            );
+            let functions = extract_functions("test.ts", &code).unwrap();
+            assert_eq!(functions[0].self_alias.as_deref(), Some("walk"));
+            let pairs = find_similar_functions_in_file("test.ts", &code, 0.8, &options).unwrap();
+            assert_eq!(pairs.len(), 1, "{left_key}: recursive object members must pair");
+            assert!(
+                (pairs[0].similarity - 1.0).abs() < 1e-9,
+                "{left_key}: got {}",
+                pairs[0].similarity
+            );
+        }
+
+        // The own name resolves to the function only where it is the own
+        // name: a twin calling an outer `walk` helper is not recursion, so
+        // the two bodies are not the same tree.
+        let outer = r"
+export const visitorA = {
+    visit: function walk(node: TreeNode): number {
+        if (node.leaf) {
+            return node.value;
+        }
+        const left = walk(node.left);
+        const right = walk(node.right);
+        return left + right;
+    },
+};
+export const visitorB = {
+    visit: function traverse(node: TreeNode): number {
+        if (node.leaf) {
+            return node.value;
+        }
+        const left = walk(node.left);
+        const right = walk(node.right);
+        return left + right;
+    },
+};
+";
+        let functions = extract_functions("test.ts", outer).unwrap();
+        let similarity =
+            compare_functions(&functions[0], &functions[1], outer, outer, &options).unwrap();
+        assert!(similarity < 1.0 - 1e-9, "recursion vs an outer helper, got {similarity}");
     }
 
     #[test]

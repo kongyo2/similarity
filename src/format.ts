@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import Table from "cli-table3";
-import { CLUSTERED_MODES, clusterPairs } from "./clusters.js";
+import { standalonePairs } from "./clusters.js";
 import type { AnalyzeReport, AnalyzerLocation, AnalyzerMode, SimilarityCluster, SimilarityPair } from "./types.js";
 import { toRelativePath } from "./utils/path.js";
 
@@ -80,7 +80,12 @@ function renderPairTable(pairs: SimilarityPair[], cwd: string): string {
   return table.toString();
 }
 
-function renderMode(mode: AnalyzerMode, pairs: SimilarityPair[], cwd: string): string {
+function renderMode(
+  mode: AnalyzerMode,
+  pairs: SimilarityPair[],
+  reportClusters: SimilarityCluster[],
+  cwd: string,
+): string {
   const lines: string[] = [];
   lines.push(chalk.bold(`=== ${formatModeLabel(mode)} ===`));
   if (pairs.length === 0) {
@@ -90,10 +95,11 @@ function renderMode(mode: AnalyzerMode, pairs: SimilarityPair[], cwd: string): s
   }
 
   // Three or more copies of one declaration are listed once, as a
-  // cluster, instead of as every pair among them.
-  const { clusters, standalone } = CLUSTERED_MODES.includes(mode)
-    ? clusterPairs(mode, pairs)
-    : { clusters: [], standalone: pairs };
+  // cluster, instead of as every pair among them. The clusters are the
+  // report's own, so the blocks agree with the summary's cluster count
+  // and with the JSON report.
+  const clusters = reportClusters.filter((cluster) => cluster.mode === mode);
+  const standalone = standalonePairs(mode, pairs, clusters);
   clusters.forEach((cluster, index) => {
     lines.push(...renderCluster(cluster, index, mode, cwd));
     lines.push("");
@@ -120,8 +126,8 @@ export function formatPrettyReport(report: AnalyzeReport, cwd: string, modes: An
   lines.push(chalk.bold("Analyzing code similarity..."));
   lines.push(`Files analyzed: ${report.stats.fileCount}`);
   lines.push(`Pairs detected: ${report.stats.pairCount}`);
-  if (report.stats.clusterCount > 0) {
-    lines.push(`Duplicate clusters: ${report.stats.clusterCount}`);
+  if (report.clusters.length > 0) {
+    lines.push(`Duplicate clusters: ${report.clusters.length}`);
   }
   lines.push(`Elapsed: ${report.stats.elapsedMs} ms`);
   lines.push("");
@@ -129,7 +135,7 @@ export function formatPrettyReport(report: AnalyzeReport, cwd: string, modes: An
   for (const mode of modes) {
     // Guard against engine/report drift: a requested mode missing from
     // `byMode` renders as an empty section instead of crashing.
-    lines.push(renderMode(mode, report.byMode[mode] ?? [], cwd));
+    lines.push(renderMode(mode, report.byMode[mode] ?? [], report.clusters, cwd));
   }
 
   if (report.warnings.length > 0) {

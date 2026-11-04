@@ -774,6 +774,33 @@ mod tests {
     }
 
     #[test]
+    fn single_quoted_atomic_aliases_need_name_agreement() {
+        // An alias body is its source text; `'1'` must still read as the
+        // literal atom `"1"` and take the name check.
+        let options = TypeComparisonOptions::default();
+        let code = r#"
+export type SchemaVersion = '1';
+export type CacheFormat = '1';
+export type ConfigVersion = "1";
+export type UserId = 'user';
+export type UserID = "user";
+"#;
+        let types = crate::type_extractor::extract_types_from_code(code, "test.ts").unwrap();
+        let find = |name: &str| types.iter().find(|t| t.name == name).unwrap();
+        for (left, right) in [("SchemaVersion", "CacheFormat"), ("CacheFormat", "ConfigVersion")] {
+            let result = compare_types(find(left), find(right), &options);
+            assert!(
+                result.similarity < 0.8,
+                "{left} vs {right} must not pair on an atomic body, got {}",
+                result.similarity
+            );
+        }
+        // The same alias in either quote style is still one declaration.
+        let variant = compare_types(find("UserId"), find("UserID"), &options);
+        assert!(variant.similarity >= 0.8, "got {}", variant.similarity);
+    }
+
+    #[test]
     fn discriminant_mismatch_halves_structural_evidence() {
         // The compiler's `ForInStatement` / `ForOfStatement` interfaces:
         // five shared members, one enum-member discriminant apart.

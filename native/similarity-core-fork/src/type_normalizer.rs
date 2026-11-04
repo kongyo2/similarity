@@ -89,7 +89,15 @@ pub fn normalize_type(type_def: &TypeDefinition, options: &NormalizationOptions)
         options.ignore_property_order,
     );
 
-    let mut extends = type_def.extends.clone();
+    // Heritage type arguments are annotations too: `extends Box<A | B>` and
+    // `extends Box<B | A>` are one base, and in `A<T, U> extends Box<T | U>`
+    // vs `B<U, T> extends Box<T | U>` positional substitution leaves the
+    // arms in different orders until they are normalized.
+    let mut extends: Vec<String> = if options.normalize_type_names {
+        type_def.extends.iter().map(|base| normalize_type_name(base)).collect()
+    } else {
+        type_def.extends.clone()
+    };
     extends.sort();
     extends.dedup();
 
@@ -109,19 +117,24 @@ pub fn normalize_type(type_def: &TypeDefinition, options: &NormalizationOptions)
 }
 
 /// Split `input` at top-level occurrences of `separator`, respecting
-/// nesting inside `<>`, `()`, `[]`, `{}` and quoted strings. Returns one
-/// element (the whole input) when the separator never appears at the top
-/// level.
+/// nesting inside `<>`, `()`, `[]`, `{}` and quoted strings (escaped
+/// quotes included). Returns one element (the whole input) when the
+/// separator never appears at the top level.
 pub(crate) fn split_top_level(input: &str, separator: char) -> Vec<String> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut in_string: Option<char> = None;
+    let mut escaped = false;
     let mut previous = '\0';
     let mut current = String::new();
     for ch in input.chars() {
         if let Some(quote) = in_string {
             current.push(ch);
-            if ch == quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
                 in_string = None;
             }
             previous = ch;
@@ -609,15 +622,27 @@ fn is_bare_type_reference(type_name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '.')
 }
 
-/// A string-literal type (`"click"`), as rendered by the extractor. One
-/// literal only: `"debug" | "warn"` also starts and ends with a quote, and
-/// counting the whole union as one literal made it an atom (and two
-/// different literal unions a discriminant mismatch).
+/// A string-literal type (`"click"`, `"say \"yes\""`), as rendered by the
+/// extractor. One literal only: `"debug" | "warn"` also starts and ends
+/// with a quote, and counting the whole union as one literal made it an
+/// atom (and two different literal unions a discriminant mismatch). The
+/// first unescaped quote after the opening one must close the type; an
+/// escaped quote is part of the value.
 fn is_string_literal_type(type_name: &str) -> bool {
-    type_name.len() >= 2
-        && type_name.starts_with('"')
-        && type_name.ends_with('"')
-        && !type_name[1..type_name.len() - 1].contains('"')
+    let Some(body) = type_name.strip_prefix('"') else {
+        return false;
+    };
+    let mut chars = body.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\\' => {
+                chars.next();
+            }
+            '"' => return index + 1 == body.len(),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// A numeric literal type: `42`, `-1`, `1.5`, `1e3`, `0x1f`, `1_000`.
@@ -1161,6 +1186,25 @@ mod tests {
         // Two different literal unions are not a discriminant mismatch.
         assert!(!is_discriminant_mismatch("\"a\" | \"b\"", "\"a\" | \"c\""));
         assert!(is_discriminant_mismatch("\"a\"", "\"c\""));
+    }
+
+    #[test]
+    fn string_literals_with_escaped_quotes_are_single_literals() {
+        // `'say "yes"'` renders as `"say \"yes\""`: the escaped quotes are
+        // part of the value, so it is one literal, and two of them that
+        // differ are distinct discriminants.
+        assert!(is_literal_type(r#""say \"yes\"""#));
+        assert!(is_literal_type(r#""\\""#));
+        assert!(!is_literal_type(r#""\""#));
+        assert!(!is_literal_type(r#""a\\" | "b""#));
+        assert!(is_discriminant_mismatch(r#""say \"yes\"""#, r#""say \"no\"""#));
+        assert_eq!(calculate_type_similarity(r#""say \"yes\"""#, r#""say \"no\"""#), 0.0);
+        // A `|` inside a literal is not a union separator.
+        assert_eq!(split_top_level(r#""a \" | b" | "c""#, '|'), vec![
+            r#""a \" | b""#.to_string(),
+            r#""c""#.to_string(),
+        ]);
+        assert!(is_literal_type(&normalize_type_name(r#""a \" | b""#)));
     }
 
     #[test]
