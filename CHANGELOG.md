@@ -1,5 +1,183 @@
 # Changelog
 
+## 0.8.0 — 2026-11-04
+
+Accuracy work driven by three more real codebases. The engine was run over
+the fallow analyzer (its VS Code extension, tools, npm packages and
+visualization frontend), tsrs (its npm package, tools and playground, and
+the 116 standard-library declaration files it bundles), and the current
+TypeScript repository (the API package, which now ships sync and async
+siblings, the VS Code extension, the generator scripts, and 1,381
+conformance tests), and every class of reported pair was audited. The
+mislabel families were added to the labeled corpus as 25 new ground-truth
+pairs (corpus now **325 pairs**); the v0.7.0 engine gets 22 of them wrong
+(6.77% error rate on the extended corpus), v0.8.0 classifies all 325
+correctly and keeps the original 300 at 100%.
+
+### Detection accuracy
+
+- **Functions — call contracts** (precision): an `async` function returns a
+  promise and a generator an iterator, so a plain twin with the same body is
+  a different contract. Such pairs cap at 0.72 unless the sync side visibly
+  returns a promise: it declares `Promise<…>`/`PromiseLike<…>`, returns
+  `new Promise(…)` or a `Promise.*(…)` call, or chains the promise the async
+  side awaits (`return fetch(u).then((r) => …)` vs `const r = await
+  fetch(u); …`, which the canonicalizer already lowers to the same `await`).
+  The sync and async API packages' `getSymbol` twins scored 0.970, and
+  static async methods and accessors, whose class wrapper never carried the
+  `async` marker, scored 1.000 against their sync versions. (XF-N42,
+  XF-N43, XF-N44)
+- **Functions — named function expressions** (recall): `const factorial =
+  function recur(n) {…}` may recurse through either name. The body is
+  compared under the function's own binding, and the variable binding is
+  now an alias of it, so `factorial(n - 1)` resolves to the function too
+  instead of staying a free identifier that differed between copies (the
+  pair scored 0.75). (XF-P49)
+- **Functions — wrapped initializers** (recall): parentheses and
+  TypeScript-only wrappers around a function initializer —
+  `const parse = (function (line) {…});`, `(… => …) satisfies Splitter`,
+  `as Handler`, `<Handler>(…)`, a trailing `!` — no longer hide the
+  function from the scan; the same holds for arrow-function class fields
+  and `export default`. (XF-P50)
+- **Functions — object-literal members** (recall): the methods, getters
+  and setters, and function-valued properties of an object literal bound to
+  a name or default-exported are extracted, nested objects included, and
+  reported under the binding (`handlers.onSave`, `pipeline.hooks.transform`,
+  `table[SyntaxKind.Block]`). Dispatch tables, handler and plugin objects,
+  and test doubles are written this way; none of their functions were
+  visible before. An object passed as an argument or returned from a
+  function stays part of the function that builds it. (XF-P51, XF-P52)
+- **Types — single-atom aliases** (precision): an alias whose body is one
+  primitive, literal or bare reference (`type GLsizei = number`,
+  `type SchemaVersion = "1"`, `type FunctionBody = Block`) has no structure
+  of its own to duplicate; it gives the atom a name. Two such aliases now
+  pair only when they are also named alike (the same alias copied into two
+  files, `UserId` vs `UserID`): the structural evidence is the name
+  similarity cubed. Every two of the DOM library's WebGL/WebGPU `number`
+  labels and every two of a generated contract's `"1"` schema versions used
+  to be reported. (XT-N21, XT-N22, XT-P24)
+- **Types — qualified generic references**: `React.ComponentType<Props>`
+  and `Preact.ComponentType<Props>` are compared like bare generic
+  references — nominal base, then arguments — instead of by edit distance
+  of their spelling (0.93), and qualified generics normalize their
+  arguments (`ns.Box<Array<T>>` ⇔ `ns.Box<T[]>`). (XT-N23)
+- **Types — literal unions**: a union of string literals (`"a" | "b"`)
+  starts and ends with a quote and was mistaken for a single literal, which
+  made two different literal unions a "discriminant mismatch". Only a
+  single literal is one now.
+- **Classes — member annotations** (precision): class mode renders member,
+  parameter and return types with type mode's renderer and normalization.
+  Its own renderer collapsed every qualified reference (`SyntaxKind.Block`,
+  `React.ComponentType<P>`) onto `unknown`, dropped the type arguments of
+  nested references (`Promise<User>` rendered as `Promise`), and rendered
+  literal, tuple, `keyof`, `readonly` and `typeof` types as `any`. Fields
+  without an annotation are typed by a literal or `new` initializer
+  (`count = 0` and `offset = -1` are `number`s, `cache = new Map<string,
+  User>()` a `Map<string, User>`), signatures keep optional and rest
+  parameters, and the rename tolerance for class-reference types no longer
+  erases the segments of a qualified name. (XC-N12)
+- **Classes — generic parameters** (recall): class type parameters are
+  spelled positionally in member annotations and in `extends`/`implements`
+  clauses, as type mode does for interfaces, so `ItemList<TItem> extends
+  Collection<TItem>` and `EntryList<U> extends Collection<U>` are the same
+  contract (the heritage mismatch used to cost 30%); a method's own type
+  parameters are positional within the method. In both modes only type
+  references are substituted: string-literal text (`"Node"`) and qualified
+  name segments (`ts.Node`) that spell a parameter name keep their
+  spelling. (XC-P15)
+- **Classes — constructor wiring** (precision): where a constructor stores
+  its parameters — fields assigned `this.x = p`, parameter properties,
+  `super(…)` argument slots — is recorded and compared through the field
+  pairing, so `this.x = y; this.y = x` is no longer the same constructor as
+  `this.x = x; this.y = y` (the corpus pair scored 0.932), while parameter
+  properties and explicit assignments still agree. A parameter stored into
+  a different place on each side counts as two unmatched elements.
+  (XC-N13, XC-P16)
+- **Classes — static and optional members**: members were keyed by bare
+  name, so a static member silently overwrote its instance namesake (a
+  store with `static create()` beside `create(id)` had structural
+  similarity 1.0 against one without it); both are kept now, and a
+  same-named static/instance pair still matches at the existing surface
+  discount. An optional member (`x?: T`, `f?(): T`) matched against a
+  required one is discounted like an optionality difference in type mode
+  (×0.5). (XC-N14, XC-N15)
+- **Classes — ignore directives**: `// similarity-ignore` excludes a class
+  from the report, as the README promised; the directive was recorded but
+  never consulted in class mode.
+- **Classes — auto-accessors**: `accessor count = 0` fields are members.
+
+### Reports
+
+- **Duplicate clusters**, ported from mizchi/similarity#27: three or more
+  declarations connected by reported pairs of one mode are listed once, as a
+  cluster with its members, pair count and similarity range, before the
+  remaining standalone pairs. The JSON report keeps every pair in
+  `results`/`byMode` and adds `clusters` and `stats.clusterCount`. On the
+  TypeScript API package, 1,437 function pairs are 58 clusters and 168
+  standalone pairs.
+
+### Overlap mode
+
+- **Deterministic reports**: the sliding windows were built from subtrees
+  collected out of a hash map and sorted by start line only, so subtrees
+  starting on the same line came in a different order on every run — the
+  same input gave a different set of overlaps each time (1,416 vs 1,423 on
+  one fallow directory with the v0.7.0 engine). The windows follow the
+  fingerprints' pre-order now.
+- **Speed**: the windows and size buckets of a function are prepared once
+  per function instead of once per compared pair (output identical). On
+  the 59-file TypeScript API package, overlap mode drops from 294 s to 26 s,
+  and a default run (all four modes) from 314 s to 56 s even though more
+  functions are extracted.
+
+### Agent skill
+
+- `.claude/skills/check-similarity-ts`, adapted from mizchi/similarity's
+  per-language skills: runs the analyzer on TypeScript files and turns its
+  clusters and pairs into a refactoring plan. Copy it into a project's
+  `.claude/skills/` directory to use it there.
+
+### Weights
+
+- The APTED operation weights (rename 0.3, delete 1.0, insert 1.0) were
+  re-validated against the extended corpus: every setting in rename
+  0.2–0.5 × delete/insert 0.8–1.0 keeps 325/325. The closest call under any
+  setting is XF-N36 at rename 0.2 (0.797 against the 0.8 threshold), the
+  same as on v0.7.0, so the calibrated defaults stay.
+
+### Real-world effect
+
+Pairs reported at the default threshold on the audited snapshots:
+
+| Target | Mode | v0.7.0 | v0.8.0 |
+| --- | --- | ---: | ---: |
+| TypeScript `packages/typescript/src` (59 files) | functions | 1,103 | 1,437 |
+| TypeScript `packages/typescript/src` | types | 540 | 533 |
+| tsrs npm package, tools, playground (217 files) | functions | 1,126 | 1,460 |
+| tsrs npm package, tools, playground | types | 518 | 510 |
+| tsrs standard-library declarations (116 files) | types | 4,585 | 2,383 |
+| fallow VS Code extension (122 files) | types | 855 | 757 |
+| fallow tools, npm packages, frontend (77 files) | types | 938 | 840 |
+| TypeScript conformance tests (1,381 files) | classes | 12,371 | 12,058 |
+| TypeScript conformance tests | types | 8,473 | 8,382 |
+
+The added function pairs are the identical-body entries of the generated
+`yieldEachChildTable` dispatch table (339 on each package, newly visible as
+object-literal members); the removed ones are the sync/async API siblings.
+The removed type pairs are single-atom aliases (`GLsizei`/`GPUSize32`,
+`CodeActionTag = 1`/`SymbolTag = 1`, `DocumentUri = string`/`URI = string`).
+In the conformance classes, 644 pairs are gone (static members, optional
+members, member annotations and generic signatures now tell them apart)
+and 331 single-member pairs of same-named classes appear, because an
+initialized field (`x = 1`) now has the type its annotated twin declares.
+
+### Accuracy
+
+| Engine | Corpus | Wrong labels | Error rate | Accuracy |
+| --- | --- | ---: | ---: | ---: |
+| v0.7.0 | 325 pairs | 22 / 325 | 6.77% | 93.23% |
+| v0.8.0 | 325 pairs | 0 / 325 | 0.00% | 100.00% |
+
 ## 0.7.0 — 2026-09-01
 
 Accuracy work driven by a real codebase. The engine was run over a snapshot

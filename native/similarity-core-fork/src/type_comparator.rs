@@ -90,9 +90,28 @@ pub fn compare_types(
     // `VoidExpression extends UnaryExpressionBase` twins used to score as
     // near-duplicates on their shared `expression` member alone.
     let heritage_factor = if normalized1.extends == normalized2.extends { 1.0 } else { 0.7 };
-    let structural_similarity =
+    let mut structural_similarity =
         calculate_structural_similarity(&normalized1, &normalized2, &property_matches)
             * heritage_factor;
+
+    // An alias whose body is a single atom — a primitive, a literal, a
+    // bare reference (`type GLsizei = number`, `type SchemaVersion = "1"`,
+    // `type Handler = EventHandler`) — has no structure of its own to
+    // duplicate: it exists to give the atom a name. Two such aliases with
+    // the same body are the same declaration only when they also name it
+    // the same way (the same alias copied into two files, `UserId` vs
+    // `UserID`); otherwise they are distinct nominal labels, and equal
+    // bodies used to report every pair of them — the DOM library's
+    // `GLint`/`GLsizei`/`GPUSize32` numbers and a contract file's version
+    // singletons by the hundreds. The structural evidence is the name
+    // agreement, cubed so that only near-identical names (similarity above
+    // ~0.91: the same name, a case variant) clear the default threshold
+    // while one-letter label variants (`GLint64` vs `GLuint64`) do not.
+    if is_atomic_alias(&normalized1) && is_atomic_alias(&normalized2) {
+        let name_similarity =
+            calculate_property_similarity(&normalized1.original_name, &normalized2.original_name);
+        structural_similarity *= name_similarity.powi(3);
+    }
 
     // Calculate naming similarity
     let naming_similarity =
@@ -122,6 +141,15 @@ pub fn compare_types(
         differences,
         matched_properties,
     }
+}
+
+/// A type alias whose whole body is one nominal atom (see the call site).
+fn is_atomic_alias(normalized: &NormalizedType) -> bool {
+    normalized.properties.len() == 1
+        && normalized
+            .properties
+            .get("<type-body>")
+            .is_some_and(|body| crate::type_normalizer::is_nominal_atom(body))
 }
 
 /// Calculate structural similarity between two normalized types
@@ -703,6 +731,46 @@ mod tests {
         same_base.extends = vec!["EventBase".to_string()];
         let same = compare_types(&with_base, &same_base, &options);
         assert!(same.similarity > 0.95, "shared heritage must not be penalized, got {}", same.similarity);
+    }
+
+    #[test]
+    fn atomic_aliases_need_name_agreement() {
+        let options = TypeComparisonOptions::default();
+        let alias = |name: &str, body: &str| TypeDefinition {
+            kind: TypeKind::TypeAlias,
+            ..create_test_type(name, vec![("<type-body>", body, false, false)])
+        };
+        // Version singletons and primitive labels: equal bodies, distinct
+        // nominal aliases.
+        for (left, right, body) in [
+            ("SimilarCodeSchemaVersion", "MutationPlanSchemaVersion", "\"1\""),
+            ("SimilarCodeSchemaVersion", "SimilarCodeReviewSchemaVersion", "\"1\""),
+            ("GLsizei", "GPUSize32", "number"),
+            ("GLint64", "GLuint64", "number"),
+            ("RequestHandler", "ResponseHandler", "EventHandler"),
+        ] {
+            let result = compare_types(&alias(left, body), &alias(right, body), &options);
+            assert!(
+                result.similarity < 0.8,
+                "{left} vs {right} must not pair on an atomic body, got {}",
+                result.similarity
+            );
+        }
+        // The same alias declared twice (copied into two files), or a
+        // case variant of its name, is still one declaration.
+        let copied = compare_types(&alias("UserId", "string"), &alias("UserId", "string"), &options);
+        assert!(copied.similarity > 0.99, "got {}", copied.similarity);
+        let variant = compare_types(&alias("UserId", "string"), &alias("UserID", "string"), &options);
+        assert!(variant.similarity >= 0.8, "got {}", variant.similarity);
+        // Structured bodies are unaffected: literal unions and generic
+        // instantiations still pair under unrelated names (T-P05, T-P09).
+        let union = "\"debug\" | \"error\" | \"info\" | \"warn\"";
+        let levels = compare_types(&alias("LogLevel", union), &alias("Severity", union), &options);
+        assert!(levels.similarity >= 0.8, "got {}", levels.similarity);
+        let record = "Record<string, number>";
+        let totals =
+            compare_types(&alias("CountsByDay", record), &alias("DailyTotals", record), &options);
+        assert!(totals.similarity >= 0.8, "got {}", totals.similarity);
     }
 
     #[test]

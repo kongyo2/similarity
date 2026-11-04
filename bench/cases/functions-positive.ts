@@ -1636,4 +1636,143 @@ export class TapRelay {
     },
     expectPairs: [["handle", "handle"]],
   },
+
+  // -------------------------------------------------------------------
+  // 0.8.0 — declaration forms found missing on the fallow, tsrs and
+  // TypeScript repositories, and the open PR #30 review findings
+  // -------------------------------------------------------------------
+  {
+    id: "XF-P49",
+    mode: "functions",
+    category: "declaration-scope",
+    description:
+      "Named function expressions that recurse through the VARIABLE they are bound to; inner names and variables both differ",
+    files: {
+      "a.ts": `
+export const factorial = function recur(n: number): number {
+  if (n <= 1) {
+    return 1;
+  }
+  const rest = factorial(n - 1);
+  return n * rest;
+};
+`,
+      "b.ts": `
+export const fact = function go(n: number): number {
+  if (n <= 1) {
+    return 1;
+  }
+  const rest = fact(n - 1);
+  return n * rest;
+};
+`,
+    },
+    expectPairs: [["factorial", "fact"]],
+  },
+  {
+    id: "XF-P50",
+    mode: "functions",
+    category: "declaration-scope",
+    description:
+      "A parenthesized function expression and a `satisfies`-checked arrow bound to variables vs the same body as a function declaration",
+    files: {
+      "a.ts": `
+export const parseLine = (function (line: string): string[] {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return [];
+  }
+  return trimmed.split(",").map((cell) => cell.trim());
+});
+`,
+      "b.ts": `
+type Splitter = (line: string) => string[];
+export const splitCells = ((line: string): string[] => {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return [];
+  }
+  return trimmed.split(",").map((cell) => cell.trim());
+}) satisfies Splitter;
+`,
+      "c.ts": `
+export function readCells(line: string): string[] {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return [];
+  }
+  return trimmed.split(",").map((cell) => cell.trim());
+}
+`,
+    },
+    expectPairs: [
+      ["parseLine", "splitCells"],
+      ["parseLine", "readCells"],
+      ["splitCells", "readCells"],
+    ],
+  },
+  {
+    id: "XF-P51",
+    mode: "functions",
+    category: "declaration-scope",
+    description:
+      "A method of a handler object bound to a variable vs the same logic as a standalone function (object-literal members used to be invisible)",
+    files: {
+      "handlers.ts": `
+export const documentHandlers = {
+  onSave(doc: OpenDocument): void {
+    if (!doc.dirty) {
+      return;
+    }
+    doc.validate();
+    storage.write(doc.uri, doc.text);
+    doc.dirty = false;
+  },
+};
+`,
+      "persist.ts": `
+export function persistDocument(document: OpenDocument): void {
+  if (!document.dirty) {
+    return;
+  }
+  document.validate();
+  storage.write(document.uri, document.text);
+  document.dirty = false;
+}
+`,
+    },
+    expectPairs: [["documentHandlers.onSave", "persistDocument"]],
+  },
+  {
+    id: "XF-P52",
+    mode: "functions",
+    category: "declaration-scope",
+    description:
+      "An arrow-valued property of a nested config object vs a method of a default-exported plugin object",
+    files: {
+      "config.ts": `
+export const pipeline = {
+  hooks: {
+    transform: (code: string, id: string): string | null => {
+      if (!id.endsWith(".ts")) {
+        return null;
+      }
+      return code.replace(/\\r\\n/g, "\\n");
+    },
+  },
+};
+`,
+      "plugin.ts": `
+export default {
+  transform(source: string, file: string): string | null {
+    if (!file.endsWith(".ts")) {
+      return null;
+    }
+    return source.replace(/\\r\\n/g, "\\n");
+  },
+};
+`,
+    },
+    expectPairs: [["pipeline.hooks.transform", "default.transform"]],
+  },
 ];

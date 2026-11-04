@@ -1,10 +1,14 @@
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{ClassElement, MethodDefinitionKind, PropertyKey, Statement};
+use oxc_ast::ast::{
+    BindingPattern, ClassElement, Expression, MethodDefinitionKind, PropertyKey, Statement, TSType,
+};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
 use crate::ignore_directive::has_similarity_ignore_directive;
 use crate::module_scope::{module_qualifier, qualified_name};
+use crate::type_extractor::TypeExtractor;
+use crate::type_normalizer::normalize_type_name;
 
 #[derive(Debug, Clone)]
 pub struct ClassDefinition {
@@ -12,6 +16,13 @@ pub struct ClassDefinition {
     pub properties: Vec<ClassProperty>,
     pub methods: Vec<ClassMethod>,
     pub constructor_params: Vec<String>,
+    /// Where the constructor stores its parameters: `(parameter, target)`
+    /// pairs, the parameter named by position (`#0`, `#1.host` for a
+    /// destructured member, `...` for the rest parameter) and the target a
+    /// field (`this.x = p` or a parameter property) or a `super(…)`
+    /// argument slot (`super[0]`). Two classes with the same fields but
+    /// opposite wiring (`this.x = y; this.y = x`) initialize differently.
+    pub constructor_wiring: Vec<(String, String)>,
     pub extends: Option<String>,
     pub implements: Vec<String>,
     pub start_line: usize,
@@ -40,6 +51,8 @@ pub struct ClassMethod {
     pub is_private: bool,
     pub is_async: bool,
     pub is_generator: bool,
+    /// `f?(): T` — an optional method may be absent on an instance.
+    pub is_optional: bool,
     pub kind: MethodKind,
     /// Structural hash of the method's canonicalized params+body tree
     /// (name excluded, locals alpha-renamed). Two methods with the same
@@ -61,12 +74,22 @@ struct ClassExtractor {
     source_text: String,
     file_path: String,
     line_offsets: Vec<usize>,
+    /// Type mode's renderer: member annotations are spelled exactly the way
+    /// an interface member's would be. The class extractor used to carry a
+    /// renderer of its own that collapsed every qualified reference
+    /// (`SyntaxKind.Block`, `React.ComponentType<P>`) onto `unknown`,
+    /// dropped the type arguments of nested references (`Promise<User>`
+    /// rendered as `Promise`) and turned literal, tuple, `keyof`,
+    /// `readonly`, `typeof` and every other type onto `any` — so classes
+    /// whose members disagreed on all of those compared as identical.
+    types: TypeExtractor,
 }
 
 impl ClassExtractor {
     fn new(source_text: String, file_path: String) -> Self {
         let line_offsets = Self::calculate_line_offsets(&source_text);
-        Self { source_text, file_path, line_offsets }
+        let types = TypeExtractor::new(source_text.clone(), file_path.clone());
+        Self { source_text, file_path, line_offsets, types }
     }
 
     fn calculate_line_offsets(source: &str) -> Vec<usize> {
@@ -86,182 +109,111 @@ impl ClassExtractor {
         }
     }
 
-    fn extract_type_string(&self, type_annotation: &oxc_ast::ast::TSTypeAnnotation) -> String {
-        use oxc_ast::ast::TSType;
+    /// A member annotation, rendered by type mode's renderer and normalized
+    /// the way type mode compares annotations (`Array<T>` ⇔ `T[]`, sorted
+    /// union arms, boxed primitives).
+    fn render_type(&self, ts_type: &TSType) -> String {
+        normalize_type_name(&self.types.render_type(ts_type))
+    }
 
-        match &type_annotation.type_annotation {
-            TSType::TSStringKeyword(_) => "string".to_string(),
-            TSType::TSNumberKeyword(_) => "number".to_string(),
-            TSType::TSBooleanKeyword(_) => "boolean".to_string(),
-            TSType::TSAnyKeyword(_) => "any".to_string(),
-            TSType::TSUnknownKeyword(_) => "unknown".to_string(),
-            TSType::TSNeverKeyword(_) => "never".to_string(),
-            TSType::TSVoidKeyword(_) => "void".to_string(),
-            TSType::TSUndefinedKeyword(_) => "undefined".to_string(),
-            TSType::TSNullKeyword(_) => "null".to_string(),
-            TSType::TSArrayType(array) => {
-                format!("{}[]", self.extract_type_string_from_ts_type(&array.element_type))
+    fn render_annotation(&self, annotation: Option<&oxc_ast::ast::TSTypeAnnotation>) -> String {
+        annotation.map_or_else(|| "any".to_string(), |ta| self.render_type(&ta.type_annotation))
+    }
+
+    /// The type a field's initializer pins down when it carries no
+    /// annotation: a literal's primitive (`count = 0`), or the constructed
+    /// class (`cache = new Map<string, User>()`). Everything else stays
+    /// `any`. Unannotated fields are the norm in TypeScript classes, and
+    /// rendering all of them `any` made `enabled = false` and `enabled =
+    /// 0` the same member while `count = 0` and `count: number` differed.
+    fn initializer_type(&self, initializer: &Expression) -> String {
+        use oxc_ast::ast::UnaryOperator;
+        match initializer.get_inner_expression() {
+            Expression::NumericLiteral(_) => "number".to_string(),
+            Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => "string".to_string(),
+            Expression::BooleanLiteral(_) => "boolean".to_string(),
+            Expression::BigIntLiteral(_) => "bigint".to_string(),
+            // A signed literal is still a literal: `offset = -1` is the
+            // same `number` field as `offset = 0`.
+            Expression::UnaryExpression(unary) => {
+                match (unary.operator, unary.argument.get_inner_expression()) {
+                    (
+                        UnaryOperator::UnaryNegation | UnaryOperator::UnaryPlus,
+                        Expression::NumericLiteral(_),
+                    ) => "number".to_string(),
+                    (UnaryOperator::UnaryNegation, Expression::BigIntLiteral(_)) => {
+                        "bigint".to_string()
+                    }
+                    (UnaryOperator::LogicalNot, _) => "boolean".to_string(),
+                    (UnaryOperator::Typeof, _) => "string".to_string(),
+                    _ => "any".to_string(),
+                }
             }
-            TSType::TSTypeReference(type_ref) => match &type_ref.type_name {
-                oxc_ast::ast::TSTypeName::IdentifierReference(ident) => {
-                    let base = ident.name.as_str();
-                    if let Some(params) = &type_ref.type_arguments {
-                        let param_strings: Vec<String> = params
+            Expression::NewExpression(new_expr) => {
+                let callee = match new_expr.callee.get_inner_expression() {
+                    Expression::Identifier(ident) => ident.name.to_string(),
+                    other => match self.source_slice(other.span()) {
+                        Some(text) => text.chars().filter(|c| !c.is_whitespace()).collect(),
+                        None => return "any".to_string(),
+                    },
+                };
+                match &new_expr.type_arguments {
+                    Some(args) if !args.params.is_empty() => {
+                        let rendered: Vec<String> = args
                             .params
                             .iter()
-                            .map(|p| self.extract_type_string_from_ts_type(p))
+                            .map(|arg| self.types.render_type(arg))
                             .collect();
-                        format!("{}<{}>", base, param_strings.join(", "))
-                    } else {
-                        base.to_string()
+                        normalize_type_name(&format!("{callee}<{}>", rendered.join(", ")))
                     }
+                    _ => callee,
                 }
-                _ => "unknown".to_string(),
-            },
-            TSType::TSUnionType(union) => {
-                let types: Vec<String> =
-                    union.types.iter().map(|t| self.extract_type_string_from_ts_type(t)).collect();
-                types.join(" | ")
-            }
-            TSType::TSIntersectionType(intersection) => {
-                let types: Vec<String> = intersection
-                    .types
-                    .iter()
-                    .map(|t| self.extract_type_string_from_ts_type(t))
-                    .collect();
-                types.join(" & ")
-            }
-            TSType::TSFunctionType(func) => {
-                let params = self.extract_function_params(&func.params);
-                let return_type =
-                    self.extract_type_string_from_ts_type(&func.return_type.type_annotation);
-                format!("({}) => {}", params, return_type)
-            }
-            TSType::TSTypeLiteral(literal) => {
-                let props: Vec<String> = literal
-                    .members
-                    .iter()
-                    .filter_map(|member| {
-                        if let oxc_ast::ast::TSSignature::TSPropertySignature(prop) = member {
-                            let name = match &prop.key {
-                                oxc_ast::ast::PropertyKey::StaticIdentifier(ident) => {
-                                    ident.name.as_str().to_string()
-                                }
-                                oxc_ast::ast::PropertyKey::StringLiteral(str_lit) => {
-                                    str_lit.value.as_str().to_string()
-                                }
-                                _ => return None,
-                            };
-                            let type_str = prop
-                                .type_annotation
-                                .as_ref()
-                                .map(|ta| self.extract_type_string(ta))
-                                .unwrap_or_else(|| "any".to_string());
-                            let optional = if prop.optional { "?" } else { "" };
-                            Some(format!("{}{}: {}", name, optional, type_str))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                format!("{{ {} }}", props.join(", "))
             }
             _ => "any".to_string(),
         }
     }
 
-    fn extract_type_string_from_ts_type(&self, ts_type: &oxc_ast::ast::TSType) -> String {
-        use oxc_ast::ast::TSType;
-
-        match ts_type {
-            TSType::TSStringKeyword(_) => "string".to_string(),
-            TSType::TSNumberKeyword(_) => "number".to_string(),
-            TSType::TSBooleanKeyword(_) => "boolean".to_string(),
-            TSType::TSAnyKeyword(_) => "any".to_string(),
-            TSType::TSUnknownKeyword(_) => "unknown".to_string(),
-            TSType::TSNeverKeyword(_) => "never".to_string(),
-            TSType::TSVoidKeyword(_) => "void".to_string(),
-            TSType::TSUndefinedKeyword(_) => "undefined".to_string(),
-            TSType::TSNullKeyword(_) => "null".to_string(),
-            TSType::TSArrayType(array) => {
-                format!("{}[]", self.extract_type_string_from_ts_type(&array.element_type))
-            }
-            TSType::TSTypeReference(type_ref) => match &type_ref.type_name {
-                oxc_ast::ast::TSTypeName::IdentifierReference(ident) => {
-                    ident.name.as_str().to_string()
-                }
-                _ => "unknown".to_string(),
-            },
-            TSType::TSUnionType(union) => {
-                let types: Vec<String> =
-                    union.types.iter().map(|t| self.extract_type_string_from_ts_type(t)).collect();
-                types.join(" | ")
-            }
-            TSType::TSIntersectionType(intersection) => {
-                let types: Vec<String> = intersection
-                    .types
-                    .iter()
-                    .map(|t| self.extract_type_string_from_ts_type(t))
-                    .collect();
-                types.join(" & ")
-            }
-            TSType::TSFunctionType(func) => {
-                let params = self.extract_function_params(&func.params);
-                let return_type =
-                    self.extract_type_string_from_ts_type(&func.return_type.type_annotation);
-                format!("({}) => {}", params, return_type)
-            }
-            TSType::TSTypeLiteral(literal) => {
-                let props: Vec<String> = literal
-                    .members
-                    .iter()
-                    .filter_map(|member| {
-                        if let oxc_ast::ast::TSSignature::TSPropertySignature(prop) = member {
-                            let name = match &prop.key {
-                                oxc_ast::ast::PropertyKey::StaticIdentifier(ident) => {
-                                    ident.name.as_str().to_string()
-                                }
-                                oxc_ast::ast::PropertyKey::StringLiteral(str_lit) => {
-                                    str_lit.value.as_str().to_string()
-                                }
-                                _ => return None,
-                            };
-                            let type_str = prop
-                                .type_annotation
-                                .as_ref()
-                                .map(|ta| self.extract_type_string(ta))
-                                .unwrap_or_else(|| "any".to_string());
-                            let optional = if prop.optional { "?" } else { "" };
-                            Some(format!("{}{}: {}", name, optional, type_str))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                format!("{{ {} }}", props.join(", "))
-            }
-            _ => "any".to_string(),
-        }
-    }
-
+    /// A parameter list as `name: type` pieces. Optional and defaulted
+    /// parameters keep their `?` and the rest parameter its `...`: the
+    /// rest parameter used to be dropped, so `log(...args: unknown[])` and
+    /// `log()` had the same signature.
     fn extract_function_params(&self, params: &oxc_ast::ast::FormalParameters) -> String {
-        let param_strings: Vec<String> = params
+        let mut pieces: Vec<String> = params
             .items
             .iter()
             .map(|param| {
                 let name = match &param.pattern {
-                    oxc_ast::ast::BindingPattern::BindingIdentifier(ident) => ident.name.as_str(),
+                    BindingPattern::BindingIdentifier(ident) => ident.name.as_str(),
                     _ => "param",
                 };
-                let type_str = param
-                    .type_annotation
-                    .as_ref()
-                    .map(|ta| self.extract_type_string(ta))
-                    .unwrap_or_else(|| "any".to_string());
-                format!("{}: {}", name, type_str)
+                let optional = param.optional || param.initializer.is_some();
+                format!(
+                    "{name}{}: {}",
+                    if optional { "?" } else { "" },
+                    self.render_annotation(param.type_annotation.as_deref())
+                )
             })
             .collect();
-        param_strings.join(", ")
+        if let Some(rest) = &params.rest {
+            let name = match &rest.rest.argument {
+                BindingPattern::BindingIdentifier(ident) => ident.name.as_str(),
+                _ => "rest",
+            };
+            pieces.push(format!(
+                "...{name}: {}",
+                self.render_annotation(rest.type_annotation.as_deref())
+            ));
+        }
+        pieces.join(", ")
+    }
+
+    /// Type-parameter names of a declaration, in order.
+    fn type_parameter_names(
+        params: Option<&oxc_allocator::Box<oxc_ast::ast::TSTypeParameterDeclaration>>,
+    ) -> Vec<String> {
+        params.map_or_else(Vec::new, |params| {
+            params.params.iter().map(|param| param.name.name.to_string()).collect()
+        })
     }
 
     /// `qualifier` is the dotted path of the enclosing `namespace`/`module`
@@ -288,12 +240,13 @@ impl ClassExtractor {
             text
         });
 
-        let implements =
+        let implements: Vec<String> =
             class.implements.iter().map(|clause| self.heritage_text(clause.span)).collect();
 
         let mut properties = Vec::new();
         let mut methods = Vec::new();
         let mut constructor_params = Vec::new();
+        let mut constructor_wiring = Vec::new();
 
         for element in &class.body.body {
             match element {
@@ -305,34 +258,40 @@ impl ClassExtractor {
                     // `handle = (event) => { … }` class fields are methods
                     // in everything but declaration syntax; extract them as
                     // methods so the arrow-field and method spellings of the
-                    // same class compare member-for-member.
-                    if let Some(oxc_ast::ast::Expression::ArrowFunctionExpression(arrow)) =
-                        &prop.value
+                    // same class compare member-for-member. Parentheses and
+                    // `as`/`satisfies` wrappers are transparent.
+                    if let Some(Expression::ArrowFunctionExpression(arrow)) =
+                        prop.value.as_ref().map(Expression::get_inner_expression)
                     {
-                        let return_type = arrow
-                            .return_type
-                            .as_ref()
-                            .map(|rt| self.extract_type_string_from_ts_type(&rt.type_annotation))
-                            .unwrap_or_else(|| "void".to_string());
+                        let return_type = arrow.return_type.as_ref().map_or_else(
+                            || "void".to_string(),
+                            |rt| self.render_type(&rt.type_annotation),
+                        );
+                        let method_generics =
+                            Self::type_parameter_names(arrow.type_parameters.as_ref());
                         methods.push(ClassMethod {
                             name,
-                            parameters: vec![self.extract_function_params(&arrow.params)],
-                            return_type,
+                            parameters: vec![Self::scoped(
+                                &self.extract_function_params(&arrow.params),
+                                &method_generics,
+                            )],
+                            return_type: Self::scoped(&return_type, &method_generics),
                             is_static: prop.r#static,
                             is_private: false,
                             is_async: arrow.r#async,
                             is_generator: false,
+                            is_optional: prop.optional,
                             kind: MethodKind::Method,
                             body_fingerprint: self.arrow_body_fingerprint(arrow),
                         });
                         continue;
                     }
 
-                    let type_annotation = prop
-                        .type_annotation
-                        .as_ref()
-                        .map(|ta| self.extract_type_string(ta))
-                        .unwrap_or_else(|| "any".to_string());
+                    let type_annotation = match (&prop.type_annotation, &prop.value) {
+                        (Some(annotation), _) => self.render_type(&annotation.type_annotation),
+                        (None, Some(value)) => self.initializer_type(value),
+                        (None, None) => "any".to_string(),
+                    };
 
                     properties.push(ClassProperty {
                         name,
@@ -341,6 +300,27 @@ impl ClassExtractor {
                         is_private: false, // PropertyDefinitionType doesn't have TSPrivateProperty
                         is_readonly: prop.readonly,
                         is_optional: prop.optional,
+                    });
+                }
+                // `accessor count = 0` (an auto-accessor) is a field behind a
+                // generated getter/setter pair — a member like any other,
+                // which the scan used to skip.
+                ClassElement::AccessorProperty(accessor) => {
+                    let Some(name) = self.member_key_name(&accessor.key, accessor.computed) else {
+                        continue;
+                    };
+                    let type_annotation = match (&accessor.type_annotation, &accessor.value) {
+                        (Some(annotation), _) => self.render_type(&annotation.type_annotation),
+                        (None, Some(value)) => self.initializer_type(value),
+                        (None, None) => "any".to_string(),
+                    };
+                    properties.push(ClassProperty {
+                        name,
+                        type_annotation,
+                        is_static: accessor.r#static,
+                        is_private: false,
+                        is_readonly: false,
+                        is_optional: false,
                     });
                 }
                 ClassElement::MethodDefinition(method) => {
@@ -358,17 +338,16 @@ impl ClassExtractor {
                                 .iter()
                                 .map(|param| {
                                     let param_name = match &param.pattern {
-                                        oxc_ast::ast::BindingPattern::BindingIdentifier(ident) => {
+                                        BindingPattern::BindingIdentifier(ident) => {
                                             ident.name.as_str()
                                         }
                                         _ => "param",
                                     };
-                                    let type_str = param
-                                        .type_annotation
-                                        .as_ref()
-                                        .map(|ta| self.extract_type_string(ta))
-                                        .unwrap_or_else(|| "any".to_string());
-                                    format!("{}: {}", param_name, type_str)
+                                    format!(
+                                        "{}: {}",
+                                        param_name,
+                                        self.render_annotation(param.type_annotation.as_deref())
+                                    )
                                 })
                                 .collect();
                             MethodKind::Constructor
@@ -379,6 +358,7 @@ impl ClassExtractor {
                     };
 
                     if kind == MethodKind::Constructor {
+                        constructor_wiring = Self::constructor_wiring(&method.value);
                         // Constructor parameter properties (`constructor(
                         // private readonly repo: Repo)`) declare real
                         // fields; surface them so the shorthand and the
@@ -391,16 +371,20 @@ impl ClassExtractor {
                             if !is_property {
                                 continue;
                             }
-                            let oxc_ast::ast::BindingPattern::BindingIdentifier(ident) =
-                                &param.pattern
-                            else {
+                            let BindingPattern::BindingIdentifier(ident) = &param.pattern else {
                                 continue;
                             };
-                            let type_annotation = param
-                                .type_annotation
-                                .as_ref()
-                                .map(|ta| self.extract_type_string(ta))
-                                .unwrap_or_else(|| "any".to_string());
+                            // An unannotated parameter property with a
+                            // default (`private indent = "\t"`) is typed by
+                            // its default, exactly like the field spelling.
+                            let type_annotation = match (&param.type_annotation, &param.initializer)
+                            {
+                                (Some(annotation), _) => {
+                                    self.render_type(&annotation.type_annotation)
+                                }
+                                (None, Some(default)) => self.initializer_type(default),
+                                (None, None) => "any".to_string(),
+                            };
                             properties.push(ClassProperty {
                                 name: ident.name.as_str().to_string(),
                                 type_annotation,
@@ -423,7 +407,9 @@ impl ClassExtractor {
                         // parameter-property constructor) add nothing the
                         // field list doesn't already say, so they stay
                         // out — otherwise a class that happens to have one
-                        // would be "missing" it on the other side.
+                        // would be "missing" it on the other side. What
+                        // they wire where is still compared, through
+                        // `constructor_wiring`.
                         if !Self::is_wiring_only_constructor(&method.value) {
                             methods.push(ClassMethod {
                                 name,
@@ -435,27 +421,29 @@ impl ClassExtractor {
                                 is_private: false,
                                 is_async: false,
                                 is_generator: false,
+                                is_optional: false,
                                 kind: MethodKind::Constructor,
                                 body_fingerprint: self.constructor_fingerprint(&method.value),
                             });
                         }
                     } else {
+                        let method_generics =
+                            Self::type_parameter_names(method.value.type_parameters.as_ref());
                         let parameters = self.extract_function_params(&method.value.params);
-                        let return_type = method
-                            .value
-                            .return_type
-                            .as_ref()
-                            .map(|rt| self.extract_type_string_from_ts_type(&rt.type_annotation))
-                            .unwrap_or_else(|| "void".to_string());
+                        let return_type = method.value.return_type.as_ref().map_or_else(
+                            || "void".to_string(),
+                            |rt| self.render_type(&rt.type_annotation),
+                        );
 
                         methods.push(ClassMethod {
                             name,
-                            parameters: vec![parameters],
-                            return_type,
+                            parameters: vec![Self::scoped(&parameters, &method_generics)],
+                            return_type: Self::scoped(&return_type, &method_generics),
                             is_static: method.r#static,
                             is_private: false, // Would need to check for private keyword
                             is_async: method.value.r#async,
                             is_generator: method.value.generator,
+                            is_optional: method.optional,
                             kind,
                             body_fingerprint: self.method_body_fingerprint(&method.value),
                         });
@@ -465,11 +453,34 @@ impl ClassExtractor {
             }
         }
 
+        // Class type parameters are declaration-local names: `Alpha<TItem>
+        // extends Base<TItem>` and `Beta<UItem> extends Base<UItem>` are the
+        // same contract, so every member annotation and heritage clause
+        // spells them positionally (`#0`, `#1`, …) — the substitution type
+        // mode applies to interfaces. Method-level parameters were already
+        // spelled `#m0`, `#m1`, … above, so they cannot collide.
+        let generics = Self::type_parameter_names(class.type_parameters.as_ref());
+        let positional = |text: &str| TypeExtractor::substitute_generic_tokens(text, &generics);
+        if !generics.is_empty() {
+            for property in &mut properties {
+                property.type_annotation = positional(&property.type_annotation);
+            }
+            for method in &mut methods {
+                method.parameters = method.parameters.iter().map(|p| positional(p)).collect();
+                method.return_type = positional(&method.return_type);
+            }
+            constructor_params = constructor_params.iter().map(|p| positional(p)).collect();
+        }
+        let extends = extends.map(|text| positional(&text));
+        let implements: Vec<String> =
+            implements.into_iter().map(|text| positional(&text)).collect();
+
         ClassDefinition {
             name,
             properties,
             methods,
             constructor_params,
+            constructor_wiring,
             extends,
             implements,
             start_line,
@@ -477,6 +488,121 @@ impl ClassExtractor {
             file_path: self.file_path.clone(),
             is_abstract: class.r#abstract,
             has_ignore_directive: has_similarity_ignore_directive(&self.source_text, start_line),
+        }
+    }
+
+    /// Spell a method's own type parameters positionally (`#m0`, `#m1`, …):
+    /// `map<U>(fn: (item: T) => U): U[]` and `map<R>(fn: (item: T) => R):
+    /// R[]` are the same signature.
+    fn scoped(text: &str, method_generics: &[String]) -> String {
+        TypeExtractor::substitute_generic_tokens_with(text, method_generics, "#m")
+    }
+
+    /// Where a constructor stores its parameters — see
+    /// [`ClassDefinition::constructor_wiring`]. Parameter properties wire
+    /// their parameter into the same-named field; top-level `this.f = p`
+    /// statements and `super(…)` arguments that are bare parameter
+    /// references wire `p` into `f` / the argument slot.
+    fn constructor_wiring(function: &oxc_ast::ast::Function) -> Vec<(String, String)> {
+        use oxc_ast::ast::{AssignmentOperator, AssignmentTarget, Statement};
+
+        let mut keys: Vec<(String, String)> = Vec::new();
+        for (index, param) in function.params.items.iter().enumerate() {
+            Self::binding_keys(&param.pattern, &format!("#{index}"), &mut keys);
+        }
+        if let Some(rest) = &function.params.rest {
+            Self::binding_keys(&rest.rest.argument, "...", &mut keys);
+        }
+        let key_of = |name: &str| {
+            keys.iter().find(|(binding, _)| binding == name).map(|(_, key)| key.clone())
+        };
+
+        let mut wiring = Vec::new();
+        for param in &function.params.items {
+            let is_property = param.accessibility.is_some() || param.readonly || param.r#override;
+            if let (true, BindingPattern::BindingIdentifier(ident)) = (is_property, &param.pattern)
+            {
+                if let Some(key) = key_of(ident.name.as_str()) {
+                    wiring.push((key, ident.name.to_string()));
+                }
+            }
+        }
+        let Some(body) = &function.body else {
+            return wiring;
+        };
+        for stmt in &body.statements {
+            let Statement::ExpressionStatement(expr_stmt) = stmt else {
+                continue;
+            };
+            match &expr_stmt.expression {
+                Expression::CallExpression(call) if matches!(call.callee, Expression::Super(_)) => {
+                    for (slot, argument) in call.arguments.iter().enumerate() {
+                        let Some(Expression::Identifier(ident)) =
+                            argument.as_expression().map(Expression::get_inner_expression)
+                        else {
+                            continue;
+                        };
+                        if let Some(key) = key_of(ident.name.as_str()) {
+                            wiring.push((key, format!("super[{slot}]")));
+                        }
+                    }
+                }
+                Expression::AssignmentExpression(assign)
+                    if assign.operator == AssignmentOperator::Assign =>
+                {
+                    let AssignmentTarget::StaticMemberExpression(member) = &assign.left else {
+                        continue;
+                    };
+                    if !matches!(member.object, Expression::ThisExpression(_)) {
+                        continue;
+                    }
+                    let Expression::Identifier(ident) = assign.right.get_inner_expression() else {
+                        continue;
+                    };
+                    if let Some(key) = key_of(ident.name.as_str()) {
+                        wiring.push((key, member.property.name.to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        wiring
+    }
+
+    /// Positional keys for every binding a parameter pattern introduces:
+    /// `#0` for a plain parameter, `#1.host` for a destructured member,
+    /// `#2[0]` for an array element.
+    fn binding_keys(pattern: &BindingPattern, key: &str, out: &mut Vec<(String, String)>) {
+        match pattern {
+            BindingPattern::BindingIdentifier(ident) => {
+                out.push((ident.name.to_string(), key.to_string()));
+            }
+            BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    let member = match &property.key {
+                        PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
+                        PropertyKey::StringLiteral(literal) => literal.value.to_string(),
+                        _ => "?".to_string(),
+                    };
+                    Self::binding_keys(&property.value, &format!("{key}.{member}"), out);
+                }
+                if let Some(rest) = &object.rest {
+                    Self::binding_keys(&rest.argument, &format!("{key}..."), out);
+                }
+            }
+            BindingPattern::ArrayPattern(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    if let Some(element) = element {
+                        Self::binding_keys(element, &format!("{key}[{index}]"), out);
+                    }
+                }
+                if let Some(rest) = &array.rest {
+                    Self::binding_keys(&rest.argument, &format!("{key}[...]"), out);
+                }
+            }
+            BindingPattern::AssignmentPattern(assignment) => {
+                Self::binding_keys(&assignment.left, key, out);
+            }
         }
     }
 
@@ -934,6 +1060,144 @@ export class Plain extends Base {}
                 "parameter wiring must not be a member: {source}"
             );
         }
+    }
+
+    #[test]
+    fn member_types_render_like_type_mode() {
+        let classes = extract_classes_from_code(
+            r#"
+export class Widget {
+  status: "open" | "closed" = "open";
+  kind: SyntaxKind.Block;
+  render: React.ComponentType<Props>;
+  ids: readonly string[] = [];
+  pair: [string, number];
+  key: keyof Options;
+  count = 0;
+  cache = new Map<string, Array<User>>();
+  label = `w`;
+  load(): Promise<User> { return this.repo.load(); }
+  log(prefix?: string, ...args: unknown[]): void {}
+}
+"#,
+            "w.ts",
+        )
+        .unwrap();
+        let types: Vec<(&str, &str)> = classes[0]
+            .properties
+            .iter()
+            .map(|p| (p.name.as_str(), p.type_annotation.as_str()))
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                ("status", "\"closed\" | \"open\""),
+                ("kind", "SyntaxKind.Block"),
+                ("render", "React.ComponentType<Props>"),
+                ("ids", "ReadonlyArray<string>"),
+                ("pair", "[string, number]"),
+                ("key", "keyof Options"),
+                ("count", "number"),
+                ("cache", "Map<string, User[]>"),
+                ("label", "string"),
+            ]
+        );
+        let load = &classes[0].methods[0];
+        assert_eq!(load.return_type, "Promise<User>");
+        let signed = extract_classes_from_code(
+            "export class Cursor { offset = -1; step = +2; big = -1n; open = !0; kind = typeof window; }",
+            "s.ts",
+        )
+        .unwrap();
+        let types: Vec<&str> =
+            signed[0].properties.iter().map(|p| p.type_annotation.as_str()).collect();
+        assert_eq!(types, vec!["number", "number", "bigint", "boolean", "string"]);
+        let accessors = extract_classes_from_code(
+            "export class Counter { accessor count = 0; static accessor label: string; }",
+            "a.ts",
+        )
+        .unwrap();
+        let members: Vec<(&str, &str, bool)> = accessors[0]
+            .properties
+            .iter()
+            .map(|p| (p.name.as_str(), p.type_annotation.as_str(), p.is_static))
+            .collect();
+        assert_eq!(members, vec![("count", "number", false), ("label", "string", true)]);
+        let log = &classes[0].methods[1];
+        assert_eq!(log.parameters, vec!["prefix?: string, ...args: unknown[]"]);
+    }
+
+    #[test]
+    fn class_type_parameters_are_positional() {
+        let classes = extract_classes_from_code(
+            r"
+export class Alpha<TItem> extends Base<TItem> implements Store<TItem> {
+  private items: TItem[] = [];
+  add(item: TItem): void { this.items.push(item); }
+  map<R>(fn: (item: TItem) => R): R[] { return this.items.map(fn); }
+}
+export class Beta<U> extends Base<U> implements Store<U> {
+  private items: U[] = [];
+  add(item: U): void { this.items.push(item); }
+  map<S>(fn: (item: U) => S): S[] { return this.items.map(fn); }
+}
+",
+            "g.ts",
+        )
+        .unwrap();
+        // Literal text and qualified-name segments that happen to spell a
+        // type parameter are not references to it.
+        let spelled = extract_classes_from_code(
+            r#"
+export class Walker<Node> extends ts.Visitor<Node> {
+  root: ts.Node;
+  kind: "Node" = "Node";
+  label: `${Node}-walker`;
+  current: Node;
+}
+"#,
+            "w.ts",
+        )
+        .unwrap();
+        assert_eq!(spelled[0].extends.as_deref(), Some("ts.Visitor<#0>"));
+        let annotations: Vec<&str> =
+            spelled[0].properties.iter().map(|p| p.type_annotation.as_str()).collect();
+        assert_eq!(annotations, vec!["ts.Node", "\"Node\"", "`${#0}-walker`", "#0"]);
+        for class in &classes {
+            assert_eq!(class.extends.as_deref(), Some("Base<#0>"));
+            assert_eq!(class.implements, vec!["Store<#0>"]);
+            assert_eq!(class.properties[0].type_annotation, "#0[]");
+            // Function-type parameter names are local to the signature and
+            // drop out, as in type mode.
+            assert_eq!(class.methods[1].parameters, vec!["fn: (#0) => #m0"]);
+            assert_eq!(class.methods[1].return_type, "#m0[]");
+        }
+    }
+
+    #[test]
+    fn constructor_wiring_records_parameter_targets() {
+        let wiring = |source: &str| {
+            extract_classes_from_code(source, "c.ts").unwrap()[0].constructor_wiring.clone()
+        };
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter().map(|(a, b)| ((*a).to_string(), (*b).to_string())).collect()
+        };
+        assert_eq!(
+            wiring("export class P { x: number; y: number; constructor(x: number, y: number) { this.x = y; this.y = x; } }"),
+            pairs(&[("#1", "x"), ("#0", "y")])
+        );
+        assert_eq!(
+            wiring("export class P { constructor(public x: number, readonly y: number) {} }"),
+            pairs(&[("#0", "x"), ("#1", "y")])
+        );
+        assert_eq!(
+            wiring("export class S extends B { constructor(name: string, id: string) { super(id, name); } }"),
+            pairs(&[("#1", "super[0]"), ("#0", "super[1]")])
+        );
+        assert_eq!(
+            wiring("export class D { constructor({ host, port }: Opts, ...rest: string[]) { this.host = host; this.port = port; this.rest = rest; } }"),
+            pairs(&[("#0.host", "host"), ("#0.port", "port"), ("...", "rest")])
+        );
     }
 
     #[test]

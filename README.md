@@ -27,6 +27,16 @@ Run `npx @kongyo2/similarity-ts .` to detect semantic code similarities.
 Execute this command, analyze the duplicate code patterns, and create a refactoring plan.
 ```
 
+For Claude Code, copy
+[`.claude/skills/check-similarity-ts`](.claude/skills/check-similarity-ts/SKILL.md)
+into your project's `.claude/skills/` directory. The skill runs the analyzer
+on TypeScript files and turns its clusters and pairs into a refactoring plan.
+
+Three or more copies of one declaration are reported once, as a **cluster**,
+instead of as every pair among them: five identical `dispose()` methods are
+one block listing five locations, not ten table rows. The JSON report keeps
+every pair in `results`/`byMode` and adds the groups as `clusters`.
+
 ## What it detects
 
 The analyzer compares functions, types, and classes structurally. Every
@@ -40,8 +50,8 @@ On top of that, the comparison canonicalizes common style alternatives —
 two snippets a reviewer would call "the same code written differently"
 score as equal:
 
-- arrow functions ⇔ function declarations ⇔ class methods ⇔ arrow-valued
-  class fields, expression bodies ⇔ block bodies
+- arrow functions ⇔ function declarations ⇔ class methods ⇔ object-literal
+  methods ⇔ arrow-valued class fields, expression bodies ⇔ block bodies
 - `promise.then((v) => …)` ⇔ `const v = await promise; …`
 - `items.forEach((item) => …)` ⇔ `for (const item of items) …` ⇔
   `for (let i = 0; i < items.length; i++) { const item = items[i]; … }`
@@ -69,50 +79,65 @@ score as equal:
 - interfaces ⇔ structurally identical type aliases, reordered members,
   renamed-but-identically-typed property sets, `Array<T>` ⇔ `T[]`,
   `x?: T` ⇔ `x: T | undefined`, reordered unions, renamed generic params
-- classes: reordered members, renamed private fields, constructor
-  parameter properties ⇔ explicit field + assignment, and fully renamed
-  method names when the canonical method bodies match
+- classes: reordered members, renamed private fields, renamed class type
+  parameters (`ItemList<T> extends Collection<T>` ⇔ `EntryList<U> extends
+  Collection<U>`), constructor parameter properties ⇔ explicit field +
+  assignment, and fully renamed method names when the canonical method
+  bodies match
 
 Every declaration form takes part: function declarations, arrow and
-function expressions bound to a variable (a named function expression keeps
-recursing through its own name), `export default` classes and functions,
-class methods and arrow-function class fields, constructors, and
-declarations inside `namespace`/`module` blocks, which are reported under
-their qualified name (`Legacy.Options`). Bodiless declarations — overload
+function expressions bound to a variable (also when parenthesized or
+wrapped in `as`/`satisfies`; a named function expression keeps recursing
+through either of its names), the methods and function-valued properties of
+an object literal bound to a name or default-exported (`handlers.onSave`,
+nested objects included), `export default` classes and functions, class
+methods and arrow-function class fields, constructors, and declarations
+inside `namespace`/`module` blocks, which are reported under their
+qualified name (`Legacy.Options`). Bodiless declarations — overload
 signatures, `declare function`, `abstract` methods — are never reported:
 there is no code behind them.
 
 Rewrites that change behavior keep their distinct shapes on purpose:
 swapped builtins (`.map` vs `.filter`, `Math.max` vs `Math.min`), a
-different free callee (`sendEmail` vs `sendSms`), flipped operators
-(`*` vs `/`, `&&` vs `||`, `<` vs `<=`), `??` vs `||`, `x == null` vs
-`x === null`, optional chaining vs plain access, `for-of` vs `for-in`, an
-added `break`, reordered statements that share data, `async` vs sync
-contracts, `then(onFulfilled, onRejected)`, fall-through `switch` cases,
-`Object.assign` with a mutated target, string prepend vs append folds
-(`trail = trail + seg` vs `trail = seg + trail`), boundary indexes
+different free callee (`sendEmail` vs `sendSms`), flipped operators (`*` vs
+`/`, `&&` vs `||`, `<` vs `<=`), `??` vs `||`, `x == null` vs `x === null`,
+optional chaining vs plain access, `for-of` vs `for-in`, an added `break`,
+reordered statements that share data, `async` vs sync and generator vs
+plain contracts (a sync twin is the same code only when it visibly returns
+a promise: a `Promise<…>` return type, a returned `Promise.resolve(…)`, or
+a chained `.then`), `then(onFulfilled, onRejected)`, fall-through `switch`
+cases, `Object.assign` with a mutated target, string prepend vs append
+folds (`trail = trail + seg` vs `trail = seg + trail`), boundary indexes
 (`.at(-1)` vs `.at(0)`, `.slice(0, n)` vs `.slice(n)`), templates that
-stringify adjacent values (`` `${a}${b}` `` vs numeric `a + b`), and on
-the type side `Promise<ShopUser>` vs `Promise<ShopOrder>` payloads,
-`Map<K, V>` vs `Map<V, K>` swaps, index signatures vs concrete members,
+stringify adjacent values (`` `${a}${b}` `` vs numeric `a + b`), and on the
+type side `Promise<ShopUser>` vs `Promise<ShopOrder>` payloads, `Map<K, V>`
+vs `Map<V, K>` swaps, index signatures vs concrete members,
 discriminated-union variants that differ in their `kind` literal or enum
 member (signed numbers and bigints included), differing `extends` heritage
 (type arguments included: `Box<string>` is not `Box<number>`), brand
 markers (`_fooBrand: any`), `typeof`/type-predicate members naming
-different things, and one- or two-member shapes whose only shared trait is
-a primitive. On the class side a constructor that does real work counts as
-a member, a different, qualified-vs-absent, or one-sided base class is a
+different things, qualified generic bases (`React.ComponentType<P>` vs
+`Preact.ComponentType<P>`), one- or two-member shapes whose only shared
+trait is a primitive, and aliases of a single atom (`type GLsizei =
+number`, `type SchemaVersion = "1"`), which pair only when they are also
+named alike — the same alias copied into two files. On the class side
+member annotations compare the way type mode compares them (literal unions,
+enum members, qualified and generic types keep their identity; renamed
+class type parameters do not count), a constructor that does real work
+counts as a member, constructors storing the same parameters into different
+fields (`this.x = y; this.y = x`) or `super(…)` slots differ, a static
+member is not its instance namesake, an optional member is not a required
+one, a different, qualified-vs-absent, or one-sided base class is a
 contract difference, an `implements` clause the other side lacks is one
 more difference, and a single shared field is not a duplicate class. Twins
-that differ
-**only in data literals** (a table name, a status code, a locale string)
-are reported — parameterizing them is the refactor.
+that differ **only in data literals** (a table name, a status code, a
+locale string) are reported — parameterizing them is the refactor.
 
 ## Accuracy
 
 Accuracy is tracked by a labeled benchmark (`bench/cases.ts` plus the
 extended corpora in `bench/cases/`) that mirrors the refactoring flow
-above: **300 ground-truth pairs** across functions, types, and classes —
+above: **325 ground-truth pairs** across functions, types, and classes —
 semantic duplicates a refactoring plan must see, and similarly-shaped
 lookalikes it must not flag — evaluated at the default threshold. The
 corpus covers whole-function renames, guard/negation/ternary spellings,
@@ -124,7 +149,12 @@ discriminated-union variants (enum members, string, signed-number and
 bigint literals), heritage (one-sided, differing, differently instantiated
 or qualified bases), brand markers, tiny renamed shapes, `typeof`/predicate
 members, constructor work, and declaration scopes — namespaces, default
-exports, named function expressions.
+exports, named function expressions — and, since 0.8.0, the families
+found on the fallow, tsrs and TypeScript repositories: sync/async API
+siblings, single-atom type aliases, qualified generic bases, class members
+whose annotations differ, renamed class type parameters, constructor
+wiring, static/instance and optional members, object-literal members and
+wrapped initializers.
 
 | Engine | Corpus | Wrong labels | Error rate | Accuracy |
 | --- | --- | ---: | ---: | ---: |
@@ -134,7 +164,9 @@ exports, named function expressions.
 | v0.5.0 | 261 pairs | 7 / 261 | 2.68% | 97.32% |
 | v0.6.0 | 261 pairs | 0 / 261 | 0.00% | 100.00% |
 | v0.6.0 | 300 pairs | 29 / 300 | 9.67% | 90.33% |
-| **v0.7.0** | **300 pairs** | **0 / 300** | **0.00%** | **100.00%** |
+| v0.7.0 | 300 pairs | 0 / 300 | 0.00% | 100.00% |
+| v0.7.0 | 325 pairs | 22 / 325 | 6.77% | 93.23% |
+| **v0.8.0** | **325 pairs** | **0 / 325** | **0.00%** | **100.00%** |
 
 v0.7.0 was audited against real code: run over the TypeScript compiler's
 API package, its VS Code extension, and 1,482 conformance test files, the
@@ -149,6 +181,24 @@ surface their twins), adds the families to the corpus, and keeps the
 original 261 pairs at 100% with unchanged margins. Reports are also
 deterministic now — type mode used to compare declarations in hash-map
 order, which moved borderline scores between runs.
+
+v0.8.0 was audited against three more codebases: the fallow analyzer (its
+VS Code extension, tools, npm packages and visualization frontend), tsrs
+(its npm package, tools and playground, and the 116 standard-library
+declaration files it bundles), and the current TypeScript repository,
+whose API package now ships sync and async siblings. The v0.7.0 engine
+paired the async API's methods with their sync namesakes, reported every
+two aliases of a single atom with equal bodies (the WebGL/WebGPU `number`
+labels of the DOM library, the `"1"` schema versions of a generated output
+contract), rendered class member annotations onto `any`/`unknown`, and
+never saw the members of an object literal — dispatch tables, handler
+objects, test doubles. v0.8.0 fixes each family (type pairs on the tsrs
+standard library drop from 4,585 to 2,383, on fallow's VS Code extension
+from 855 to 757), adds the families to the corpus, and keeps the original
+300 pairs at 100%. Overlap mode, part of every default run, used to give a
+different report on each run of the same input and took over five minutes
+on the 59-file TypeScript API package; it is deterministic now, and a
+default run there takes 56 s instead of 314 s.
 
 Run it yourself with `npm run bench:accuracy`; the suite in
 `tests/accuracy-benchmark.test.ts` fails CI if **any** labeled pair is
@@ -189,10 +239,10 @@ size-penalty layers documented above are this project's additions on top
 of that metric; the operation-weight sensitivity they exploit is the
 paper's RQ3 finding that TSED's penalty weights are influential and
 language-dependent. Following that finding, the weights are re-validated
-against the labeled corpus on every accuracy release: for 0.7.0 every
-setting in rename 0.2–0.5 × delete/insert 0.8–1.0 classifies all 300 pairs
-correctly and moves the tightest margins by less than 0.03, so the
-calibrated defaults stand.
+against the labeled corpus on every accuracy release: for 0.8.0 every
+setting in rename 0.2–0.5 × delete/insert 0.8–1.0 classifies all 325 pairs
+correctly (the closest call is XF-N36 at rename 0.2, 0.797 against the 0.8
+threshold, the same as on v0.7.0), so the calibrated defaults stand.
 
 - Yewei Song, Cedric Lothritz, Daniel Tang, Tegawendé F. Bissyandé, and
   Jacques Klein. 2024. *Revisiting Code Similarity Evaluation with

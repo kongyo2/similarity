@@ -1,6 +1,14 @@
 import { access } from "node:fs/promises";
 import { z } from "zod";
-import type { LoadedFile } from "../types.js";
+import type { AnalyzeReport, LoadedFile } from "../types.js";
+
+/**
+ * The report the engine returns: everything in {@link AnalyzeReport}
+ * except what the JavaScript layer derives (duplicate clusters).
+ */
+export type WasmReport = Omit<AnalyzeReport, "clusters" | "stats"> & {
+  stats: Omit<AnalyzeReport["stats"], "clusterCount">;
+};
 
 const locationSchema = z.object({
   filePath: z.string(),
@@ -56,8 +64,6 @@ interface WasmAnalyzeInput {
   overlapSizeTolerance: number;
 }
 
-type WasmAnalyzeOutput = unknown;
-
 type WasmModule = {
   analyze_project: (inputJson: string) => string;
 };
@@ -98,7 +104,7 @@ async function loadWasmModule(): Promise<WasmModule> {
   return wasmModulePromise;
 }
 
-export async function analyzeWithWasm(input: WasmAnalyzeInput): Promise<WasmAnalyzeOutput> {
+export async function analyzeWithWasm(input: WasmAnalyzeInput): Promise<WasmReport> {
   const wasm = await loadWasmModule();
   if (typeof wasm.analyze_project !== "function") {
     throw new Error("WASM module does not export analyze_project — rebuild with `npm run build:wasm`.");
@@ -112,5 +118,7 @@ export async function analyzeWithWasm(input: WasmAnalyzeInput): Promise<WasmAnal
         "The engine and JS wrapper are likely out of sync — rebuild with `npm run build:wasm`.",
     );
   }
-  return validated.data;
+  // The schema checks structure only; pair modes are the engine's own
+  // mode names.
+  return validated.data as WasmReport;
 }

@@ -2,8 +2,8 @@ use crate::{
     function_extractor::{extract_functions, FunctionDefinition},
     parser::parse_and_convert_to_tree,
     subtree_fingerprint::{
-        detect_partial_overlaps, generate_subtree_fingerprints, IndexedFunction, LineIndex,
-        OverlapOptions, PartialOverlap,
+        detect_partial_overlaps, detect_prepared_overlaps, generate_subtree_fingerprints,
+        IndexedFunction, LineIndex, OverlapOptions, OverlapSource, OverlapTarget, PartialOverlap,
     },
     tsed::{calculate_tsed, TSEDOptions},
 };
@@ -127,11 +127,30 @@ pub fn find_overlaps_across_files(
         .map(|(name, source)| index_file_functions(name, source))
         .collect();
 
+    // The per-function halves of the pairwise comparison are prepared
+    // once: target sides for every function up front (they only borrow
+    // the index), source sides — which own their sliding windows — one
+    // function at a time, so memory stays bounded by a single function.
+    // Rebuilding both halves inside every pair made overlap mode the
+    // slowest part of a default run by far.
+    let targets: Vec<Vec<OverlapTarget>> = indexed_per_file
+        .iter()
+        .map(|functions| functions.iter().map(|func| OverlapTarget::new(func, options)).collect())
+        .collect();
+
     let mut all_overlaps = Vec::new();
     for i in 0..files.len() {
-        // Same-file scan: ordered pairs only, skipping parent/child
-        // containment pairs.
+        // Results keep the original visiting order: the same-file pairs of
+        // file `i` first, then its pairs with each later file `j` in order,
+        // each of those source-major. Sources are walked once, so the
+        // cross-file pairs are bucketed by `j` and concatenated afterwards.
+        let mut same_file = Vec::new();
+        let mut cross_file: Vec<Vec<PartialOverlapWithFiles>> =
+            (i + 1..files.len()).map(|_| Vec::new()).collect();
         for (source_position, source_func) in indexed_per_file[i].iter().enumerate() {
+            let source = OverlapSource::new(source_func, options);
+            // Same-file scan: ordered pairs only, skipping parent/child
+            // containment pairs.
             for (target_position, target_func) in indexed_per_file[i].iter().enumerate() {
                 if target_position <= source_position {
                     continue;
@@ -139,21 +158,20 @@ pub fn find_overlaps_across_files(
                 if is_nested_pair(source_func, target_func) {
                     continue;
                 }
-                for overlap in detect_partial_overlaps(source_func, target_func, options) {
-                    all_overlaps.push(PartialOverlapWithFiles {
+                let target = &targets[i][target_position];
+                for overlap in detect_prepared_overlaps(&source, target, options) {
+                    same_file.push(PartialOverlapWithFiles {
                         source_file: files[i].0.clone(),
                         target_file: files[i].0.clone(),
                         overlap,
                     });
                 }
             }
-        }
-        // Cross-file pairs.
-        for j in (i + 1)..files.len() {
-            for source_func in &indexed_per_file[i] {
-                for target_func in &indexed_per_file[j] {
-                    for overlap in detect_partial_overlaps(source_func, target_func, options) {
-                        all_overlaps.push(PartialOverlapWithFiles {
+            // Cross-file pairs.
+            for (bucket, j) in cross_file.iter_mut().zip(i + 1..files.len()) {
+                for target in &targets[j] {
+                    for overlap in detect_prepared_overlaps(&source, target, options) {
+                        bucket.push(PartialOverlapWithFiles {
                             source_file: files[i].0.clone(),
                             target_file: files[j].0.clone(),
                             overlap,
@@ -162,6 +180,8 @@ pub fn find_overlaps_across_files(
                 }
             }
         }
+        all_overlaps.extend(same_file);
+        all_overlaps.extend(cross_file.into_iter().flatten());
     }
 
     Ok(all_overlaps)
@@ -455,5 +475,86 @@ export function normalizeVector(row: number[]): number[] {
             involves_inner_helper,
             "expected the nested helper to overlap its cross-file copy: {overlaps:?}"
         );
+    }
+
+    #[test]
+    fn sliding_windows_do_not_depend_on_hash_map_order() {
+        // Every index gets its own randomly seeded hash maps; windows used
+        // to inherit their tie order (subtrees starting on the same line),
+        // so two indexes of one function produced different windows.
+        let source = r#"
+function settle(items: Item[], limit: number): number {
+    let total = 0; let seen = 0; const skipped: string[] = [];
+    for (const item of items) { if (item.price > limit) { skipped.push(item.id); continue; } total += item.price * item.qty; seen++; }
+    if (seen === 0) { throw new Error("nothing to settle: " + skipped.join(",")); }
+    return Math.round(total * 100) / 100;
+}
+"#;
+        let signature = |indexed: &IndexedFunction| -> Vec<Vec<(u64, u32, u32, u32)>> {
+            (5..=30)
+                .map(|size| {
+                    crate::subtree_fingerprint::create_sliding_windows(indexed, size)
+                        .iter()
+                        .map(|w| (w.hash, w.start_line, w.end_line, w.weight))
+                        .collect()
+                })
+                .collect()
+        };
+        let first = index_file_functions("a.ts", source);
+        let reference = signature(&first[0]);
+        for _ in 0..8 {
+            let again = index_file_functions("a.ts", source);
+            assert_eq!(signature(&again[0]), reference);
+        }
+    }
+
+    #[test]
+    fn prepared_scan_matches_pairwise_detection() {
+        // The scan prepares each function once; the result must equal the
+        // plain pair-by-pair detection, in the same order.
+        let file_a = r"
+function validateUser(user: User): string[] {
+    const errors: string[] = [];
+    if (!user.email) { errors.push('email'); }
+    if (!user.name) { errors.push('name'); }
+    if (user.age < 0) { errors.push('age'); }
+    return errors;
+}
+";
+        let file_b = r"
+function validateOrder(order: Order): string[] {
+    const errors: string[] = [];
+    if (!order.email) { errors.push('email'); }
+    if (!order.name) { errors.push('name'); }
+    if (order.total < 0) { errors.push('total'); }
+    return errors;
+}
+";
+        let options = OverlapOptions {
+            min_window_size: 5,
+            max_window_size: 30,
+            threshold: 0.5,
+            size_tolerance: 0.25,
+        };
+        let mut files = HashMap::new();
+        files.insert("a.ts".to_string(), file_a.to_string());
+        files.insert("b.ts".to_string(), file_b.to_string());
+        let scanned: Vec<(u32, u32, u32, u32, String)> = find_overlaps_across_files(&files, &options)
+            .unwrap()
+            .into_iter()
+            .map(|o| {
+                let p = o.overlap;
+                (p.source_lines.0, p.source_lines.1, p.target_lines.0, p.target_lines.1, p.node_type)
+            })
+            .collect();
+        let left = index_file_functions("a.ts", file_a);
+        let right = index_file_functions("b.ts", file_b);
+        let pairwise: Vec<(u32, u32, u32, u32, String)> =
+            detect_partial_overlaps(&left[0], &right[0], &options)
+                .into_iter()
+                .map(|p| (p.source_lines.0, p.source_lines.1, p.target_lines.0, p.target_lines.1, p.node_type))
+                .collect();
+        assert!(!scanned.is_empty());
+        assert_eq!(scanned, pairwise);
     }
 }

@@ -5,9 +5,13 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct NormalizedClass {
     pub name: String,
+    /// Members keyed by [`member_key`]: a static member and an instance
+    /// member may share a name, and keying by the bare name let one
+    /// silently overwrite the other.
     pub properties: HashMap<String, ClassProperty>,
     pub methods: HashMap<String, ClassMethod>,
     pub constructor_signature: String,
+    pub constructor_wiring: Vec<(String, String)>,
     pub extends: Option<String>,
     pub implements: Vec<String>,
 }
@@ -51,27 +55,35 @@ pub struct SimilarClassPair {
     pub result: ClassComparisonResult,
 }
 
+/// Map key of a class member: the bare name for instance members,
+/// `static <name>` for static ones.
+fn member_key(name: &str, is_static: bool) -> String {
+    if is_static {
+        format!("static {name}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// The same member name on the other runtime surface (`static x` ⇔ `x`).
+fn opposite_surface_key(key: &str) -> String {
+    match key.strip_prefix("static ") {
+        Some(name) => name.to_string(),
+        None => format!("static {key}"),
+    }
+}
+
 pub fn normalize_class(class: &ClassDefinition) -> NormalizedClass {
     let mut properties = HashMap::new();
     for prop in &class.properties {
-        properties.insert(prop.name.clone(), prop.clone());
+        properties.insert(member_key(&prop.name, prop.is_static), prop.clone());
     }
 
     let mut methods = HashMap::new();
     for method in &class.methods {
-        // Normalize method signature
-        let normalized_method = ClassMethod {
-            name: method.name.clone(),
-            parameters: normalize_parameters(&method.parameters),
-            return_type: normalize_type(&method.return_type),
-            is_static: method.is_static,
-            is_private: method.is_private,
-            is_async: method.is_async,
-            is_generator: method.is_generator,
-            kind: method.kind.clone(),
-            body_fingerprint: method.body_fingerprint,
-        };
-        methods.insert(method.name.clone(), normalized_method);
+        // Member annotations arrive normalized by the extractor (type
+        // mode's renderer plus `normalize_type_name`).
+        methods.insert(member_key(&method.name, method.is_static), method.clone());
     }
 
     let constructor_signature = if class.constructor_params.is_empty() {
@@ -90,18 +102,10 @@ pub fn normalize_class(class: &ClassDefinition) -> NormalizedClass {
         properties,
         methods,
         constructor_signature,
+        constructor_wiring: class.constructor_wiring.clone(),
         extends: class.extends.clone(),
         implements,
     }
-}
-
-fn normalize_parameters(params: &[String]) -> Vec<String> {
-    params.iter().map(|p| normalize_type(p)).collect()
-}
-
-fn normalize_type(type_str: &str) -> String {
-    // Basic normalization - can be expanded
-    type_str.replace("Array<", "[").replace(">", "]").replace(" ", "").trim().to_string()
 }
 
 /// Strip parameter names and class-shaped tokens so two methods that have
@@ -129,11 +133,21 @@ fn normalize_signature_for_fuzzy(method: &ClassMethod) -> String {
         split_parameter_list(&joined)
             .into_iter()
             .map(|piece| {
-                let without_name = match piece.find(':') {
-                    Some(idx) => piece[idx + 1..].trim(),
-                    None => piece,
+                // Drop the parameter NAME but keep what it said about the
+                // parameter: `x?: T` is optional and `...xs: T[]` is the
+                // rest parameter, both part of the call contract.
+                let (head, without_name) = match piece.find(':') {
+                    Some(idx) => (piece[..idx].trim(), piece[idx + 1..].trim()),
+                    None => ("", piece),
                 };
-                replace_camelcase_identifiers(without_name)
+                let marker = if head.starts_with("...") {
+                    "..."
+                } else if head.ends_with('?') {
+                    "?"
+                } else {
+                    ""
+                };
+                format!("{marker}{}", replace_camelcase_identifiers(without_name))
             })
             .collect()
     };
@@ -169,18 +183,39 @@ fn split_parameter_list(input: &str) -> Vec<&str> {
 }
 
 fn replace_camelcase_identifiers(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let is_token_char = |ch: char| ch.is_ascii_alphabetic() || ch == '_' || ch.is_ascii_digit();
+    // A `.` joining two path segments, as opposed to a spread `...`.
+    let is_qualifier_dot = |position: usize| {
+        chars.get(position) == Some(&'.')
+            && (position == 0 || chars[position - 1] != '.')
+            && chars.get(position + 1) != Some(&'.')
+    };
     let mut out = String::with_capacity(input.len());
-    let mut current = String::new();
-    for ch in input.chars() {
-        if ch.is_ascii_alphabetic() || ch == '_' || ch.is_ascii_digit() {
-            current.push(ch);
+    let mut index = 0;
+    while index < chars.len() {
+        if !is_token_char(chars[index]) {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && is_token_char(chars[index]) {
+            index += 1;
+        }
+        let token: String = chars[start..index].iter().collect();
+        // Segments of a qualified path keep their spelling: an enum member
+        // (`SyntaxKind.Block` vs `SyntaxKind.Identifier`) or a namespace
+        // (`React.ComponentType` vs `Preact.ComponentType`) is an identity,
+        // not a class renamed along with its family, and placeholdering
+        // every segment made all qualified references compare equal.
+        let qualified = (start > 0 && is_qualifier_dot(start - 1)) || is_qualifier_dot(index);
+        if qualified {
+            out.push_str(&token);
         } else {
-            push_identifier_token(&current, &mut out);
-            current.clear();
-            out.push(ch);
+            push_identifier_token(&token, &mut out);
         }
     }
-    push_identifier_token(&current, &mut out);
     out
 }
 
@@ -268,7 +303,9 @@ fn calculate_name_similarity(name1: &str, name2: &str) -> f64 {
 ///   things (`0.55`) — signatures alone used to hide this entirely;
 /// * `static` mismatch → different runtime surface (`0.4`);
 /// * accessor-kind mismatch (getter/setter vs plain method) → different
-///   call contract (`0.5`).
+///   call contract (`0.5`);
+/// * optionality mismatch (`f?(): T` vs `f(): T`) → one side may lack the
+///   method (`0.5`, the type comparator's optionality discount).
 fn method_agreement_factor(method1: &ClassMethod, method2: &ClassMethod) -> f64 {
     let mut factor = 1.0;
     if let (Some(fp1), Some(fp2)) = (method1.body_fingerprint, method2.body_fingerprint) {
@@ -282,7 +319,112 @@ fn method_agreement_factor(method1: &ClassMethod, method2: &ClassMethod) -> f64 
     if method1.kind != method2.kind {
         factor *= 0.5;
     }
+    if method1.is_optional != method2.is_optional {
+        factor *= 0.5;
+    }
     factor
+}
+
+/// Discount for a matched property pair that lives on different runtime
+/// surfaces (`static` vs instance, `0.4` — the method pass applies the same
+/// rule through its agreement factor) or disagrees on optionality (`x?: T`
+/// vs `x: T`, `0.5` — the type comparator's optionality discount).
+fn property_modifier_factor(prop1: &ClassProperty, prop2: &ClassProperty) -> f64 {
+    let mut factor = 1.0;
+    if prop1.is_static != prop2.is_static {
+        factor *= 0.4;
+    }
+    if prop1.is_optional != prop2.is_optional {
+        factor *= 0.5;
+    }
+    factor
+}
+
+/// Keys of `class1`'s members matched by key (pass 1), then by the same
+/// name on the other runtime surface (pass 2), as `(key1, key2)` pairs in
+/// a deterministic order. Everything left over goes to the fuzzy passes.
+fn match_member_keys<'a, T>(
+    members1: &'a HashMap<String, T>,
+    members2: &'a HashMap<String, T>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut keys1: Vec<&String> = members1.keys().collect();
+    keys1.sort();
+    let mut matched2: std::collections::HashSet<&str> = Default::default();
+    let mut pairs = Vec::new();
+    let mut leftovers = Vec::new();
+    for key in keys1 {
+        if let Some((key2, _)) = members2.get_key_value(key) {
+            matched2.insert(key2.as_str());
+            pairs.push((key.as_str(), key2.as_str()));
+        } else {
+            leftovers.push(key);
+        }
+    }
+    for key in leftovers {
+        let opposite = opposite_surface_key(key);
+        if let Some((key2, _)) = members2.get_key_value(&opposite) {
+            if matched2.insert(key2.as_str()) {
+                pairs.push((key.as_str(), key2.as_str()));
+            }
+        }
+    }
+    pairs
+}
+
+/// Constructor-wiring positions on which the two classes disagree: the
+/// same parameter stored into fields the property pass did not pair, or
+/// into different `super(…)` slots. Counted only when both constructors
+/// wire something — a class without a constructor is not "missing" one.
+fn wiring_mismatches(
+    wiring1: &[(String, String)],
+    wiring2: &[(String, String)],
+    field_pairing: &HashMap<String, String>,
+) -> usize {
+    if wiring1.is_empty() || wiring2.is_empty() {
+        return 0;
+    }
+    let targets = |wiring: &[(String, String)]| -> HashMap<String, Vec<String>> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (parameter, target) in wiring {
+            map.entry(parameter.clone()).or_default().push(target.clone());
+        }
+        for list in map.values_mut() {
+            list.sort();
+        }
+        map
+    };
+    let targets1 = targets(wiring1);
+    let targets2 = targets(wiring2);
+    let mut parameters: Vec<&String> = targets1.keys().chain(targets2.keys()).collect();
+    parameters.sort();
+    parameters.dedup();
+    parameters
+        .into_iter()
+        .filter(|parameter| {
+            let empty = Vec::new();
+            let list1 = targets1.get(*parameter).unwrap_or(&empty);
+            let list2 = targets2.get(*parameter).unwrap_or(&empty);
+            // A parameter only one constructor wires is an extra (or
+            // missing) parameter or field, which the member tally already
+            // counts; only a parameter both sides store somewhere
+            // DIFFERENT is miswired.
+            if list1.is_empty() || list2.is_empty() {
+                return false;
+            }
+            let mut translated: Vec<String> = list1
+                .iter()
+                .map(|target| {
+                    if target.starts_with("super[") {
+                        target.clone()
+                    } else {
+                        field_pairing.get(target).cloned().unwrap_or_else(|| target.clone())
+                    }
+                })
+                .collect();
+            translated.sort();
+            translated != *list2
+        })
+        .count()
 }
 
 fn calculate_structural_similarity(
@@ -292,11 +434,15 @@ fn calculate_structural_similarity(
     let mut missing_properties = Vec::new();
     let mut extra_properties = Vec::new();
     let mut property_type_mismatches = Vec::new();
+    // class1 field → class2 field, for the constructor-wiring check.
+    let mut field_pairing: HashMap<String, String> = HashMap::new();
 
     // Properties: two-phase matching.
     //
     // Phase 1 — strict by name. A property keeps its name across most
-    // refactors so this is the primary signal.
+    // refactors so this is the primary signal. Members are keyed by name
+    // and runtime surface; a same-named static/instance pair still matches
+    // here, at the surface discount.
     //
     // Phase 2 — fuzzy by type for the leftovers. A common refactor pattern
     // is renaming a private storage field (`store` → `items` between two
@@ -307,58 +453,57 @@ fn calculate_structural_similarity(
     // unrelated types.
     let mut property_score = 0.0;
     let property_total_count = (class1.properties.len() + class2.properties.len()) as f64;
-    let mut matched_in_class2: std::collections::HashSet<String> = Default::default();
+    let mut matched_in_class1: std::collections::HashSet<&str> = Default::default();
+    let mut matched_in_class2: std::collections::HashSet<&str> = Default::default();
 
-    let mut leftovers_class1: Vec<&str> = Vec::new();
-
-    // Iterate properties in name-sorted order so the strict pass behaves
-    // deterministically (the HashMap iteration order is randomised in
-    // Rust, and the greedy phase 2 below would otherwise produce
-    // different pairings on different runs of the same input).
-    let mut class1_property_names: Vec<&String> = class1.properties.keys().collect();
-    class1_property_names.sort();
-    for name in &class1_property_names {
-        let prop1 = &class1.properties[*name];
-        if let Some(prop2) = class2.properties.get(*name) {
-            // A `static` field and an instance field live on different
-            // runtime surfaces even when name and type agree — same
-            // discount the method pass applies via its agreement factor.
-            let modifier_factor = if prop1.is_static == prop2.is_static { 1.0 } else { 0.4 };
-            // Class-reference types tolerate renames: `repo: InvoiceRepo`
-            // and `repo: ReceiptRepo` are the same dependency slot in two
-            // renamed class families (the same placeholdering the fuzzy
-            // method matcher applies to signatures). Primitive types are
-            // untouched — `count: number` vs `count: string` stays a
-            // genuine mismatch.
-            if prop1.type_annotation == prop2.type_annotation
-                || replace_camelcase_identifiers(&prop1.type_annotation)
-                    == replace_camelcase_identifiers(&prop2.type_annotation)
-            {
-                // Strict match — credit both class1 and class2 sides.
-                property_score += 2.0 * modifier_factor;
-            } else {
-                // Same name, different type — partial match.
-                property_score += 1.4 * modifier_factor;
-                property_type_mismatches.push(PropertyMismatch {
-                    name: (*name).to_string(),
-                    type1: prop1.type_annotation.clone(),
-                    type2: prop2.type_annotation.clone(),
-                });
-            }
-            matched_in_class2.insert((*name).to_string());
+    for (key1, key2) in match_member_keys(&class1.properties, &class2.properties) {
+        let prop1 = &class1.properties[key1];
+        let prop2 = &class2.properties[key2];
+        let modifier_factor = property_modifier_factor(prop1, prop2);
+        // Class-reference types tolerate renames: `repo: InvoiceRepo`
+        // and `repo: ReceiptRepo` are the same dependency slot in two
+        // renamed class families (the same placeholdering the fuzzy
+        // method matcher applies to signatures). Primitive types are
+        // untouched — `count: number` vs `count: string` stays a
+        // genuine mismatch.
+        if prop1.type_annotation == prop2.type_annotation
+            || replace_camelcase_identifiers(&prop1.type_annotation)
+                == replace_camelcase_identifiers(&prop2.type_annotation)
+        {
+            // Strict match — credit both class1 and class2 sides.
+            property_score += 2.0 * modifier_factor;
         } else {
-            leftovers_class1.push(name.as_str());
+            // Same name, different type — partial match.
+            property_score += 1.4 * modifier_factor;
+            property_type_mismatches.push(PropertyMismatch {
+                name: prop1.name.clone(),
+                type1: prop1.type_annotation.clone(),
+                type2: prop2.type_annotation.clone(),
+            });
         }
+        if !prop1.is_static && !prop2.is_static {
+            field_pairing.insert(prop1.name.clone(), prop2.name.clone());
+        }
+        matched_in_class1.insert(key1);
+        matched_in_class2.insert(key2);
     }
 
+    // Sorting both leftover lists makes the greedy match below produce
+    // the same pairings on every run for a given input (the HashMap
+    // iteration order is randomised in Rust).
+    let mut leftovers_class1: Vec<&str> = class1
+        .properties
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !matched_in_class1.contains(key))
+        .collect();
+    leftovers_class1.sort();
     let mut leftovers_class2: Vec<&str> = class2
         .properties
         .keys()
-        .filter(|n| !matched_in_class2.contains(n.as_str()))
-        .map(|n| n.as_str())
+        .map(String::as_str)
+        .filter(|key| !matched_in_class2.contains(key))
         .collect();
-    // Sorting both leftover lists makes the greedy match below produce
-    // the same pairings on every run for a given input.
     leftovers_class2.sort();
 
     // Greedy best-match by type for the leftovers. This is N×M but class
@@ -391,13 +536,10 @@ fn calculate_structural_similarity(
             } else {
                 0.4
             };
-            let name_sim = calculate_name_similarity(name1, name2);
-            let mut score = 0.8 * type_match + 0.2 * name_sim;
-            // Same runtime-surface rule as the strict pass: a static
-            // field is not a rename of an instance field.
-            if prop1.is_static != prop2.is_static {
-                score *= 0.4;
-            }
+            let name_sim = calculate_name_similarity(&prop1.name, &prop2.name);
+            // Same runtime-surface and optionality rules as the strict
+            // pass: a static field is not a rename of an instance field.
+            let score = (0.8 * type_match + 0.2 * name_sim) * property_modifier_factor(prop1, prop2);
             if best_match.is_none_or(|(_, b)| score > b) {
                 best_match = Some((name2, score));
             }
@@ -407,6 +549,10 @@ fn calculate_structural_similarity(
                 // Credit it as a rename match — both sides count.
                 property_score += 2.0 * score;
                 leftover_consumed_class2.insert(name2.to_string());
+                let prop2 = &class2.properties[name2];
+                if !prop1.is_static && !prop2.is_static {
+                    field_pairing.insert(prop1.name.clone(), prop2.name.clone());
+                }
                 continue;
             }
         }
@@ -426,53 +572,54 @@ fn calculate_structural_similarity(
 
     let method_total_count = (class1.methods.len() + class2.methods.len()) as f64;
     let mut method_score = 0.0;
-    let mut method_matched_in_class2: std::collections::HashSet<String> = Default::default();
-    let mut method_leftovers_class1: Vec<&str> = Vec::new();
+    let mut method_matched_in_class1: std::collections::HashSet<&str> = Default::default();
+    let mut method_matched_in_class2: std::collections::HashSet<&str> = Default::default();
 
-    // Same deterministic ordering as the property pass — see the comment
-    // there for why.
-    let mut class1_method_names: Vec<&String> = class1.methods.keys().collect();
-    class1_method_names.sort();
-    for name in &class1_method_names {
-        let method1 = &class1.methods[*name];
-        if let Some(method2) = class2.methods.get(*name) {
-            let sig1 = format!("({}) => {}", method1.parameters.join(", "), method1.return_type);
-            let sig2 = format!("({}) => {}", method2.parameters.join(", "), method2.return_type);
-            // Parameter renames (`findById(id)` vs `findById(key)`) are
-            // neutral refactors — when the name matches and the
-            // name-stripped signatures agree, credit a full match instead
-            // of the partial-mismatch rate.
-            let agreement = method_agreement_factor(method1, method2);
-            if sig1 == sig2
-                || normalize_signature_for_fuzzy(method1) == normalize_signature_for_fuzzy(method2)
-            {
-                method_score += 2.0 * agreement;
-                if agreement < 1.0 {
-                    method_signature_mismatches.push(MethodMismatch {
-                        name: (*name).to_string(),
-                        signature1: sig1,
-                        signature2: sig2,
-                    });
-                }
-            } else {
-                method_score += 1.4 * agreement;
+    for (key1, key2) in match_member_keys(&class1.methods, &class2.methods) {
+        let method1 = &class1.methods[key1];
+        let method2 = &class2.methods[key2];
+        let sig1 = format!("({}) => {}", method1.parameters.join(", "), method1.return_type);
+        let sig2 = format!("({}) => {}", method2.parameters.join(", "), method2.return_type);
+        // Parameter renames (`findById(id)` vs `findById(key)`) are
+        // neutral refactors — when the name matches and the
+        // name-stripped signatures agree, credit a full match instead
+        // of the partial-mismatch rate.
+        let agreement = method_agreement_factor(method1, method2);
+        if sig1 == sig2
+            || normalize_signature_for_fuzzy(method1) == normalize_signature_for_fuzzy(method2)
+        {
+            method_score += 2.0 * agreement;
+            if agreement < 1.0 {
                 method_signature_mismatches.push(MethodMismatch {
-                    name: (*name).to_string(),
+                    name: method1.name.clone(),
                     signature1: sig1,
                     signature2: sig2,
                 });
             }
-            method_matched_in_class2.insert((*name).to_string());
         } else {
-            method_leftovers_class1.push(name.as_str());
+            method_score += 1.4 * agreement;
+            method_signature_mismatches.push(MethodMismatch {
+                name: method1.name.clone(),
+                signature1: sig1,
+                signature2: sig2,
+            });
         }
+        method_matched_in_class1.insert(key1);
+        method_matched_in_class2.insert(key2);
     }
 
+    let mut method_leftovers_class1: Vec<&str> = class1
+        .methods
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !method_matched_in_class1.contains(key))
+        .collect();
+    method_leftovers_class1.sort();
     let mut method_leftovers_class2: Vec<&str> = class2
         .methods
         .keys()
-        .filter(|n| !method_matched_in_class2.contains(n.as_str()))
-        .map(|n| n.as_str())
+        .map(String::as_str)
+        .filter(|key| !method_matched_in_class2.contains(key))
         .collect();
     method_leftovers_class2.sort();
 
@@ -503,7 +650,7 @@ fn calculate_structural_similarity(
                 let name_overlap = normalized_signature_overlap(&normalized_sig1, &normalized_sig2);
                 0.4 + 0.4 * name_overlap
             };
-            let name_sim = calculate_name_similarity(name1, name2);
+            let name_sim = calculate_name_similarity(&method1.name, &method2.name);
             let mut score = 0.6 * sig_match + 0.4 * name_sim;
             // Identical canonical body fingerprints are the strongest
             // duplicate signal there is: a full method rename
@@ -559,11 +706,23 @@ fn calculate_structural_similarity(
         class1.implements.iter().filter(|name| !class2.implements.contains(name)).count()
             + class2.implements.iter().filter(|name| !class1.implements.contains(name)).count();
 
+    // Constructor wiring: the same fields filled from different parameters
+    // (`this.x = y; this.y = x` vs `this.x = x; this.y = y`) initialize
+    // differently, and wiring-only constructors are not members, so nothing
+    // else would notice. A miswired parameter is wired on both sides, both
+    // entries disagree, and it counts like a member present on both sides
+    // with nothing matching: two unmatched elements.
+    let miswired = wiring_mismatches(
+        &class1.constructor_wiring,
+        &class2.constructor_wiring,
+        &field_pairing,
+    );
+
     // Calculate overall structural similarity. Each side counts once, so
     // a "complete match" pair contributes 2 to the score and 2 to the
     // denominator — leaving the ratio at 1.0 for an exact match.
     let member_count = property_total_count + method_total_count;
-    let total_elements = member_count + unmatched_implements as f64;
+    let total_elements = member_count + unmatched_implements as f64 + 2.0 * miswired as f64;
     let matched_elements = property_score + method_score;
 
     let structural_similarity = if total_elements > 0.0 {
@@ -650,7 +809,17 @@ pub fn find_similar_classes(classes: &[ClassDefinition], threshold: f64) -> Vec<
     let mut similar_pairs = Vec::new();
 
     for i in 0..classes.len() {
+        // `// similarity-ignore` excludes a class from the report the same
+        // way it excludes functions and types; the extractor recorded the
+        // directive but nothing consulted it, so ignored classes kept
+        // pairing.
+        if classes[i].has_ignore_directive {
+            continue;
+        }
         for j in i + 1..classes.len() {
+            if classes[j].has_ignore_directive {
+                continue;
+            }
             let result = compare_classes(&classes[i], &classes[j]);
 
             if result.similarity >= threshold {
@@ -1031,6 +1200,186 @@ export class MemoryStore {
             "a shared clause must not lift different bodies over the threshold, got {}",
             same_interface.similarity
         );
+    }
+
+    #[test]
+    fn ignored_classes_are_not_reported() {
+        let classes = extract_classes_from_code(
+            r"
+export class ActiveCache {
+  private items = new Map<string, string>();
+  get(key: string): string | undefined { return this.items.get(key); }
+  set(key: string, value: string): void { this.items.set(key, value); }
+}
+
+// similarity-ignore
+export class IgnoredCache {
+  private items = new Map<string, string>();
+  get(key: string): string | undefined { return this.items.get(key); }
+  set(key: string, value: string): void { this.items.set(key, value); }
+}
+",
+            "a.ts",
+        )
+        .unwrap();
+        assert!(find_similar_classes(&classes, 0.5).is_empty());
+    }
+
+    #[test]
+    fn member_types_keep_their_identity() {
+        // Literal, enum-member, qualified-generic and payload types used to
+        // collapse onto `any`/`unknown`/bare names in class mode.
+        let result = compare_sources(
+            r#"
+export class Alpha {
+  status: "active" | "inactive" = "active";
+  kind: SyntaxKind.Block;
+  render: React.ComponentType<Props>;
+  load(): Promise<User> { return this.repo.load(); }
+  ids: readonly string[] = [];
+}
+"#,
+            r#"
+export class Beta {
+  status: "open" | "closed" = "open";
+  kind: SyntaxKind.Identifier;
+  render: Preact.ComponentType<Props>;
+  load(): Promise<Order> { return this.repo.load(); }
+  ids: Map<string, number>[] = [];
+}
+"#,
+        );
+        assert!(result.similarity < 0.8, "got {}", result.similarity);
+        // A renamed class reference in an otherwise equal family still
+        // matches (`repo: InvoiceRepo` vs `repo: ReceiptRepo`).
+        let family = compare_sources(
+            "export class InvoiceService { repo: InvoiceRepo; load(id: string): Invoice { return this.repo.find(id); } total(): number { return 0; } }",
+            "export class ReceiptService { repo: ReceiptRepo; load(id: string): Receipt { return this.repo.find(id); } total(): number { return 0; } }",
+        );
+        assert!(family.structural_similarity > 0.99, "got {}", family.structural_similarity);
+    }
+
+    #[test]
+    fn generic_heritage_renames_are_neutral() {
+        let result = compare_sources(
+            r"
+export class Alpha<TItem> extends Base<TItem> {
+  private items: TItem[] = [];
+  add(item: TItem): void { this.items.push(item); }
+  all(): TItem[] { return [...this.items]; }
+}
+",
+            r"
+export class Beta<U> extends Base<U> {
+  private items: U[] = [];
+  add(item: U): void { this.items.push(item); }
+  all(): U[] { return [...this.items]; }
+}
+",
+        );
+        assert!((result.structural_similarity - 1.0).abs() < 1e-9, "got {}", result.structural_similarity);
+        // A concrete instantiation is still a different base.
+        let concrete = compare_sources(
+            "export class A extends Base<string> { add(item: string): void { this.items.push(item); } all(): string[] { return [...this.items]; } }",
+            "export class B extends Base<number> { add(item: string): void { this.items.push(item); } all(): string[] { return [...this.items]; } }",
+        );
+        assert!(concrete.structural_similarity < 0.8, "got {}", concrete.structural_similarity);
+    }
+
+    #[test]
+    fn swapped_constructor_wiring_is_a_difference() {
+        let swapped = r"
+export class PointA {
+  x: number;
+  y: number;
+  constructor(x: number, y: number) { this.x = y; this.y = x; }
+  sum(): number { return this.x + this.y; }
+  scale(k: number): number { return this.x * k; }
+}
+";
+        let straight = r"
+export class PointB {
+  x: number;
+  y: number;
+  constructor(x: number, y: number) { this.x = x; this.y = y; }
+  sum(): number { return this.x + this.y; }
+  scale(k: number): number { return this.x * k; }
+}
+";
+        let shorthand = r"
+export class PointC {
+  constructor(public x: number, public y: number) {}
+  sum(): number { return this.x + this.y; }
+  scale(k: number): number { return this.x * k; }
+}
+";
+        assert!(compare_sources(swapped, straight).similarity < 0.8);
+        assert!(compare_sources(swapped, shorthand).similarity < 0.8);
+        let same = compare_sources(straight, shorthand);
+        assert!((same.structural_similarity - 1.0).abs() < 1e-9, "got {}", same.structural_similarity);
+
+        // Forwarding to `super` in a different order is miswiring too.
+        let forward = compare_sources(
+            "export class NamedA extends Entity { label = ''; constructor(name: string, id: string) { super(id, name); } describe(): string { return this.label; } }",
+            "export class NamedB extends Entity { label = ''; constructor(name: string, id: string) { super(name, id); } describe(): string { return this.label; } }",
+        );
+        assert!(forward.structural_similarity < 0.8, "got {}", forward.structural_similarity);
+
+        // A parameter only one side wires is an extra field, counted once
+        // by the member tally, not miswiring.
+        let extended = compare_sources(
+            "export class Pair { a: string; b: string; constructor(a: string, b: string) { this.a = a; this.b = b; } join(): string { return this.a + this.b; } }",
+            "export class Triple { a: string; b: string; c: string; constructor(a: string, b: string, c: string) { this.a = a; this.b = b; this.c = c; } join(): string { return this.a + this.b; } }",
+        );
+        assert!((extended.structural_similarity - 6.0 / 7.0).abs() < 1e-9, "got {}", extended.structural_similarity);
+    }
+
+    #[test]
+    fn static_and_instance_members_sharing_a_name_both_count() {
+        // Keyed by bare name, the static `current`/`create` overwrote the
+        // instance ones and this pair scored structural 1.0.
+        let result = compare_sources(
+            r"
+export class SessionStore {
+  static current: SessionStore | null = null;
+  current: string | null = null;
+  static create(): SessionStore { return new SessionStore(); }
+  create(id: string): void { this.current = id; }
+  clear(): void { this.current = null; }
+}
+",
+            r"
+export class DraftStore {
+  current: string | null = null;
+  create(id: string): void { this.current = id; }
+  clear(): void { this.current = null; }
+}
+",
+        );
+        assert!(result.similarity < 0.8, "got {}", result.similarity);
+        assert_eq!(result.differences.missing_properties, vec!["static current"]);
+        assert_eq!(result.differences.missing_methods, vec!["static create"]);
+    }
+
+    #[test]
+    fn optional_members_differ_from_required_ones() {
+        let result = compare_sources(
+            r"
+export class DraftStore {
+  current: string | null = null;
+  create(id: string): void { this.current = id; }
+  clear(): void { this.current = null; }
+}
+",
+            r"
+export declare class OptionalStore {
+  current?: string | null;
+  create?(id: string): void;
+  clear?(): void;
+}
+",
+        );
+        assert!(result.similarity < 0.8, "got {}", result.similarity);
     }
 
     #[test]

@@ -232,12 +232,14 @@ pub fn normalize_type_name(type_name: &str) -> String {
     }
 
     // Generic references: `Array<T>` → `T[]`; other generics normalize
-    // their arguments in place.
+    // their arguments in place. Qualified bases (`React.ComponentType<P>`)
+    // are generic references too — they used to skip normalization, so
+    // `ns.Box<Array<T>>` and `ns.Box<T[]>` spelled two different types.
     if let Some(open) = trimmed.find('<') {
         if trimmed.ends_with('>') {
             let base = trimmed[..open].trim();
             let args_text = &trimmed[open + 1..trimmed.len() - 1];
-            if is_balanced(args_text) && base.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            if is_balanced(args_text) && is_generic_base(base) {
                 let args: Vec<String> = split_top_level(args_text, ',')
                     .iter()
                     .map(|arg| normalize_type_name(arg))
@@ -570,18 +572,32 @@ fn split_function_type(type_name: &str) -> Option<(String, String)> {
     Some((type_name[1..params_end].to_string(), return_type.trim().to_string()))
 }
 
-/// `Base<Arg, …>` splitter for already-normalized type strings.
+/// `Base<Arg, …>` splitter for already-normalized type strings. The base
+/// may be qualified (`React.ComponentType<Props>`): a qualified generic is
+/// as nominal as a bare one, and falling back to edit distance scored
+/// `React.ComponentType<Props>` vs `Preact.ComponentType<Props>` ~0.93.
 fn parse_generic_reference(type_name: &str) -> Option<(&str, Vec<String>)> {
     let open = type_name.find('<')?;
     if !type_name.ends_with('>') {
         return None;
     }
     let base = &type_name[..open];
-    if base.is_empty() || !base.chars().all(|c| c.is_alphanumeric() || c == '_') {
+    if !is_generic_base(base) {
         return None;
     }
     let args = split_top_level(&type_name[open + 1..type_name.len() - 1], ',');
     Some((base, args))
+}
+
+/// A (possibly qualified) identifier that can head a generic reference:
+/// `Map`, `React.ComponentType`, `ts.NodeArray`. Every dot-separated
+/// segment must be a non-empty identifier.
+fn is_generic_base(base: &str) -> bool {
+    !base.is_empty()
+        && base.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        })
 }
 
 /// A single identifier-shaped type token (`User`, `string`, `#0`), or a
@@ -593,9 +609,15 @@ fn is_bare_type_reference(type_name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '.')
 }
 
-/// A string-literal type (`"click"`), as rendered by the extractor.
+/// A string-literal type (`"click"`), as rendered by the extractor. One
+/// literal only: `"debug" | "warn"` also starts and ends with a quote, and
+/// counting the whole union as one literal made it an atom (and two
+/// different literal unions a discriminant mismatch).
 fn is_string_literal_type(type_name: &str) -> bool {
-    type_name.len() >= 2 && type_name.starts_with('"') && type_name.ends_with('"')
+    type_name.len() >= 2
+        && type_name.starts_with('"')
+        && type_name.ends_with('"')
+        && !type_name[1..type_name.len() - 1].contains('"')
 }
 
 /// A numeric literal type: `42`, `-1`, `1.5`, `1e3`, `0x1f`, `1_000`.
@@ -636,7 +658,7 @@ fn is_literal_type(type_name: &str) -> bool {
 /// literal types (disjoint singletons). Signed numbers and bigints are
 /// literals too — `-1` vs `-2` used to fall through to edit distance and
 /// score 0.5, `1n` vs `2n` 0.2.
-fn is_nominal_atom(type_name: &str) -> bool {
+pub(crate) fn is_nominal_atom(type_name: &str) -> bool {
     is_bare_type_reference(type_name) || is_literal_type(type_name)
 }
 
@@ -1107,6 +1129,38 @@ mod tests {
         assert_eq!(calculate_type_similarity("\"click\"", "\"click\""), 1.0);
         assert_eq!(calculate_type_similarity("1", "2"), 0.0);
         assert_eq!(calculate_type_similarity("true", "false"), 0.0);
+    }
+
+    #[test]
+    fn qualified_generic_references_compare_nominally() {
+        // The base of a qualified generic is as nominal as a bare one;
+        // edit distance on the spelling used to score these ~0.93.
+        assert_eq!(
+            calculate_type_similarity("React.ComponentType<Props>", "Preact.ComponentType<Props>"),
+            0.2
+        );
+        assert_eq!(
+            calculate_type_similarity("React.ComponentType<Props>", "React.ComponentType<Props>"),
+            1.0
+        );
+        // Same qualified container, different payloads: graded.
+        let payload = calculate_type_similarity("ts.NodeArray<Statement>", "ts.NodeArray<Expression>");
+        assert!((payload - 0.43).abs() < 1e-9, "got {payload}");
+        // Qualified generics normalize their arguments like bare ones.
+        assert_eq!(normalize_type_name("ns.Box<Array<string>>"), "ns.Box<string[]>");
+        assert_eq!(normalize_type_name("ns.Box<B | A>"), "ns.Box<A | B>");
+        assert!(!is_generic_base("a..b"));
+        assert!(!is_generic_base(".a"));
+    }
+
+    #[test]
+    fn string_literal_unions_are_not_single_literals() {
+        assert!(is_literal_type("\"debug\""));
+        assert!(!is_literal_type("\"debug\" | \"warn\""));
+        assert!(!is_nominal_atom("\"debug\" | \"warn\""));
+        // Two different literal unions are not a discriminant mismatch.
+        assert!(!is_discriminant_mismatch("\"a\" | \"b\"", "\"a\" | \"c\""));
+        assert!(is_discriminant_mismatch("\"a\"", "\"c\""));
     }
 
     #[test]

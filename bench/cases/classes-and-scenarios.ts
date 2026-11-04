@@ -1943,4 +1943,217 @@ export class ReceiptLookup extends BaseLookup {
     },
     expectPairs: [["InvoiceLookup", "ReceiptLookup"]],
   },
+
+  // -------------------------------------------------------------------
+  // 0.8.0 — class-mode findings: member annotations rendered by type
+  // mode's renderer, positional class generics, constructor wiring, and
+  // members that share a name across the static/instance surfaces
+  // -------------------------------------------------------------------
+  {
+    id: "XC-N12",
+    mode: "classes",
+    category: "member-types",
+    description:
+      "Same member names, but the literal unions, enum members, qualified component types and payload types all differ — class mode used to render all of them onto any/unknown/bare names",
+    files: {
+      "a.ts": `
+export class ReactPanel {
+  status: "active" | "inactive" = "active";
+  kind: SyntaxKind.Block;
+  render: React.ComponentType<Props>;
+  ids: readonly string[] = [];
+  load(): Promise<User> {
+    return this.repo.load();
+  }
+}
+`,
+      "b.ts": `
+export class PreactPanel {
+  status: "open" | "closed" = "open";
+  kind: SyntaxKind.Identifier;
+  render: Preact.ComponentType<Props>;
+  ids: Map<string, number>[] = [];
+  load(): Promise<Order> {
+    return this.repo.load();
+  }
+}
+`,
+    },
+    forbidPairs: [["ReactPanel", "PreactPanel"]],
+  },
+  {
+    id: "XC-P15",
+    mode: "classes",
+    category: "generic-rename",
+    description:
+      "Generic collections whose type parameter is renamed (TItem → U) in the members AND the heritage clause",
+    files: {
+      "a.ts": `
+export class ItemList<TItem> extends Collection<TItem> {
+  private items: TItem[] = [];
+  add(item: TItem): void {
+    this.items.push(item);
+  }
+  all(): TItem[] {
+    return [...this.items];
+  }
+}
+`,
+      "b.ts": `
+export class EntryList<U> extends Collection<U> {
+  private items: U[] = [];
+  add(item: U): void {
+    this.items.push(item);
+  }
+  all(): U[] {
+    return [...this.items];
+  }
+}
+`,
+    },
+    expectPairs: [["ItemList", "EntryList"]],
+  },
+  {
+    id: "XC-N13",
+    mode: "classes",
+    category: "constructor-wiring",
+    description:
+      "Wiring-only constructors that store the same parameters into opposite fields — new GridPoint(1, 2).x is 2, new ScreenPoint(1, 2).x is 1",
+    files: {
+      "a.ts": `
+export class GridPoint {
+  x: number;
+  y: number;
+  constructor(x: number, y: number) {
+    this.x = y;
+    this.y = x;
+  }
+  sum(): number {
+    return this.x + this.y;
+  }
+  scale(k: number): number {
+    return this.x * k;
+  }
+}
+`,
+      "b.ts": `
+export class ScreenPoint {
+  x: number;
+  y: number;
+  constructor(x: number, y: number) {
+    this.x = x;
+    this.y = y;
+  }
+  sum(): number {
+    return this.x + this.y;
+  }
+  scale(k: number): number {
+    return this.x * k;
+  }
+}
+`,
+    },
+    forbidPairs: [["GridPoint", "ScreenPoint"]],
+  },
+  {
+    id: "XC-P16",
+    mode: "classes",
+    category: "constructor-wiring",
+    description:
+      "The same parameter-to-field wiring spelled with parameter properties vs explicit assignments",
+    files: {
+      "a.ts": `
+export class ScreenPoint {
+  constructor(public x: number, public y: number) {}
+  sum(): number {
+    return this.x + this.y;
+  }
+  scale(k: number): number {
+    return this.x * k;
+  }
+}
+`,
+      "b.ts": `
+export class CanvasPoint {
+  x: number;
+  y: number;
+  constructor(x: number, y: number) {
+    this.x = x;
+    this.y = y;
+  }
+  sum(): number {
+    return this.x + this.y;
+  }
+  scale(k: number): number {
+    return this.x * k;
+  }
+}
+`,
+    },
+    expectPairs: [["ScreenPoint", "CanvasPoint"]],
+  },
+  {
+    id: "XC-N14",
+    mode: "classes",
+    category: "static-vs-instance",
+    description:
+      "A store with a static singleton and factory next to same-named instance members vs one without them — the static members used to overwrite the instance ones",
+    files: {
+      "a.ts": `
+export class SessionStore {
+  static current: SessionStore | null = null;
+  current: string | null = null;
+  static create(): SessionStore {
+    return new SessionStore();
+  }
+  create(id: string): void {
+    this.current = id;
+  }
+  clear(): void {
+    this.current = null;
+  }
+}
+`,
+      "b.ts": `
+export class DraftStore {
+  current: string | null = null;
+  create(id: string): void {
+    this.current = id;
+  }
+  clear(): void {
+    this.current = null;
+  }
+}
+`,
+    },
+    forbidPairs: [["SessionStore", "DraftStore"]],
+  },
+  {
+    id: "XC-N15",
+    mode: "classes",
+    category: "optional-members",
+    description:
+      "A declared shape whose members are all optional vs an implementation that always has them",
+    files: {
+      "a.ts": `
+export class DraftStore {
+  current: string | null = null;
+  create(id: string): void {
+    this.current = id;
+  }
+  clear(): void {
+    this.current = null;
+  }
+}
+`,
+      "b.d.ts": `
+export declare class PartialStore {
+  current?: string | null;
+  create?(id: string): void;
+  clear?(): void;
+}
+`,
+    },
+    forbidPairs: [["DraftStore", "PartialStore"]],
+  },
 ];

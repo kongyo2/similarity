@@ -16,6 +16,22 @@ export interface SimilarityPair {
   details?: Record<string, unknown>;
 }
 
+/**
+ * A group of three or more declarations connected by reported pairs of
+ * one mode (functions, types or classes): the copies a refactor would
+ * consolidate into one.
+ */
+export interface SimilarityCluster {
+  mode: AnalyzerMode;
+  /** Every declaration in the group, in path/line order. */
+  members: AnalyzerLocation[];
+  /** Reported pairs between members. */
+  pairCount: number;
+  maxSimilarity: number;
+  minSimilarity: number;
+  averageSimilarity: number;
+}
+
 export interface AnalyzerWarning {
   filePath?: string;
   message: string;
@@ -62,9 +78,15 @@ export interface AnalyzeReport {
   warnings: AnalyzerWarning[];
   results: SimilarityPair[];
   byMode: Record<AnalyzerMode, SimilarityPair[]>;
+  /**
+   * Duplicate clusters of the functions, types and classes modes (see
+   * {@link SimilarityCluster}); their pairs stay listed in `byMode`.
+   */
+  clusters: SimilarityCluster[];
   stats: {
     fileCount: number;
     pairCount: number;
+    clusterCount: number;
     elapsedMs: number;
   };
 }

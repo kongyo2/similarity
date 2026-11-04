@@ -5,5 +5,6 @@ export type {
   AnalyzerLocation,
   AnalyzerMode,
   AnalyzerWarning,
+  SimilarityCluster,
   SimilarityPair,
 } from "./types.js";
