@@ -74,6 +74,11 @@ pub struct FunctionDefinition {
     /// recursive self-references keep resolving. Falls back to `name`
     /// when the underlying span can't be recovered.
     pub display_name: String,
+    /// The other name a named function expression is reachable under:
+    /// `factorial` in `const factorial = function recur(n) {…}`, where the
+    /// body may recurse through either binding. `None` when the function
+    /// has a single name.
+    pub self_alias: Option<String>,
     pub start_line: u32,
     pub end_line: u32,
     pub class_name: Option<String>,
@@ -250,13 +255,21 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
             ExportDefaultDeclarationKind::ClassDeclaration(class) => {
                 extract_class_members(class, ctx);
             }
-            ExportDefaultDeclarationKind::FunctionExpression(func) => {
-                push_function_like(func, "default".to_string(), ctx);
-            }
-            ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
-                push_arrow_binding(arrow, "default".to_string(), ctx);
-            }
-            _ => {}
+            // Expression forms, looking through transparent wrappers the
+            // same way variable initializers do (`export default (() =>
+            // {…}) satisfies Handler`).
+            other => match other.as_expression().map(Expression::get_inner_expression) {
+                Some(Expression::FunctionExpression(func)) => {
+                    push_function_like(func, "default".to_string(), ctx);
+                }
+                Some(Expression::ArrowFunctionExpression(arrow)) => {
+                    push_arrow_binding(arrow, "default".to_string(), ctx);
+                }
+                Some(Expression::ObjectExpression(object)) => {
+                    extract_object_members(object, "default", ctx);
+                }
+                _ => {}
+            },
         },
         _ => {}
     }
@@ -310,8 +323,11 @@ fn push_function_like(func: &Function, name: String, ctx: &mut ExtractionContext
     // is rebuilt under that binding so `recur(n - 1)` keeps resolving to
     // the function itself; rebuilding it under the variable name used to
     // leave `recur` as a free identifier that differed between otherwise
-    // identical copies.
+    // identical copies. The variable binding is the same function, so it
+    // is kept as an alias: a body recursing through `factorial(n - 1)`
+    // resolves to the function too.
     let binding_name = func.id.as_ref().map_or_else(|| name.clone(), |id| id.name.to_string());
+    let self_alias = (binding_name != name && is_plain_identifier(&name)).then(|| name.clone());
     let start_line = ctx.line_number(func.span.start);
     ctx.functions.push(FunctionDefinition {
         name: name.clone(),
@@ -326,6 +342,7 @@ fn push_function_like(func: &Function, name: String, ctx: &mut ExtractionContext
         is_static: false,
         method_kind: MethodKind::Normal,
         display_name: binding_name,
+        self_alias,
         start_line,
         end_line: ctx.line_number(func.span.end),
         class_name: None,
@@ -355,6 +372,7 @@ fn push_arrow_binding(arrow: &ArrowFunctionExpression, name: String, ctx: &mut E
         is_static: false,
         method_kind: MethodKind::Normal,
         display_name: name.clone(),
+        self_alias: None,
         start_line,
         end_line: ctx.line_number(arrow.span.end),
         class_name: None,
@@ -373,21 +391,117 @@ fn push_arrow_binding(arrow: &ArrowFunctionExpression, name: String, ctx: &mut E
 /// `const f = (x) => …` and `const f = function (x) { … }` both bind a
 /// function to a name; the function-expression spelling used to be
 /// invisible to the scan.
+///
+/// Parentheses and TypeScript-only wrappers around the initializer are
+/// transparent at runtime — `const parse = (function (line) {…});`,
+/// `const handle = ((event) => {…}) as Handler;`, `… satisfies Handler`,
+/// `<Handler>(…)` and a trailing `!` all bind the inner function — so they
+/// are looked through instead of hiding the function from the scan.
 fn extract_variable_functions(var_decl: &VariableDeclaration, ctx: &mut ExtractionContext) {
     for decl in &var_decl.declarations {
         let BindingPattern::BindingIdentifier(ident) = &decl.id else {
             continue;
         };
-        match &decl.init {
-            Some(Expression::ArrowFunctionExpression(arrow)) => {
+        let Some(init) = &decl.init else {
+            continue;
+        };
+        match init.get_inner_expression() {
+            Expression::ArrowFunctionExpression(arrow) => {
                 push_arrow_binding(arrow, ident.name.to_string(), ctx);
             }
-            Some(Expression::FunctionExpression(func)) => {
+            Expression::FunctionExpression(func) => {
                 push_function_like(func, ident.name.to_string(), ctx);
+            }
+            Expression::ObjectExpression(object) => {
+                extract_object_members(object, ident.name.as_str(), ctx);
             }
             _ => {}
         }
     }
+}
+
+/// Functions held by an object literal bound to a name — `const handlers
+/// = { onSave(doc) {…}, onClose: (doc) => {…} }`, `export default {
+/// transform(code) {…} }`, nested objects included. Dispatch tables,
+/// plugin and handler objects, and test doubles are written this way, and
+/// all of their functions used to be invisible to the scan. Members are
+/// reported under the binding (`handlers.onSave`,
+/// `table[SyntaxKind.Block]`); an object passed as an argument or returned
+/// from a function stays part of the function that builds it.
+fn extract_object_members(
+    object: &ObjectExpression,
+    qualifier: &str,
+    ctx: &mut ExtractionContext,
+) {
+    for property in &object.properties {
+        let ObjectPropertyKind::ObjectProperty(prop) = property else {
+            continue;
+        };
+        let key = class_member_name(&prop.key, prop.computed, ctx.source_text);
+        let name = if key.starts_with('[') {
+            format!("{qualifier}{key}")
+        } else {
+            format!("{qualifier}.{key}")
+        };
+        match prop.value.get_inner_expression() {
+            // `save(doc) {…}`, `get size() {…}` and `save: function (doc)
+            // {…}` are methods: `this` is the object, exactly as in a class.
+            Expression::FunctionExpression(func) => {
+                push_object_method(func, prop, name, ctx);
+            }
+            Expression::ArrowFunctionExpression(arrow) => {
+                push_arrow_binding(arrow, name, ctx);
+            }
+            Expression::ObjectExpression(inner) => extract_object_members(inner, &name, ctx),
+            _ => {}
+        }
+    }
+}
+
+/// Record a function-valued object member as a method (see
+/// [`extract_object_members`]).
+fn push_object_method(
+    func: &Function,
+    prop: &ObjectProperty,
+    name: String,
+    ctx: &mut ExtractionContext,
+) {
+    let Some(body) = &func.body else {
+        return;
+    };
+    let method_kind = match prop.kind {
+        PropertyKind::Get => MethodKind::Getter,
+        PropertyKind::Set => MethodKind::Setter,
+        PropertyKind::Init => MethodKind::Normal,
+    };
+    let display_name = method_key_display_text(&prop.key, prop.computed, ctx.source_text)
+        .unwrap_or_else(|| name.clone());
+    let start_line = ctx.line_number(prop.span.start);
+    ctx.functions.push(FunctionDefinition {
+        name: name.clone(),
+        function_type: FunctionType::Method,
+        parameters: extract_parameters(&func.params),
+        body_span: prop.span,
+        params_span: func.params.span,
+        body_block_span: body.span,
+        is_arrow_expression: false,
+        is_async: func.r#async,
+        is_generator: func.generator,
+        is_static: false,
+        method_kind,
+        display_name,
+        self_alias: None,
+        start_line,
+        end_line: ctx.line_number(prop.span.end),
+        class_name: None,
+        parent_function: ctx.parent_function.clone(),
+        has_ignore_directive: has_similarity_ignore_directive(ctx.source_text, start_line as usize),
+    });
+
+    let saved_parent = ctx.parent_function.clone();
+    ctx.parent_function = Some(name);
+    extract_from_function_body(body, ctx);
+    ctx.parent_function = saved_parent;
 }
 
 /// Member name for a class element key: identifiers as written, private
@@ -464,6 +578,7 @@ fn extract_class_members(class: &Class, ctx: &mut ExtractionContext) {
                     is_static: method.r#static,
                     method_kind,
                     display_name: method_display_name,
+                    self_alias: None,
                     start_line,
                     end_line: ctx.line_number(method.span.end),
                     class_name: class_name.clone(),
@@ -485,7 +600,9 @@ fn extract_class_members(class: &Class, ctx: &mut ExtractionContext) {
             // arrow-field method and its `handle(event) { … }` twin meet
             // in the function scan.
             ClassElement::PropertyDefinition(prop) => {
-                let Some(Expression::ArrowFunctionExpression(arrow)) = &prop.value else {
+                let Some(Expression::ArrowFunctionExpression(arrow)) =
+                    prop.value.as_ref().map(Expression::get_inner_expression)
+                else {
                     continue;
                 };
                 let field_name = class_member_name(&prop.key, prop.computed, ctx.source_text);
@@ -511,6 +628,7 @@ fn extract_class_members(class: &Class, ctx: &mut ExtractionContext) {
                     is_static: prop.r#static,
                     method_kind: MethodKind::Normal,
                     display_name,
+                    self_alias: None,
                     start_line,
                     end_line: ctx.line_number(prop.span.end),
                     class_name: class_name.clone(),
@@ -719,6 +837,21 @@ fn compare_function_trees(
         }
     }
 
+    // Call-contract cap: an `async` function returns a promise and a
+    // generator returns an iterator, so a plain twin with the same body is
+    // a different contract for every caller (`getSymbol(): Promise<Symbol>`
+    // in an async API vs `getSymbol(): Symbol` in its sync sibling). The
+    // one equivalence is a sync function that chains the same promise —
+    // `return fetch(u).then((r) => …)` vs `const r = await fetch(u); …` —
+    // and the canonicalizer has already lowered that `.then` into the
+    // `await` the async twin spells, so an awaiting sync side is not a
+    // contract change. The marker used to be one relabelled node (or, for
+    // static methods and accessors, nothing at all), which identical
+    // bodies easily outweighed.
+    if similarity > 0.6 && call_contract_differs(tree1, tree2, func1, func2) {
+        similarity = similarity.min(0.72);
+    }
+
     // Statement-order factor: two bodies made of the same statements in a
     // different order share all their atoms and most of their tree. When
     // the reordered statements touch the same identifiers, order is
@@ -730,6 +863,55 @@ fn compare_function_trees(
     }
 
     Ok(similarity)
+}
+
+/// Whether the two functions expose different call contracts: generator vs
+/// plain, or `async` vs sync where the sync side does not itself await
+/// (see the call site).
+fn call_contract_differs(
+    tree1: &crate::tree::TreeNode,
+    tree2: &crate::tree::TreeNode,
+    func1: &FunctionDefinition,
+    func2: &FunctionDefinition,
+) -> bool {
+    if func1.is_generator != func2.is_generator {
+        return true;
+    }
+    if func1.is_async == func2.is_async {
+        return false;
+    }
+    let sync_tree = if func1.is_async { tree2 } else { tree1 };
+    !fragment_awaits(sync_tree)
+}
+
+/// Whether the comparison fragment's own function body contains an
+/// `await` (or `for await`) — awaits inside nested functions belong to
+/// those functions, not to the fragment.
+fn fragment_awaits(tree: &crate::tree::TreeNode) -> bool {
+    fn is_function_like(value: &str) -> bool {
+        matches!(
+            value,
+            "FunctionDeclaration" | "FunctionExpression" | "ArrowFunctionExpression"
+                | "MethodDefinition"
+        )
+    }
+    fn walk(node: &crate::tree::TreeNode, inside_fragment: bool) -> bool {
+        if inside_fragment
+            && (node.value == "AwaitExpression" || node.label == "ForAwaitOfStatement")
+        {
+            return true;
+        }
+        node.children.iter().any(|child| {
+            if is_function_like(&child.value) {
+                // The first function-like node is the fragment itself;
+                // any function inside it awaits for its own sake.
+                !inside_fragment && walk(child, true)
+            } else {
+                walk(child, inside_fragment)
+            }
+        })
+    }
+    walk(tree, false)
 }
 
 #[derive(Debug, Default)]
@@ -1481,7 +1663,17 @@ fn parse_function_for_comparison(
     source: &str,
 ) -> Result<std::rc::Rc<crate::tree::TreeNode>, String> {
     let fragment = build_normalized_fragment(func, source);
-    match parse_and_convert_to_tree_canonical(filename, &fragment) {
+    let parsed = match &func.self_alias {
+        // The fragment declares the function under `display_name`; the
+        // other name it is bound under resolves to the same declaration.
+        Some(alias) => crate::parser::parse_and_convert_to_tree_canonical_with_aliases(
+            filename,
+            &fragment,
+            vec![(alias.clone(), sanitize_function_name(&func.display_name))],
+        ),
+        None => parse_and_convert_to_tree_canonical(filename, &fragment),
+    };
+    match parsed {
         Ok(tree) => Ok(tree),
         Err(_) => {
             // Fallback to the legacy whole-function parse path so we don't
@@ -2579,5 +2771,234 @@ export function visitNode(node: Node | undefined, visitor: Visitor, test?: (node
             "overload signatures must not pair, got {:?}",
             pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn named_function_expressions_recurse_through_either_binding() {
+        // `const factorial = function recur(n) { … factorial(n - 1) … }`
+        // recurses through the VARIABLE binding: rebuilding the fragment
+        // under `recur` left `factorial` a free identifier that differed
+        // from the twin's `fact`, so the pair scored 0.75.
+        let code = r"
+export const factorial = function recur(n: number): number {
+    if (n <= 1) {
+        return 1;
+    }
+    const rest = factorial(n - 1);
+    return n * rest;
+};
+export const fact = function go(n: number): number {
+    if (n <= 1) {
+        return 1;
+    }
+    const rest = fact(n - 1);
+    return n * rest;
+};
+export function product(n: number): number {
+    if (n <= 1) {
+        return 1;
+    }
+    const rest = product(n - 1);
+    return n * rest;
+}
+";
+        let functions = extract_functions("test.ts", code).unwrap();
+        assert_eq!(functions[0].self_alias.as_deref(), Some("factorial"));
+        assert_eq!(functions[2].self_alias, None);
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+        assert_eq!(pairs.len(), 3, "all three recursive twins must pair");
+        assert!(pairs.iter().all(|p| (p.similarity - 1.0).abs() < 1e-9));
+
+        // A local that shadows the alias is the local, not the function.
+        let shadowed = r"
+export const walk = function step(n: number): number {
+    const walk = (k: number) => k * 2;
+    if (n <= 1) {
+        return 1;
+    }
+    return walk(n - 1);
+};
+export const visit = function hop(n: number): number {
+    const visit = (k: number) => k * 2;
+    if (n <= 1) {
+        return 1;
+    }
+    return visit(n - 1);
+};
+";
+        let pairs = find_similar_functions_in_file("test.ts", shadowed, 0.8, &options).unwrap();
+        assert_eq!(pairs.len(), 1);
+    }
+
+    #[test]
+    fn transparent_wrappers_do_not_hide_function_initializers() {
+        let code = r"
+export const parse = (function (line: string): string[] {
+    return line.trim().split(',');
+});
+export const handle = ((line: string): string[] => line.trim().split(',')) satisfies Splitter;
+export const cast = ((line: string) => line.trim().split(',')) as Splitter;
+export const asserted = <Splitter>((line: string) => line.trim().split(','));
+export const forced = ((line: string) => line.trim().split(','))!;
+export default ((line: string) => line.trim().split(','));
+";
+        let functions = extract_functions("test.ts", code).unwrap();
+        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["parse", "handle", "cast", "asserted", "forced", "default"]);
+    }
+
+    #[test]
+    fn object_literal_members_are_extracted() {
+        let code = r#"
+export const handlers = {
+    onSave(doc: Doc): void {
+        if (!doc.dirty) return;
+        store.write(doc.id, doc.body);
+    },
+    onClose: (doc: Doc): void => {
+        store.release(doc.id);
+    },
+    get size(): number {
+        return store.count();
+    },
+    "on-reset": function (doc: Doc): void {
+        doc.body = "";
+    },
+    [Kind.Block]: (data: Data) => visit(data.statements),
+    nested: { flush(): void { store.flush(); } },
+    plain: 42,
+    shorthand,
+};
+export default {
+    transform(code: string): string {
+        return code.trim();
+    },
+};
+function factory() {
+    return { inner(): void { work(); } };
+}
+"#;
+        let functions = extract_functions("test.ts", code).unwrap();
+        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "handlers.onSave",
+                "handlers.onClose",
+                "handlers.size",
+                "handlers.on-reset",
+                "handlers[Kind.Block]",
+                "handlers.nested.flush",
+                "default.transform",
+                "factory",
+            ],
+            "objects bound to a name are scanned; a returned object stays part of its builder"
+        );
+        assert_eq!(functions[0].function_type, FunctionType::Method);
+        assert_eq!(functions[1].function_type, FunctionType::Arrow);
+        assert_eq!(functions[2].method_kind, MethodKind::Getter);
+
+        // An object method and its standalone twin compare as equal.
+        let twins = r"
+export const handlers = {
+    onSave(doc: Doc): void {
+        if (!doc.dirty) return;
+        doc.validate();
+        store.write(doc.id, doc.body);
+    },
+};
+export function persist(document: Doc): void {
+    if (!document.dirty) return;
+    document.validate();
+    store.write(document.id, document.body);
+}
+";
+        let options = TSEDOptions::default();
+        let pairs = find_similar_functions_in_file("test.ts", twins, 0.8, &options).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert!((pairs[0].similarity - 1.0).abs() < 1e-9, "got {}", pairs[0].similarity);
+    }
+
+    #[test]
+    fn async_and_generator_contracts_cap_identical_bodies() {
+        let options = TSEDOptions::default();
+        let compare = |code: &str| {
+            let functions = extract_functions("test.ts", code).unwrap();
+            compare_functions(&functions[0], &functions[1], code, code, &options).unwrap()
+        };
+        // The sync and async API siblings: same body, different contract.
+        let async_vs_sync = compare(
+            r#"
+export async function getSymbol(declaration: Declaration): Promise<Symbol> {
+    const api = getNodeAPI(declaration);
+    if (!api) throw new Error("Source file not found for declaration");
+    return api.getSymbol(declaration);
+}
+export function getSymbolSync(declaration: Declaration): Symbol {
+    const api = getNodeAPI(declaration);
+    if (!api) throw new Error("Source file not found for declaration");
+    return api.getSymbol(declaration);
+}
+"#,
+        );
+        assert!(async_vs_sync < 0.8, "got {async_vs_sync}");
+
+        // Static methods and accessors keep the class wrapper, whose
+        // method label never carried `async` at all.
+        let static_methods = compare(
+            r#"
+export class Loader {
+    static async load(path: string): Promise<string> {
+        const text = readFileSync(path, "utf8");
+        if (text.length === 0) throw new Error("empty");
+        return text.trim();
+    }
+    static loadSync(path: string): string {
+        const text = readFileSync(path, "utf8");
+        if (text.length === 0) throw new Error("empty");
+        return text.trim();
+    }
+}
+"#,
+        );
+        assert!(static_methods < 0.8, "got {static_methods}");
+
+        // A sync function chaining the same promise is the async twin.
+        let then_chain = compare(
+            r#"
+export function loadOrder(id: string): Promise<unknown> {
+    return fetch("/api/orders/" + id).then((response) => {
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return response.json();
+    });
+}
+export async function readOrder(id: string): Promise<unknown> {
+    const response = await fetch("/api/orders/" + id);
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    return response.json();
+}
+"#,
+        );
+        assert!(then_chain >= 0.8, "got {then_chain}");
+
+        // An await inside a nested callback is the callback's own.
+        let nested = compare(
+            r#"
+export function startAll(jobs: Job[]): Promise<void>[] {
+    const started = jobs.filter((job) => job.ready);
+    return started.map(async (job) => {
+        await job.run();
+    });
+}
+export async function startAllAsync(jobs: Job[]): Promise<Promise<void>[]> {
+    const started = jobs.filter((job) => job.ready);
+    return started.map(async (job) => {
+        await job.run();
+    });
+}
+"#,
+        );
+        assert!(nested < 0.8, "got {nested}");
     }
 }

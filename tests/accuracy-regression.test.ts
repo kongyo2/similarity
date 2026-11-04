@@ -382,7 +382,7 @@ export interface Config {
     });
   });
 
-  it("honors similarity-ignore comments for functions and types", async () => {
+  it("honors similarity-ignore comments for functions, types, and classes", async () => {
     await withTempProject(async (projectDir) => {
       await writeSource(
         projectDir,
@@ -415,16 +415,31 @@ export interface IgnoredUser {
   id: string;
   email: string;
 }
+
+export class ActiveCache {
+  private items = new Map<string, string>();
+  get(key: string): string | undefined { return this.items.get(key); }
+  set(key: string, value: string): void { this.items.set(key, value); }
+}
+
+// similarity-ignore
+export class IgnoredCache {
+  private items = new Map<string, string>();
+  get(key: string): string | undefined { return this.items.get(key); }
+  set(key: string, value: string): void { this.items.set(key, value); }
+}
 `,
       );
 
-      const report = await analyzeTempProject(projectDir, ["functions", "types"], {
+      const report = await analyzeTempProject(projectDir, ["functions", "types", "classes"], {
         threshold: 0.6,
         noSizePenalty: true,
       });
 
       expect(hasPair(report.byMode.functions, "calculateTotal", "computeTotal")).toBe(false);
       expect(hasPair(report.byMode.types, "User", "IgnoredUser")).toBe(false);
+      // Class mode recorded the directive but never consulted it.
+      expect(hasPair(report.byMode.classes, "ActiveCache", "IgnoredCache")).toBe(false);
     });
   });
 

@@ -10,6 +10,7 @@ import {
   DEFAULT_OVERLAP_SIZE_TOLERANCE,
   DEFAULT_THRESHOLD,
 } from "./defaults.js";
+import { buildClusters } from "./clusters.js";
 import { analyzeWithWasm } from "./engine/wasm.js";
 import type { AnalyzeProjectOptions, AnalyzeReport, AnalyzerMode, LoadedFile } from "./types.js";
 import { collectTypeScriptFiles } from "./utils/files.js";
@@ -161,7 +162,7 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
   const { files, warnings: readWarnings } = await loadFiles(collected.files);
   warnings.push(...readWarnings);
 
-  const wasmReport = (await analyzeWithWasm({
+  const wasmReport = await analyzeWithWasm({
     files,
     modes: options.modes,
     threshold: options.threshold,
@@ -176,14 +177,17 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
     overlapMinWindow: options.overlapMinWindow,
     overlapMaxWindow: options.overlapMaxWindow,
     overlapSizeTolerance: options.overlapSizeTolerance,
-  })) as AnalyzeReport;
+  });
 
+  const clusters = buildClusters(wasmReport.byMode);
   return {
     ...wasmReport,
     skippedFiles: [...wasmReport.skippedFiles, ...collected.skipped],
     warnings: [...wasmReport.warnings, ...warnings],
+    clusters,
     stats: {
       ...wasmReport.stats,
+      clusterCount: clusters.length,
       elapsedMs: Date.now() - startTime,
     },
   };

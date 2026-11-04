@@ -232,6 +232,33 @@ impl Drop for RenameGuard {
     }
 }
 
+thread_local! {
+    /// `(alias, binding)` pairs for the fragment being converted: free
+    /// references spelled `alias` resolve to the fragment's own top-level
+    /// `binding`. See [`parse_and_convert_to_tree_canonical_with_aliases`].
+    static SELF_ALIASES: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Installs the self-alias list for one conversion and restores the
+/// previous list on drop, mirroring [`RenameGuard`].
+struct SelfAliasGuard {
+    previous: Vec<(String, String)>,
+}
+
+impl SelfAliasGuard {
+    fn install(aliases: Vec<(String, String)>) -> Self {
+        let previous = SELF_ALIASES.with(|cell| cell.replace(aliases));
+        SelfAliasGuard { previous }
+    }
+}
+
+impl Drop for SelfAliasGuard {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.previous);
+        SELF_ALIASES.with(|cell| cell.replace(previous));
+    }
+}
+
 /// Alpha-renaming map: every symbol *declared inside* the parsed fragment
 /// (parameters, local `let`/`const`/`var` bindings, inner function/class
 /// names, catch bindings, the fragment's own top-level name) is assigned a
@@ -270,6 +297,34 @@ fn build_rename_map(program: &Program) -> HashMap<(u32, u32), Rc<str>> {
             map.insert((span.start, span.end), Rc::clone(&canonical));
         }
     }
+
+    // Self-aliases: a named function expression bound to a variable
+    // (`const factorial = function recur(n) {…}`) is reachable under both
+    // names, but the comparison fragment can only declare one of them. A
+    // free reference spelled like the other name is the function itself,
+    // so it shares the binding's canonical name.
+    SELF_ALIASES.with(|cell| {
+        for (alias, binding) in cell.borrow().iter() {
+            let Some(symbol_id) = scoping.get_root_binding(oxc_span::Ident::from(binding.as_str()))
+            else {
+                continue;
+            };
+            let declaration = scoping.symbol_span(symbol_id);
+            let Some(canonical) = map.get(&(declaration.start, declaration.end)).cloned() else {
+                continue;
+            };
+            for (name, reference_ids) in scoping.root_unresolved_references().iter() {
+                if name.as_str() != alias.as_str() {
+                    continue;
+                }
+                for &reference_id in reference_ids.iter() {
+                    let reference = scoping.get_reference(reference_id);
+                    let span = nodes.get_node(reference.node_id()).kind().span();
+                    map.insert((span.start, span.end), Rc::clone(&canonical));
+                }
+            }
+        }
+    });
     map
 }
 
@@ -308,6 +363,23 @@ pub fn parse_and_convert_to_tree_canonical(
 ) -> Result<Rc<TreeNode>, String> {
     let _guard = CanonicalizeGuard::enable();
     parse_and_convert_to_tree(filename, source_text)
+}
+
+/// [`parse_and_convert_to_tree_canonical`] for a fragment whose top-level
+/// function is also reachable under other names: each `(alias, binding)`
+/// pair makes free references spelled `alias` resolve to the fragment's
+/// top-level declaration `binding`, so they alpha-rename together with it.
+///
+/// # Errors
+///
+/// Returns an error if parsing fails due to syntax errors
+pub fn parse_and_convert_to_tree_canonical_with_aliases(
+    filename: &str,
+    source_text: &str,
+    aliases: Vec<(String, String)>,
+) -> Result<Rc<TreeNode>, String> {
+    let _aliases = SelfAliasGuard::install(aliases);
+    parse_and_convert_to_tree_canonical(filename, source_text)
 }
 
 fn strip_parentheses<'a, 'b>(expr: &'b Expression<'a>) -> &'b Expression<'a> {

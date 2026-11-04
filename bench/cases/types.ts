@@ -1244,4 +1244,95 @@ export interface AccountDebit {
     },
     forbidPairs: [["AccountCredit", "AccountDebit"]],
   },
+
+  // -------------------------------------------------------------------
+  // 0.8.0 — atomic aliases from fallow's generated output contract and
+  // the DOM/WebWorker libraries tsrs ships, and the qualified-generic
+  // review finding on PR #30
+  // -------------------------------------------------------------------
+  {
+    id: "XT-N21",
+    mode: "types",
+    category: "atomic-alias",
+    description:
+      "Independently versioned schema singletons that all happen to be \"1\" — equal atomic bodies, different contracts",
+    files: {
+      "contract.ts": `
+export type SimilarCodeSchemaVersion = "1";
+export type SimilarCodeReviewSchemaVersion = "1";
+export type MutationPlanSchemaVersion = "1";
+`,
+    },
+    forbidPairs: [
+      ["SimilarCodeSchemaVersion", "SimilarCodeReviewSchemaVersion"],
+      ["SimilarCodeSchemaVersion", "MutationPlanSchemaVersion"],
+      ["SimilarCodeReviewSchemaVersion", "MutationPlanSchemaVersion"],
+    ],
+  },
+  {
+    id: "XT-N22",
+    mode: "types",
+    category: "atomic-alias",
+    description:
+      "Nominal number aliases of a graphics API (`GLsizei`, `GLint64`, `GLuint64`, `GPUSize32`): labels for a primitive, not duplicated structure",
+    files: {
+      "webgl.ts": `
+export type GLsizei = number;
+export type GLint64 = number;
+export type GLuint64 = number;
+`,
+      "webgpu.ts": `
+export type GPUSize32 = number;
+export type GPUIndex32 = number;
+`,
+    },
+    forbidPairs: [
+      ["GLsizei", "GPUSize32"],
+      ["GLint64", "GLuint64"],
+      ["GPUSize32", "GPUIndex32"],
+      ["GLsizei", "GLint64"],
+    ],
+  },
+  {
+    id: "XT-P24",
+    mode: "types",
+    category: "atomic-alias",
+    description:
+      "The same atomic alias declared in two files, and a case variant of it — one declaration copied, not two labels",
+    files: {
+      "users.ts": `
+export type UserId = string;
+`,
+      "orders.ts": `
+export type UserId = string;
+export type UserID = string;
+`,
+    },
+    expectPairs: [
+      ["UserId", "UserId"],
+      ["UserId", "UserID"],
+    ],
+  },
+  {
+    id: "XT-N23",
+    mode: "types",
+    category: "nominal-generic",
+    description:
+      "Component props whose renderer is a React vs a Preact component type — qualified generic bases are as nominal as bare ones",
+    files: {
+      "react-card.ts": `
+export interface ReactCardProps {
+  renderer: React.ComponentType<CardBody>;
+  title: string;
+}
+`,
+      "preact-card.ts": `
+export interface PreactCardProps {
+  renderer: Preact.ComponentType<CardBody>;
+  title: string;
+}
+`,
+    },
+    forbidPairs: [["ReactCardProps", "PreactCardProps"]],
+  },
 ];

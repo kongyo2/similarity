@@ -38,9 +38,11 @@ function createReport(overrides: Partial<AnalyzeReport> = {}): AnalyzeReport {
       classes: [],
       overlap: [],
     },
+    clusters: [],
     stats: {
       fileCount: 2,
       pairCount: 1,
+      clusterCount: 0,
       elapsedMs: 17,
     },
     ...overrides,
@@ -118,7 +120,7 @@ describe("formatPrettyReport", () => {
 
   it("falls back to the raw mode name for unknown runtime mode values", () => {
     const report = {
-      ...createReport({ results: [], stats: { fileCount: 0, pairCount: 0, elapsedMs: 0 } }),
+      ...createReport({ results: [], stats: { fileCount: 0, pairCount: 0, clusterCount: 0, elapsedMs: 0 } }),
       byMode: {
         functions: [],
         types: [],
@@ -134,5 +136,76 @@ describe("formatPrettyReport", () => {
 
     expect(rendered).toContain("=== custom ===");
     expect(rendered).toContain("No similar pairs found.");
+  });
+
+  it("lists three or more connected declarations once, as a cluster", () => {
+    const at = (name: string, line: number) => ({
+      filePath: path.join("/repo", "src", `${name}.ts`),
+      startLine: line,
+      endLine: line + 4,
+      symbolName: name,
+      kind: "function",
+    });
+    const [a, b, c, d, e] = [at("alpha", 1), at("beta", 2), at("gamma", 3), at("delta", 4), at("epsilon", 5)];
+    const pairs: SimilarityPair[] = [
+      createPair({ similarity: 1, left: a, right: b }),
+      createPair({ similarity: 0.95, left: b, right: c }),
+      createPair({ similarity: 0.9, left: a, right: c }),
+      createPair({ similarity: 0.85, left: d, right: e }),
+    ];
+    const report = createReport({
+      results: pairs,
+      byMode: { functions: pairs, types: [], classes: [], overlap: [] },
+      stats: { fileCount: 5, pairCount: 4, clusterCount: 1, elapsedMs: 3 },
+    });
+
+    const rendered = formatPrettyReport(report, "/repo", ["functions"]);
+
+    expect(rendered).toContain("Duplicate clusters: 1");
+    expect(rendered).toContain(
+      "Cluster 1: 3 functions, 3 pairwise matches, similarity 0.900–1.000 (avg 0.950)",
+    );
+    expect(rendered).toContain("  src/alpha.ts:1-5 alpha");
+    expect(rendered).toContain("  src/gamma.ts:3-7 gamma");
+    // The two-member component stays a plain pair row.
+    expect(rendered).toContain("src/delta.ts:4-8 delta");
+    expect(rendered).toContain("Total pairs: 4 (3 in 1 cluster, 1 standalone)");
+    expect(rendered).not.toContain("Cluster 2");
+  });
+});
+
+describe("clusterPairs", () => {
+  it("groups connected pairs and leaves two-member components standalone", async () => {
+    const { clusterPairs, buildClusters } = await import("../src/clusters.js");
+    const at = (name: string) => ({
+      filePath: `/repo/${name}.ts`,
+      startLine: 1,
+      endLine: 5,
+      symbolName: name,
+      kind: "function",
+    });
+    const pairs: SimilarityPair[] = [
+      createPair({ similarity: 0.9, left: at("c"), right: at("d") }),
+      createPair({ similarity: 1, left: at("a"), right: at("b") }),
+      createPair({ similarity: 0.8, left: at("b"), right: at("c") }),
+      createPair({ similarity: 0.99, left: at("x"), right: at("y") }),
+    ];
+
+    const { clusters, standalone } = clusterPairs("functions", pairs);
+
+    expect(clusters).toHaveLength(1);
+    expect(clusters[0]?.members.map((member) => member.symbolName)).toEqual(["a", "b", "c", "d"]);
+    expect(clusters[0]).toMatchObject({
+      mode: "functions",
+      pairCount: 3,
+      maxSimilarity: 1,
+      minSimilarity: 0.8,
+    });
+    expect(clusters[0]?.averageSimilarity).toBeCloseTo(0.9, 10);
+    expect(standalone.map((pair) => pair.left.symbolName)).toEqual(["x"]);
+
+    // Overlap windows are not declarations and never cluster.
+    const all = buildClusters({ functions: pairs, overlap: pairs });
+    expect(all).toHaveLength(1);
   });
 });

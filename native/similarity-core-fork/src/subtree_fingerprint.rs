@@ -75,6 +75,9 @@ pub struct IndexedFunction {
     pub size_index: HashMap<u32, Vec<SubtreeFingerprint>>,
     /// Bloom filter for quick overlap detection (represented as u128 for simplicity)
     pub bloom_bits: u128,
+    /// The order subtrees were added in (the fingerprint generator's
+    /// pre-order), as `(hash, position in that hash's list)`.
+    subtree_order: Vec<(u64, usize)>,
 }
 
 impl IndexedFunction {
@@ -95,13 +98,16 @@ impl IndexedFunction {
             subtree_index: HashMap::new(),
             size_index: HashMap::new(),
             bloom_bits: 0,
+            subtree_order: Vec::new(),
         }
     }
 
     /// Add a subtree fingerprint to the index
     pub fn add_subtree(&mut self, fingerprint: SubtreeFingerprint) {
         // Update hash index
-        self.subtree_index.entry(fingerprint.hash).or_default().push(fingerprint.clone());
+        let same_hash = self.subtree_index.entry(fingerprint.hash).or_default();
+        self.subtree_order.push((fingerprint.hash, same_hash.len()));
+        same_hash.push(fingerprint.clone());
 
         // Update size index
         self.size_index.entry(fingerprint.weight).or_default().push(fingerprint.clone());
@@ -316,9 +322,17 @@ pub fn create_sliding_windows(
 ) -> Vec<SubtreeFingerprint> {
     let mut windows = Vec::new();
 
-    // Get all subtrees sorted by start line
-    let mut all_subtrees: Vec<&SubtreeFingerprint> =
-        indexed_func.subtree_index.values().flatten().collect();
+    // All subtrees sorted by start line. The sort is stable over the order
+    // the subtrees were added in, so subtrees starting on the same line
+    // keep their pre-order; collecting them from the hash index instead
+    // left that tie order to `HashMap` iteration, which differs from run to
+    // run — the same input produced different windows, and different
+    // overlap reports, on every run.
+    let mut all_subtrees: Vec<&SubtreeFingerprint> = indexed_func
+        .subtree_order
+        .iter()
+        .map(|(hash, position)| &indexed_func.subtree_index[hash][*position])
+        .collect();
     all_subtrees.sort_by_key(|fp| fp.start_line);
 
     // Create windows by combining adjacent subtrees
@@ -352,12 +366,85 @@ pub fn create_sliding_windows(
     windows
 }
 
+/// What the overlap passes read from the SOURCE side of a pair. It depends
+/// on the function alone, so a scan builds it once per function instead of
+/// once per compared pair: the sliding windows of all 23 default window
+/// sizes used to be rebuilt (and their child-hash lists re-cloned) for
+/// every target the function was compared with.
+pub struct OverlapSource<'a> {
+    func: &'a IndexedFunction,
+    /// Natural subtrees in `[min_window_size, max_window_size]`, sorted.
+    natural: Vec<&'a SubtreeFingerprint>,
+    /// Sliding windows per window size, `min_window_size` first.
+    windows: Vec<Vec<SubtreeFingerprint>>,
+}
+
+impl<'a> OverlapSource<'a> {
+    #[must_use]
+    pub fn new(func: &'a IndexedFunction, options: &OverlapOptions) -> Self {
+        let natural = func.get_subtrees_in_size_range(options.min_window_size, options.max_window_size);
+        let windows = (options.min_window_size..=options.max_window_size)
+            .map(|window_size| create_sliding_windows(func, window_size))
+            .collect();
+        Self { func, natural, windows }
+    }
+}
+
+/// What the overlap passes read from the TARGET side of a pair (see
+/// [`OverlapSource`]).
+pub struct OverlapTarget<'a> {
+    func: &'a IndexedFunction,
+    /// Natural subtrees in `[min_window_size, max_window_size]` by hash,
+    /// each list in sorted order.
+    natural_by_hash: HashMap<u64, Vec<&'a SubtreeFingerprint>>,
+    /// Per window size, the subtrees whose size is within tolerance of it.
+    by_window: Vec<Vec<&'a SubtreeFingerprint>>,
+}
+
+impl<'a> OverlapTarget<'a> {
+    #[must_use]
+    pub fn new(func: &'a IndexedFunction, options: &OverlapOptions) -> Self {
+        let mut natural_by_hash: HashMap<u64, Vec<&SubtreeFingerprint>> = HashMap::new();
+        for fp in func.get_subtrees_in_size_range(options.min_window_size, options.max_window_size) {
+            natural_by_hash.entry(fp.hash).or_default().push(fp);
+        }
+        let by_window = (options.min_window_size..=options.max_window_size)
+            .map(|window_size| {
+                let size_min = ((window_size as f64) * (1.0 - options.size_tolerance)) as u32;
+                let size_max = ((window_size as f64) * (1.0 + options.size_tolerance)) as u32;
+                func.get_subtrees_in_size_range(size_min, size_max)
+            })
+            .collect();
+        Self { func, natural_by_hash, by_window }
+    }
+}
+
 /// Detect partial overlaps between two functions
 pub fn detect_partial_overlaps(
     source_func: &IndexedFunction,
     target_func: &IndexedFunction,
     options: &OverlapOptions,
 ) -> Vec<PartialOverlap> {
+    // Quick bloom filter check before preparing either side.
+    if !source_func.might_overlap(target_func) {
+        return Vec::new();
+    }
+    detect_prepared_overlaps(
+        &OverlapSource::new(source_func, options),
+        &OverlapTarget::new(target_func, options),
+        options,
+    )
+}
+
+/// [`detect_partial_overlaps`] over prepared sides, for scans that compare
+/// each function with many others.
+pub fn detect_prepared_overlaps(
+    source: &OverlapSource,
+    target: &OverlapTarget,
+    options: &OverlapOptions,
+) -> Vec<PartialOverlap> {
+    let source_func = source.func;
+    let target_func = target.func;
     let mut overlaps = Vec::new();
 
     // Quick bloom filter check
@@ -382,17 +469,8 @@ pub fn detect_partial_overlaps(
     // appears in both functions" with similarity 1.0, which the windowed
     // pass would otherwise reduce to a Jaccard estimate that rarely tops
     // 0.7 on small blocks.
-    let min_natural = options.min_window_size;
-    let max_natural = options.max_window_size;
-    let source_natural = source_func.get_subtrees_in_size_range(min_natural, max_natural);
-    let target_natural_by_hash: std::collections::HashMap<u64, Vec<&SubtreeFingerprint>> = {
-        let mut map: std::collections::HashMap<u64, Vec<&SubtreeFingerprint>> =
-            std::collections::HashMap::new();
-        for fp in target_func.get_subtrees_in_size_range(min_natural, max_natural) {
-            map.entry(fp.hash).or_default().push(fp);
-        }
-        map
-    };
+    let source_natural = &source.natural;
+    let target_natural_by_hash = &target.natural_by_hash;
 
     // Multiplicity signal: count how many DISTINCT source-subtree hashes
     // have at least one exact-hash match in the target. A single small
@@ -408,7 +486,7 @@ pub fn detect_partial_overlaps(
     // though only one shape actually overlaps.
     let mut distinct_match_hashes: std::collections::HashSet<u64> =
         std::collections::HashSet::new();
-    for src in &source_natural {
+    for src in source_natural {
         if src.weight >= options.min_window_size
             && target_natural_by_hash.contains_key(&src.hash)
         {
@@ -417,7 +495,7 @@ pub fn detect_partial_overlaps(
     }
     let strong_multiplicity_signal = distinct_match_hashes.len() >= 3;
 
-    for src in &source_natural {
+    for src in source_natural {
         if let Some(matches) = target_natural_by_hash.get(&src.hash) {
             for tgt in matches {
                 // Respect the user's min_window_size — they explicitly asked
@@ -456,14 +534,12 @@ pub fn detect_partial_overlaps(
     // catches matches where the duplicated stretch doesn't start at a
     // single natural subtree boundary on the source side.
     // For each window size
-    for window_size in options.min_window_size..=options.max_window_size {
-        // Get source windows
-        let source_windows = create_sliding_windows(source_func, window_size);
-
-        // Get target subtrees in the size range
-        let size_min = ((window_size as f64) * (1.0 - options.size_tolerance)) as u32;
-        let size_max = ((window_size as f64) * (1.0 + options.size_tolerance)) as u32;
-        let target_subtrees = target_func.get_subtrees_in_size_range(size_min, size_max);
+    for (window_offset, source_windows) in source.windows.iter().enumerate() {
+        // Source windows and the target subtrees in the size range.
+        let target_subtrees = &target.by_window[window_offset];
+        #[cfg(test)]
+        #[allow(clippy::cast_possible_truncation)]
+        let window_size = options.min_window_size + window_offset as u32;
 
         #[cfg(test)]
         if !source_windows.is_empty() && !target_subtrees.is_empty() {
@@ -476,8 +552,8 @@ pub fn detect_partial_overlaps(
         }
 
         // Compare each source window with target subtrees
-        for source_window in &source_windows {
-            for target_subtree in &target_subtrees {
+        for source_window in source_windows {
+            for target_subtree in target_subtrees {
                 #[cfg(test)]
                 {
                     let similar =

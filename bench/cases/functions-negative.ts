@@ -1244,4 +1244,87 @@ export abstract class RecordStore {
       ["find", "remove"],
     ],
   },
+
+  // -------------------------------------------------------------------
+  // 0.8.0 — call-contract lookalikes from the sync and async API
+  // packages of the TypeScript and tsrs repositories
+  // -------------------------------------------------------------------
+  {
+    id: "XF-N42",
+    mode: "functions",
+    category: "async-contract",
+    description:
+      "The async API's getSymbol vs the sync API's: the same text, but one returns a Promise<Symbol> and the other a Symbol — the sync body never awaits",
+    files: {
+      "async/api.ts": `
+export async function getSymbol(declaration: Declaration): Promise<Symbol> {
+  const api = getNodeAPI(declaration);
+  if (!api) throw new Error("Source file not found for declaration");
+  return api.getSymbol(declaration);
+}
+`,
+      "sync/api.ts": `
+export function getSymbol(declaration: Declaration): Symbol {
+  const api = getNodeAPI(declaration);
+  if (!api) throw new Error("Source file not found for declaration");
+  return api.getSymbol(declaration);
+}
+`,
+    },
+    forbidPairs: [["getSymbol", "getSymbol"]],
+  },
+  {
+    id: "XF-N43",
+    mode: "functions",
+    category: "async-contract",
+    description:
+      "A static async loader vs a static sync loader with the same body: the class wrapper of static methods used to drop the async marker entirely (scored 1.000)",
+    files: {
+      "loader.ts": `
+export class ConfigLoader {
+  static async load(path: string): Promise<string> {
+    const text = readFileSync(path, "utf8");
+    if (text.length === 0) {
+      throw new Error("empty config: " + path);
+    }
+    return text.trim();
+  }
+}
+`,
+      "sync-loader.ts": `
+export class SyncConfigLoader {
+  static load(path: string): string {
+    const text = readFileSync(path, "utf8");
+    if (text.length === 0) {
+      throw new Error("empty config: " + path);
+    }
+    return text.trim();
+  }
+}
+`,
+    },
+    forbidPairs: [["load", "load"]],
+  },
+  {
+    id: "XF-N44",
+    mode: "functions",
+    category: "async-contract",
+    description:
+      "An async checker method resolving a boolean vs a synchronous type-guard function delegating to the same call",
+    files: {
+      "checker.ts": `
+export class Checker {
+  async isTupleType(type: Type): Promise<boolean> {
+    return type.isTupleType();
+  }
+}
+`,
+      "guards.ts": `
+export function isTupleType(type: Type): type is TupleTypeReference {
+  return type.isTupleType();
+}
+`,
+    },
+    forbidPairs: [["isTupleType", "isTupleType"]],
+  },
 ];

@@ -456,7 +456,21 @@ impl TypeExtractor {
 
     /// The token replacement behind [`Self::substitute_generic_params`],
     /// for one rendered type.
-    fn substitute_generic_tokens(input: &str, generics: &[String]) -> String {
+    pub(crate) fn substitute_generic_tokens(input: &str, generics: &[String]) -> String {
+        Self::substitute_generic_tokens_with(input, generics, "#")
+    }
+
+    /// [`Self::substitute_generic_tokens`] with a caller-chosen marker, so
+    /// nested generic scopes (a generic method inside a generic class) get
+    /// distinct positional tokens.
+    pub(crate) fn substitute_generic_tokens_with(
+        input: &str,
+        generics: &[String],
+        marker: &str,
+    ) -> String {
+        if generics.is_empty() {
+            return input.to_string();
+        }
         let mut result = String::with_capacity(input.len());
         let mut token = String::new();
         let flush = |token: &mut String, result: &mut String| {
@@ -464,7 +478,7 @@ impl TypeExtractor {
                 return;
             }
             if let Some(position) = generics.iter().position(|generic| generic == token) {
-                result.push_str(&format!("#{position}"));
+                result.push_str(&format!("{marker}{position}"));
             } else {
                 result.push_str(token);
             }
@@ -719,6 +733,13 @@ impl TypeExtractor {
             }
         }
         "unknown".to_string()
+    }
+
+    /// The type renderer behind type mode, shared with class mode so a class
+    /// member's annotation is spelled exactly the way an interface member's
+    /// is (qualified names, type arguments, literal and exotic types).
+    pub(crate) fn render_type(&self, ts_type: &TSType) -> String {
+        self.extract_type_string(ts_type)
     }
 
     fn extract_type_string(&self, ts_type: &TSType) -> String {
