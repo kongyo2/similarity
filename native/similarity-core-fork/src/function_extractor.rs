@@ -1978,9 +1978,7 @@ mod tests {
                 return 42;
             }
         ";
-        let mut options = TSEDOptions::default();
-        options.min_lines = 1;
-        options.size_penalty = false;
+        let mut options = TSEDOptions { min_lines: 1, size_penalty: false, ..Default::default() };
 
         // Without a token gate the identical pair is reported…
         let (pairs, _) = find_similar_function_pairs(
