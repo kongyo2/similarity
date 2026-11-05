@@ -68,6 +68,28 @@ fn ts_type_span(ts_type: &TSType) -> (u32, u32) {
     (span.start, span.end)
 }
 
+/// The canonical spelling of a string-literal type: its cooked value in
+/// double quotes, with `"` and `\` escaped (and line breaks and tabs
+/// spelled as escapes). Escaping keeps a literal's boundaries unambiguous:
+/// `'say "yes"'` spells `"say \"yes\""`, one literal, while a literal union
+/// such as `"a" | "b"`, which also starts and ends with a quote, is not.
+pub(crate) fn quote_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Collapse runs of whitespace down to a single space, but leave whitespace
 /// inside string and template literals untouched. Pure
 /// `split_whitespace().join(" ")` would equate `type A = "a b"` with
@@ -76,8 +98,11 @@ fn ts_type_span(ts_type: &TSType) -> (u32, u32) {
 /// outside quoted regions.
 ///
 /// Behavior notes:
-/// * Single- and double-quoted strings preserve every byte verbatim,
-///   honoring `\"`, `\\`, … escapes.
+/// * Single- and double-quoted strings keep their content verbatim,
+///   honoring `\"`, `\\`, … escapes, but are spelled the way
+///   [`quote_string_literal`] spells a string-literal type: in double
+///   quotes, with an inner `"` escaped and `\'` unescaped. Quote style is
+///   formatting: `type A = '1'` and `type A = "1"` are the same literal.
 /// * Backtick template literals preserve whitespace inside the literal
 ///   sections but collapse whitespace inside `${...}` interpolations,
 ///   because a template type's interpolated expression is a normal type
@@ -109,13 +134,24 @@ fn collapse_whitespace_outside_strings(text: &str) -> String {
         let top = stack.last_mut().expect("stack always has at least one mode");
         match top {
             Mode::QuotedString(q) => {
-                out.push(ch);
                 if ch == '\\' {
-                    if let Some(next) = chars.next() {
-                        out.push(next);
+                    match chars.next() {
+                        // `'` needs no escape inside double quotes.
+                        Some('\'') => out.push('\''),
+                        Some(next) => {
+                            out.push('\\');
+                            out.push(next);
+                        }
+                        None => out.push('\\'),
                     }
                 } else if ch == *q {
+                    out.push('"');
                     stack.pop();
+                } else if ch == '"' {
+                    // An unescaped `"` inside a single-quoted string.
+                    out.push_str("\\\"");
+                } else {
+                    out.push(ch);
                 }
                 last_was_space = false;
             }
@@ -147,7 +183,7 @@ fn collapse_whitespace_outside_strings(text: &str) -> String {
                     out.push(ch);
                     last_was_space = false;
                 } else if ch == '"' || ch == '\'' {
-                    out.push(ch);
+                    out.push('"');
                     stack.push(Mode::QuotedString(ch));
                     last_was_space = false;
                 } else if ch == '`' {
@@ -170,7 +206,7 @@ fn collapse_whitespace_outside_strings(text: &str) -> String {
             }
             Mode::Code => {
                 if ch == '"' || ch == '\'' {
-                    out.push(ch);
+                    out.push('"');
                     stack.push(Mode::QuotedString(ch));
                     last_was_space = false;
                 } else if ch == '`' {
@@ -913,7 +949,7 @@ impl TypeExtractor {
             }
             TSType::TSLiteralType(literal_type) => match &literal_type.literal {
                 oxc_ast::ast::TSLiteral::StringLiteral(str_lit) => {
-                    format!("\"{}\"", str_lit.value.as_str())
+                    quote_string_literal(str_lit.value.as_str())
                 }
                 oxc_ast::ast::TSLiteral::NumericLiteral(num_lit) => num_lit.value.to_string(),
                 oxc_ast::ast::TSLiteral::BooleanLiteral(bool_lit) => bool_lit.value.to_string(),
@@ -1556,8 +1592,40 @@ export interface Channel {
         assert_eq!(annotation("guard"), "(value: unknown) => value is string");
         assert_eq!(annotation("source"), "typeof stringSource");
         assert_eq!(annotation("mapped"), "{ [K in keyof Options]?: Options[K] }");
-        assert_eq!(annotation("conditional"), "T extends string ? 'text' : 'other'");
+        assert_eq!(annotation("conditional"), "T extends string ? \"text\" : \"other\"");
         assert_eq!(annotation("template"), "`${string}px`");
+    }
+
+    #[test]
+    fn string_literals_take_one_canonical_spelling() {
+        // Quote style is formatting: rendered annotations and source-text
+        // bodies both spell a string literal in double quotes, an inner `"`
+        // escaped, so `'1'` and `"1"` are one literal and `'say "yes"'`
+        // stays one token.
+        let code = r#"
+export type SingleQuoted = '1';
+export type DoubleQuoted = "1";
+export type Quoted = 'say "yes"';
+export type Apostrophe = 'it\'s';
+export type Union = 'a' | "b";
+export interface Consent {
+  kind: 'say "yes"';
+  note: "it's";
+}
+"#;
+        let types = extract_types_from_code(code, "test.ts").unwrap();
+        let body = |name: &str| {
+            types.iter().find(|t| t.name == name).unwrap().properties[0].type_annotation.clone()
+        };
+        assert_eq!(body("SingleQuoted"), "\"1\"");
+        assert_eq!(body("DoubleQuoted"), "\"1\"");
+        assert_eq!(body("Quoted"), r#""say \"yes\"""#);
+        assert_eq!(body("Apostrophe"), "\"it's\"");
+        assert_eq!(body("Union"), "\"a\" | \"b\"");
+        let consent = types.iter().find(|t| t.name == "Consent").unwrap();
+        assert_eq!(consent.properties[0].type_annotation, r#""say \"yes\"""#);
+        assert_eq!(consent.properties[1].type_annotation, "\"it's\"");
+        assert_eq!(quote_string_literal("a\\b\n"), r#""a\\b\n""#);
     }
 
     #[test]
@@ -1571,6 +1639,22 @@ export default interface Marker { id: number; }
         assert_eq!(types[0].extends, vec!["Box<string>", "Legacy.Tagged"]);
         assert_eq!(types[1].extends, vec!["Box<#0>"]);
         assert_eq!(types[2].name, "Marker");
+    }
+
+    #[test]
+    fn heritage_normalizes_after_positional_substitution() {
+        // `Box<T | U>` substitutes to `Box<#0 | #1>` under `A<T, U>` and to
+        // `Box<#1 | #0>` under `B<U, T>`; normalization sorts them again.
+        let code = r"
+interface A<T, U> extends Box<T | U> { id: number; }
+interface B<U, T> extends Box<T | U> { id: number; }
+";
+        let types = extract_types_from_code(code, "test.ts").unwrap();
+        let options = crate::type_normalizer::NormalizationOptions::default();
+        let a = crate::type_normalizer::normalize_type(&types[0], &options);
+        let b = crate::type_normalizer::normalize_type(&types[1], &options);
+        assert_eq!(a.extends, vec!["Box<#0 | #1>"]);
+        assert_eq!(a.extends, b.extends);
     }
 
     #[test]

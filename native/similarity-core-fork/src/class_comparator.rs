@@ -1292,6 +1292,54 @@ export class Beta<U> extends Base<U> {
     }
 
     #[test]
+    fn reordered_type_parameters_keep_compound_annotations_equal() {
+        // `T | U` is `#0 | #1` in `Alpha<T, U>` and `#1 | #0` in
+        // `Beta<U, T>` until it is normalized again after substitution.
+        let result = compare_sources(
+            r"
+export class Alpha<T, U> extends Base<T | U> {
+  x: T | U;
+  y: T & U;
+  pick<A, B>(left: A | B, right: T | U): A | B { return left; }
+}
+",
+            r"
+export class Beta<U, T> extends Base<T | U> {
+  x: T | U;
+  y: T & U;
+  pick<B, A>(left: A | B, right: T | U): A | B { return left; }
+}
+",
+        );
+        assert!(
+            (result.structural_similarity - 1.0).abs() < 1e-9,
+            "got {}",
+            result.structural_similarity
+        );
+        // Positions still matter: `T` is the first parameter of `Alpha<T, U>`
+        // but the second of `Beta<U, T>`, so a field typed `T` alone differs.
+        let asymmetric = compare_sources(
+            "export class Alpha<T, U> { x: T | U; first: T; }",
+            "export class Beta<U, T> { x: T | U; first: T; }",
+        );
+        assert!(
+            asymmetric.structural_similarity < 1.0 - 1e-9,
+            "got {}",
+            asymmetric.structural_similarity
+        );
+        // Heritage type arguments are normalized like annotations.
+        let heritage = compare_sources(
+            "export class A extends Base<string | number> { x: string; y: number; }",
+            "export class B extends Base<number | string> { x: string; y: number; }",
+        );
+        assert!(
+            (heritage.structural_similarity - 1.0).abs() < 1e-9,
+            "got {}",
+            heritage.structural_similarity
+        );
+    }
+
+    #[test]
     fn swapped_constructor_wiring_is_a_difference() {
         let swapped = r"
 export class PointA {

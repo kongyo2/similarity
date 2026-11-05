@@ -80,8 +80,10 @@ pub struct FunctionDefinition {
     pub display_name: String,
     /// The other name a named function expression is reachable under:
     /// `factorial` in `const factorial = function recur(n) {…}`, where the
-    /// body may recurse through either binding. `None` when the function
-    /// has a single name.
+    /// body may recurse through either binding, or `walk` in an object
+    /// member `visit: function walk(node) {…}`, whose fragment is declared
+    /// under a placeholder because the key binds nothing inside the body.
+    /// `None` when the function has a single name.
     pub self_alias: Option<String>,
     pub start_line: u32,
     pub end_line: u32,
@@ -478,6 +480,14 @@ fn push_object_method(
     };
     let display_name = method_key_display_text(&prop.key, prop.computed, ctx.source_text)
         .unwrap_or_else(|| name.clone());
+    // `visit: function walk(node) {… walk(node.left) …}`: the function
+    // expression's own name is a binding inside the body, the property key
+    // is not. The own name is an alias of the fragment's declaration, so
+    // recursion through `walk` alpha-renames with the function instead of
+    // staying a free identifier that differs between otherwise identical
+    // copies. The fragment is not declared under the key (see
+    // `METHOD_FRAGMENT_NAME`), so a call to an outer `visit` stays free.
+    let self_alias = func.id.as_ref().map(|id| id.name.to_string());
     let start_line = ctx.line_number(prop.span.start);
     ctx.functions.push(FunctionDefinition {
         name: name.clone(),
@@ -493,7 +503,7 @@ fn push_object_method(
         is_static: false,
         method_kind,
         display_name,
-        self_alias: None,
+        self_alias,
         start_line,
         end_line: ctx.line_number(prop.span.end),
         class_name: None,
@@ -1464,6 +1474,13 @@ fn extract_body_text(func: &FunctionDefinition, source: &str) -> String {
     source[start..end].to_string()
 }
 
+/// The comparison fragment of a function and the top-level binding it
+/// declares, which is what a self-alias resolves to.
+struct NormalizedFragment {
+    text: String,
+    binding: String,
+}
+
 /// Build a normalization-friendly fragment for a function. The goal is that
 /// two functions whose bodies and parameter lists agree end up producing
 /// identical fragments regardless of whether they were declared as
@@ -1471,7 +1488,7 @@ fn extract_body_text(func: &FunctionDefinition, source: &str) -> String {
 /// `const foo = (x) => x + 1`. Without this layer the wrapping shape
 /// (FunctionDeclaration vs ExpressionStatement→ArrowFunctionExpression)
 /// dominated the structural distance on short bodies.
-fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String {
+fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> NormalizedFragment {
     let safe_slice = |start: u32, end: u32| -> &str {
         let s = start as usize;
         let e = end as usize;
@@ -1507,6 +1524,9 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
     } else {
         raw_body_text.to_string()
     };
+    // Every source text the fragment splices in; a synthetic name must not
+    // occur in any of it (see `unused_synthetic_name`).
+    let spliced = format!("{params_text} {body_text} {}", func.display_name);
 
     match func.function_type {
         FunctionType::Method | FunctionType::Constructor => {
@@ -1514,26 +1534,27 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
             // fragment so "extract method to function" refactors (and the
             // reverse) compare by body instead of by declaration shape —
             // the class wrapper used to dominate the structural distance
-            // for method-vs-function pairs. Static methods, accessors,
+            // for method-vs-function pairs. The fragment is declared under
+            // a placeholder, not the key, which binds nothing inside the
+            // body (see `METHOD_FRAGMENT_NAME`). Static methods, accessors,
             // constructors and non-identifier keys keep the class wrapper:
             // their runtime contracts are tied to the class shape and the
             // existing relative scoring for those forms is calibrated
             // against it.
-            if matches!(func.function_type, FunctionType::Method)
-                && matches!(func.method_kind, MethodKind::Normal)
-                && !func.is_static
-            {
-                if let Some(name_text) = method_fragment_name(&func.display_name) {
-                    let mut prefix = String::new();
-                    if func.is_async {
-                        prefix.push_str("async ");
-                    }
-                    prefix.push_str("function");
-                    if func.is_generator {
-                        prefix.push('*');
-                    }
-                    return format!("{prefix} {name_text}{params_text} {body_text}");
+            if method_normalizes_to_function(func) {
+                let name_text = unused_synthetic_name(METHOD_FRAGMENT_NAME, &spliced);
+                let mut prefix = String::new();
+                if func.is_async {
+                    prefix.push_str("async ");
                 }
+                prefix.push_str("function");
+                if func.is_generator {
+                    prefix.push('*');
+                }
+                return NormalizedFragment {
+                    text: format!("{prefix} {name_text}{params_text} {body_text}"),
+                    binding: name_text,
+                };
             }
             // Remaining method shapes can't be parsed in isolation, so keep
             // the synthetic class wrapper. Preserve `static`, getter/setter,
@@ -1567,7 +1588,14 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
             } else {
                 func.display_name.clone()
             };
-            format!("class __C__ {{ {}{}{} {} }}", prefix, method_name_text, params_text, body_text)
+            let wrapper = unused_synthetic_name(CLASS_WRAPPER_NAME, &spliced);
+            NormalizedFragment {
+                text: format!(
+                    "class {wrapper} {{ {}{}{} {} }}",
+                    prefix, method_name_text, params_text, body_text
+                ),
+                binding: wrapper,
+            }
         }
         FunctionType::Function | FunctionType::Arrow => {
             // Carry async / generator flags through the wrapper so two
@@ -1589,11 +1617,70 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
             // is no private-method / string-literal-key path here.
             // `display_name` is the name the body is bound under: the
             // declaration name, or a named function expression's own
-            // name, which its recursive calls refer to.
-            let name_text = sanitize_function_name(&func.display_name);
-            format!("{} {}{} {}", prefix, name_text, params_text, body_text)
+            // name, which its recursive calls refer to. A name the
+            // sanitizer made up binds nothing in the source and is kept out
+            // of its references like the other synthetic names.
+            let mut name_text = sanitize_function_name(&func.display_name);
+            if name_text != func.display_name {
+                name_text = unused_synthetic_name(&name_text, &spliced);
+            }
+            NormalizedFragment {
+                text: format!("{} {}{} {}", prefix, name_text, params_text, body_text),
+                binding: name_text,
+            }
         }
     }
+}
+
+/// `base`, or `base` with the smallest numeric suffix, whichever `text`
+/// does not contain. Fragments declare synthetic names (the method
+/// placeholder, the class wrapper, a sanitized function name) around
+/// source text, and a source reference spelled like one of them would
+/// resolve to the synthetic declaration: a call to an outer `__m__`
+/// would read as recursion. A name the source never spells captures
+/// nothing, and any spelling works because the declaration alpha-renames
+/// like every other binding.
+fn unused_synthetic_name(base: &str, text: &str) -> String {
+    let mut name = base.to_string();
+    let mut suffix = 0u32;
+    while text.contains(name.as_str()) {
+        suffix += 1;
+        name = format!("{base}{suffix}");
+    }
+    name
+}
+
+/// Name of the synthetic class that wraps method fragments which cannot be
+/// parsed on their own (see [`build_normalized_fragment`]).
+const CLASS_WRAPPER_NAME: &str = "__C__";
+
+/// Name the standalone `function` fragment of a method is declared under
+/// (or, when the method's source spells it, the same name with a suffix;
+/// see [`unused_synthetic_name`]). A member key is not a binding inside the
+/// member's body: in `visit(node) { return visit(node.left); }` the call
+/// goes to an outer `visit`, and recursion goes through `this.visit`.
+/// Under the key, such calls would resolve to the fragment's own
+/// declaration, and a method delegating to a same-named helper would
+/// compare as identical to a recursive function. Under a placeholder, a
+/// reference spelled like the key stays a free identifier, as in the
+/// class-wrapped shapes, in arrow-valued object members and in class
+/// mode's method fingerprints. The declaration name alpha-renames like any
+/// other binding, so the comparison does not depend on it. A method's key
+/// is a binding in neither fragment shape, so only the own name of a
+/// function expression held by the member (`visit: function walk(node)
+/// {…}`) resolves to the function.
+const METHOD_FRAGMENT_NAME: &str = "__m__";
+
+/// Whether a method normalizes to a standalone `function` fragment: plain
+/// instance methods with an identifier key. The other shapes keep the
+/// synthetic class wrapper — static methods, accessors, constructors, and
+/// non-identifier keys (string literals, computed keys, `#private` names),
+/// whose key shape stays visible to the comparison.
+fn method_normalizes_to_function(func: &FunctionDefinition) -> bool {
+    matches!(func.function_type, FunctionType::Method)
+        && matches!(func.method_kind, MethodKind::Normal)
+        && !func.is_static
+        && is_plain_identifier(&func.display_name)
 }
 
 fn is_plain_identifier(name: &str) -> bool {
@@ -1674,23 +1761,6 @@ fn is_reserved_function_name(name: &str) -> bool {
     )
 }
 
-/// Name to bind a plain instance method to when normalizing it into a
-/// standalone `function` fragment. Returns `None` for non-identifier keys
-/// (string literals, computed keys, `#private` names) — those keep the
-/// class wrapper so their key shape stays visible to the comparison.
-/// Reserved words get a stable prefix so e.g. a `delete(key)` method still
-/// produces a valid, name-distinct function fragment.
-fn method_fragment_name(name: &str) -> Option<String> {
-    if !is_plain_identifier(name) {
-        return None;
-    }
-    if is_reserved_function_name(name) {
-        Some(format!("__m_{name}"))
-    } else {
-        Some(name.to_string())
-    }
-}
-
 /// Parse a function body snippet into a tree, wrapping method-shorthand
 /// fragments in a synthetic class so that standalone class methods and
 /// constructors (which are not valid top-level TypeScript) can still be
@@ -1700,21 +1770,16 @@ fn parse_function_fragment(
     body_text: &str,
     function_type: &FunctionType,
 ) -> Result<std::rc::Rc<crate::tree::TreeNode>, String> {
+    let class_wrapped = || {
+        let wrapper = unused_synthetic_name(CLASS_WRAPPER_NAME, body_text);
+        parse_and_convert_to_tree_canonical(filename, &format!("class {wrapper} {{ {body_text} }}"))
+    };
     match function_type {
-        FunctionType::Method | FunctionType::Constructor => {
-            let wrapped = format!("class __C__ {{ {body_text} }}");
-            parse_and_convert_to_tree_canonical(filename, &wrapped)
-        }
+        FunctionType::Method | FunctionType::Constructor => class_wrapped(),
         FunctionType::Function | FunctionType::Arrow => {
             // Try direct parse first; fall back to class-wrapping for method-like
             // snippets that snuck through (e.g. rare extractor edge cases).
-            match parse_and_convert_to_tree_canonical(filename, body_text) {
-                Ok(tree) => Ok(tree),
-                Err(_) => {
-                    let wrapped = format!("class __C__ {{ {body_text} }}");
-                    parse_and_convert_to_tree_canonical(filename, &wrapped)
-                }
-            }
+            parse_and_convert_to_tree_canonical(filename, body_text).or_else(|_| class_wrapped())
         }
     }
 }
@@ -1731,14 +1796,14 @@ fn parse_function_for_comparison(
 ) -> Result<std::rc::Rc<crate::tree::TreeNode>, String> {
     let fragment = build_normalized_fragment(func, source);
     let parsed = match &func.self_alias {
-        // The fragment declares the function under `display_name`; the
-        // other name it is bound under resolves to the same declaration.
+        // The fragment declares the function under one binding; the other
+        // name it is reachable under resolves to the same declaration.
         Some(alias) => crate::parser::parse_and_convert_to_tree_canonical_with_aliases(
             filename,
-            &fragment,
-            vec![(alias.clone(), sanitize_function_name(&func.display_name))],
+            &fragment.text,
+            vec![(alias.clone(), fragment.binding)],
         ),
-        None => parse_and_convert_to_tree_canonical(filename, &fragment),
+        None => parse_and_convert_to_tree_canonical(filename, &fragment.text),
     };
     match parsed {
         Ok(tree) => Ok(tree),
@@ -2759,7 +2824,8 @@ export class TapRelay {
             build_normalized_fragment(
                 &expressions[0],
                 "export default function (line: string): string {\n    return line.trim();\n}\n"
-            ),
+            )
+            .text,
             "function __f_default(line: string) {\n    return line.trim();\n}"
         );
         let arrows =
@@ -2969,6 +3035,304 @@ export function persist(document: Doc): void {
         let pairs = find_similar_functions_in_file("test.ts", twins, 0.8, &options).unwrap();
         assert_eq!(pairs.len(), 1);
         assert!((pairs[0].similarity - 1.0).abs() < 1e-9, "got {}", pairs[0].similarity);
+    }
+
+    #[test]
+    fn object_members_recurse_through_their_own_name() {
+        // `visit: function walk(node) {… walk(node.left) …}` recurses
+        // through the function expression's own name, which the property
+        // key does not bind. Identifier keys (function-shaped fragment),
+        // reserved-word keys and computed keys (class-wrapped fragment) all
+        // resolve it.
+        let options = TSEDOptions::default();
+        for (left_key, right_key) in
+            [("visit", "visit"), ("delete", "delete"), ("[Kind.Sum]", "[Kind.Sum]")]
+        {
+            let code = format!(
+                r"
+export const visitorA = {{
+    {left_key}: function walk(node: TreeNode): number {{
+        if (node.leaf) {{
+            return node.value;
+        }}
+        const left = walk(node.left);
+        const right = walk(node.right);
+        return left + right;
+    }},
+}};
+export const visitorB = {{
+    {right_key}: function traverse(node: TreeNode): number {{
+        if (node.leaf) {{
+            return node.value;
+        }}
+        const left = traverse(node.left);
+        const right = traverse(node.right);
+        return left + right;
+    }},
+}};
+"
+            );
+            let functions = extract_functions("test.ts", &code).unwrap();
+            assert_eq!(functions[0].self_alias.as_deref(), Some("walk"));
+            let pairs = find_similar_functions_in_file("test.ts", &code, 0.8, &options).unwrap();
+            assert_eq!(pairs.len(), 1, "{left_key}: recursive object members must pair");
+            assert!(
+                (pairs[0].similarity - 1.0).abs() < 1e-9,
+                "{left_key}: got {}",
+                pairs[0].similarity
+            );
+        }
+
+        // The own name resolves to the function only where it is the own
+        // name: a twin calling an outer `walk` helper is not recursion, so
+        // the two bodies are not the same tree.
+        let outer = r"
+export const visitorA = {
+    visit: function walk(node: TreeNode): number {
+        if (node.leaf) {
+            return node.value;
+        }
+        const left = walk(node.left);
+        const right = walk(node.right);
+        return left + right;
+    },
+};
+export const visitorB = {
+    visit: function traverse(node: TreeNode): number {
+        if (node.leaf) {
+            return node.value;
+        }
+        const left = walk(node.left);
+        const right = walk(node.right);
+        return left + right;
+    },
+};
+";
+        let functions = extract_functions("test.ts", outer).unwrap();
+        let similarity =
+            compare_functions(&functions[0], &functions[1], outer, outer, &options).unwrap();
+        assert!(similarity < 1.0 - 1e-9, "recursion vs an outer helper, got {similarity}");
+
+        // Nor is a call spelled like the KEY: the key binds nothing in the
+        // body, so `visit(…)` reaches an outer `visit` and must not resolve
+        // to the function along with the own name.
+        let template = r"
+export const visitorA = {
+    visit: function walk(node: TreeNode): number {
+        if (node.leaf) {
+            return node.value;
+        }
+        const left = walk(node.left);
+        const right = LEFT_RIGHT(node.right);
+        return left + right;
+    },
+};
+export const visitorB = {
+    visit: function traverse(node: TreeNode): number {
+        if (node.leaf) {
+            return node.value;
+        }
+        const left = RIGHT_LEFT(node.left);
+        const right = traverse(node.right);
+        return left + right;
+    },
+};
+";
+        for (left_call, right_call, case) in [
+            // Recursion on the left, an outer `visit` on the right.
+            ("walk", "visit", "own name vs key"),
+            // One body calls itself and the outer `visit`, the other
+            // calls itself twice.
+            ("visit", "traverse", "key and own name vs own name twice"),
+        ] {
+            let code = template.replace("LEFT_RIGHT", left_call).replace("RIGHT_LEFT", right_call);
+            let functions = extract_functions("test.ts", &code).unwrap();
+            let similarity =
+                compare_functions(&functions[0], &functions[1], &code, &code, &options).unwrap();
+            assert!(similarity < 1.0 - 1e-9, "{case}: got {similarity}");
+        }
+    }
+
+    #[test]
+    fn member_keys_bind_nothing_inside_the_body() {
+        let options = TSEDOptions::default();
+
+        // Methods delegating to a helper named like themselves call
+        // different helpers: a facade over two sinks is not one function
+        // twice.
+        let facade = r"
+export const logger = {
+    debug(message: string, ...args: unknown[]): void {
+        if (!settings.enabled) {
+            return;
+        }
+        const line = format(message, args);
+        debug(`${settings.prefix} ${line}`);
+    },
+    info(message: string, ...args: unknown[]): void {
+        if (!settings.enabled) {
+            return;
+        }
+        const line = format(message, args);
+        info(`${settings.prefix} ${line}`);
+    },
+};
+";
+        let pairs = find_similar_functions_in_file("test.ts", facade, 0.8, &options).unwrap();
+        assert!(
+            pairs.is_empty(),
+            "different sinks must not pair, got {:?}",
+            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
+        );
+
+        // Every member spelling delegating to the outer `visit` is the same
+        // code: shorthand, named function expression, arrow value, class
+        // method. A recursive `function visit` is different code.
+        let delegating = r"
+export const shorthand = {
+    visit(node: TreeNode): number {
+        if (node.leaf) {
+            return node.value;
+        }
+        const left = visit(node.left);
+        return left + node.value;
+    },
+};
+export const named = {
+    visit: function walk(node: TreeNode): number {
+        if (node.leaf) {
+            return node.value;
+        }
+        const left = visit(node.left);
+        return left + node.value;
+    },
+};
+export const arrow = {
+    visit: (node: TreeNode): number => {
+        if (node.leaf) {
+            return node.value;
+        }
+        const left = visit(node.left);
+        return left + node.value;
+    },
+};
+export class Visitor {
+    visit(node: TreeNode): number {
+        if (node.leaf) {
+            return node.value;
+        }
+        const left = visit(node.left);
+        return left + node.value;
+    }
+}
+export function visit(node: TreeNode): number {
+    if (node.leaf) {
+        return node.value;
+    }
+    const left = visit(node.left);
+    return left + node.value;
+}
+";
+        let functions = extract_functions("test.ts", delegating).unwrap();
+        assert_eq!(functions.len(), 5);
+        let (members, recursive) = functions.split_at(4);
+        for (i, left) in members.iter().enumerate() {
+            for right in &members[i + 1..] {
+                let similarity =
+                    compare_functions(left, right, delegating, delegating, &options).unwrap();
+                assert!(
+                    (similarity - 1.0).abs() < 1e-9,
+                    "{} vs {}: got {similarity}",
+                    left.name,
+                    right.name
+                );
+            }
+            let similarity =
+                compare_functions(left, &recursive[0], delegating, delegating, &options).unwrap();
+            assert!(similarity < 1.0 - 1e-9, "{} vs recursion: got {similarity}", left.name);
+        }
+    }
+
+    #[test]
+    fn synthetic_fragment_names_never_capture_source_references() {
+        let options = TSEDOptions::default();
+        let similarity_of_first_and_last = |code: &str| {
+            let functions = extract_functions("test.ts", code).unwrap();
+            let last = functions.last().unwrap();
+            compare_functions(&functions[0], last, code, code, &options).unwrap()
+        };
+        let body = |callee: &str| {
+            format!(
+                "(n: number): number {{
+        if (n <= 0) {{
+            return 0;
+        }}
+        const rest = {callee}(n - 1);
+        return rest + 1;
+    }}"
+            )
+        };
+        let recursive = format!("export function countdown{}\n", body("countdown"));
+
+        // A call to an outer function spelled like the synthetic name the
+        // fragment is declared under (the method placeholder, the name an
+        // arrow-valued member gets) is not recursion.
+        let method =
+            format!("export const a = {{\n    countdown{},\n}};\n{recursive}", body("__m__"));
+        let similarity = similarity_of_first_and_last(&method);
+        assert!(similarity < 1.0 - 1e-9, "method calling __m__: got {similarity}");
+
+        let arrow = format!(
+            "export const a = {{\n    countdown: (n: number): number => {{
+        if (n <= 0) {{
+            return 0;
+        }}
+        const rest = __sim__(n - 1);
+        return rest + 1;
+    }},\n}};\n{recursive}"
+        );
+        let similarity = similarity_of_first_and_last(&arrow);
+        assert!(similarity < 1.0 - 1e-9, "arrow member calling __sim__: got {similarity}");
+
+        // Class-wrapped: a member calling an outer `__C__` is not the twin
+        // that recurses through its own name.
+        let wrapped = format!(
+            "export const a = {{\n    [Kind.Sum]: function walk{},\n}};
+export const b = {{\n    [Kind.Sum]: function step{},\n}};\n",
+            body("walk"),
+            body("__C__")
+        );
+        let similarity = similarity_of_first_and_last(&wrapped);
+        assert!(similarity < 1.0 - 1e-9, "member calling __C__: got {similarity}");
+
+        // When the source spells the placeholder, the fragment takes
+        // another name, and the own name still resolves to it.
+        let spelled = r#"
+export const a = {
+    visit: function walk(n: number): string {
+        if (n <= 0) {
+            return "__m__";
+        }
+        const rest = walk(n - 1);
+        return rest + "!";
+    },
+};
+export const b = {
+    visit: function step(n: number): string {
+        if (n <= 0) {
+            return "__m__";
+        }
+        const rest = step(n - 1);
+        return rest + "!";
+    },
+};
+"#;
+        let functions = extract_functions("test.ts", spelled).unwrap();
+        let fragment = build_normalized_fragment(&functions[0], spelled);
+        assert_eq!(fragment.binding, "__m__1");
+        assert!(fragment.text.starts_with("function __m__1("), "{}", fragment.text);
+        let similarity = similarity_of_first_and_last(spelled);
+        assert!((similarity - 1.0).abs() < 1e-9, "own-name recursion: got {similarity}");
     }
 
     #[test]

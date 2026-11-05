@@ -1,5 +1,6 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { buildClusters, clusterPairs, standalonePairs } from "../src/clusters.js";
 import { formatJsonReport, formatPrettyReport } from "../src/format.js";
 import type { AnalyzeReport, SimilarityPair } from "../src/types.js";
 
@@ -153,9 +154,11 @@ describe("formatPrettyReport", () => {
       createPair({ similarity: 0.9, left: a, right: c }),
       createPair({ similarity: 0.85, left: d, right: e }),
     ];
+    const byMode = { functions: pairs, types: [], classes: [], overlap: [] };
     const report = createReport({
       results: pairs,
-      byMode: { functions: pairs, types: [], classes: [], overlap: [] },
+      byMode,
+      clusters: buildClusters(byMode),
       stats: { fileCount: 5, pairCount: 4, clusterCount: 1, elapsedMs: 3 },
     });
 
@@ -171,12 +174,19 @@ describe("formatPrettyReport", () => {
     expect(rendered).toContain("src/delta.ts:4-8 delta");
     expect(rendered).toContain("Total pairs: 4 (3 in 1 cluster, 1 standalone)");
     expect(rendered).not.toContain("Cluster 2");
+
+    // The blocks are the report's clusters, the same list the summary line
+    // counts: a report without clusters lists every pair as a row.
+    const unclustered = formatPrettyReport({ ...report, clusters: [] }, "/repo", ["functions"]);
+    expect(unclustered).not.toContain("Duplicate clusters");
+    expect(unclustered).not.toContain("Cluster 1");
+    expect(unclustered).toContain("Total pairs: 4");
+    expect(unclustered).toContain("src/beta.ts:2-6 beta");
   });
 });
 
 describe("clusterPairs", () => {
-  it("groups connected pairs and leaves two-member components standalone", async () => {
-    const { clusterPairs, buildClusters } = await import("../src/clusters.js");
+  it("groups connected pairs and leaves two-member components standalone", () => {
     const at = (name: string) => ({
       filePath: `/repo/${name}.ts`,
       startLine: 1,
@@ -203,9 +213,30 @@ describe("clusterPairs", () => {
     });
     expect(clusters[0]?.averageSimilarity).toBeCloseTo(0.9, 10);
     expect(standalone.map((pair) => pair.left.symbolName)).toEqual(["x"]);
+    expect(standalonePairs("functions", pairs, clusters)).toEqual(standalone);
 
     // Overlap windows are not declarations and never cluster.
     const all = buildClusters({ functions: pairs, overlap: pairs });
     expect(all).toHaveLength(1);
+  });
+
+  it("orders members by code unit, independent of the host locale", () => {
+    const at = (name: string) => ({
+      filePath: `/repo/${name}.ts`,
+      startLine: 1,
+      endLine: 5,
+      symbolName: name,
+      kind: "function",
+    });
+    const pairs: SimilarityPair[] = [
+      createPair({ left: at("a"), right: at("B") }),
+      createPair({ left: at("B"), right: at("c") }),
+    ];
+
+    const { clusters } = clusterPairs("functions", pairs);
+
+    // A locale-aware comparison sorts "a" before "B"; code-unit order puts
+    // the uppercase letter first on every machine.
+    expect(clusters[0]?.members.map((member) => member.symbolName)).toEqual(["B", "a", "c"]);
   });
 });

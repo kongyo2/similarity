@@ -1,10 +1,10 @@
 
-> @kongyo2/similarity-ts@0.8.0 bench:accuracy
+> @kongyo2/similarity-ts@0.8.1 bench:accuracy
 > tsx scripts/accuracy-benchmark.ts
 
 # Refactoring Accuracy Benchmark
 
-Generated at: 2026-11-04T03:12:07.988Z
+Generated at: 2026-11-05T03:32:52.360Z
 
 Settings: threshold 0.8 (CLI default), minLines 3 (CLI default)
 
@@ -12,10 +12,10 @@ Settings: threshold 0.8 (CLI default), minLines 3 (CLI default)
 
 | Metric | Value |
 | --- | ---: |
-| Labeled pairs | 325 |
-| True positives | 198 |
+| Labeled pairs | 337 |
+| True positives | 203 |
 | False negatives | 0 |
-| True negatives | 127 |
+| True negatives | 134 |
 | False positives | 0 |
 | Accuracy | 100.00% |
 | Error rate | 0.00% |
@@ -24,9 +24,9 @@ Settings: threshold 0.8 (CLI default), minLines 3 (CLI default)
 
 | Mode | Pairs | Errors | Accuracy |
 | --- | ---: | ---: | ---: |
-| functions | 205 | 0 | 100.00% |
-| types | 82 | 0 | 100.00% |
-| classes | 38 | 0 | 100.00% |
+| functions | 209 | 0 | 100.00% |
+| types | 88 | 0 | 100.00% |
+| classes | 40 | 0 | 100.00% |
 
 ## Failures
 

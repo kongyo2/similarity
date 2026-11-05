@@ -1,5 +1,109 @@
 # Changelog
 
+## 0.8.1 — 2026-11-05
+
+Fixes for gaps left in the 0.8.0 extraction and comparison rules, and a
+machine-independent cluster order. Twelve new ground-truth pairs pin the
+fixes (corpus now **337 pairs**); the v0.8.0 engine gets all twelve wrong,
+v0.8.1 classifies all 337 correctly, and the 325 pairs of 0.8.0 keep their
+scores.
+
+### Detection accuracy
+
+- **Functions — methods calling a helper named like themselves**
+  (precision): a member key binds nothing inside the member's body, so
+  `debug(…)` inside a `debug()` method calls the outer `debug`. Plain
+  methods and arrow-valued class fields resolved such a call to the method
+  itself, as if it were recursion, so methods delegating to different
+  helpers (`debug()` calling `debug(…)`, `info()` calling `info(…)`)
+  scored 1.000 against each other, and a method delegating to a helper
+  scored 1.000 against a recursive function with its body. The call is a
+  free call now, as it already was in static methods, accessors,
+  arrow-valued object members and class mode, and a different callee caps
+  the pair like any other. (XF-N45, XF-N46)
+- **Functions — object members that recurse** (recall): in
+  `visit: function walk(node) {… walk(node.left) …}` the function
+  expression's own name is the function, and it now alpha-renames with it.
+  Two copies whose own names differ scored 0.75 and pair at 1.000 now,
+  under identifier and computed keys alike (`[OpKind.Sum]: function
+  evaluateSum(…)`), while a call spelled like the key (`visit(…)`) stays
+  a call to the outer `visit`. (XF-P53, XF-P54)
+- **Types — literals containing quotes** (precision): a string-literal type
+  is spelled with its inner quotes escaped (`'say "yes"'` is
+  `"say \"yes\""`), so it reads as one literal. Discriminated variants
+  told apart by such literals (`quote: '"'` vs `quote: "'"`,
+  `kind: 'say "yes"'` vs `kind: 'say "no"'`) scored about 0.92 and were
+  reported; they score about 0.45 now, like any other discriminant
+  mismatch. (XT-N24)
+- **Types — quote style**: string literals in type-alias bodies and in
+  source-rendered types are spelled in double quotes whatever the source
+  used. `type SchemaVersion = '1'` is now a literal atom like
+  `type SchemaVersion = "1"` and takes the atomic-alias name check:
+  single-quoted version singletons scored about 0.99 against each other
+  and score about 0.3 now, while the same alias copied into a single-quoted
+  and a double-quoted file pairs at 1.000 (0.43 before). (XT-N25, XT-P25)
+- **Classes — type parameter order** (recall): member annotations are
+  normalized again after class and method type parameters are spelled
+  positionally, so unions and intersections of the parameters compare
+  equal when the parameters are declared in another order
+  (`Settled<TValue, TError>` vs `Outcome<E, T>` with `TValue | TError`
+  members: 0.62 before, 0.87 now). Heritage type arguments are normalized
+  like annotations in class and type mode (`extends Base<A | B>` ⇔
+  `extends Base<B | A>`). (XC-P17)
+- **Classes — constructor wiring** (recall): a constructor that stores a
+  parameter through parentheses or a type assertion
+  (`this.canvas = canvas as HTMLCanvasElement`, `this.x = (x)`, `x!`,
+  `x satisfies T`) only wires its parameters, like `this.x = x`, instead of
+  counting as a member the other class lacks (0.77 before, 0.89 now for
+  the corpus pair). (XC-P18)
+
+### Reports
+
+- Cluster members, and clusters that tie, are ordered by code unit instead
+  of the host locale, so the JSON `clusters` field is the same on every
+  machine.
+
+### Weights
+
+- The APTED operation weights (rename 0.3, delete 1.0, insert 1.0) keep
+  337/337 under every setting in rename 0.2–0.5 × delete/insert 0.8–1.0;
+  the closest call is still XF-N36 at rename 0.2 (0.797 against the 0.8
+  threshold).
+
+### Real-world effect
+
+On current snapshots of the repositories audited for 0.8.0 — the
+TypeScript API package (59 files), its VS Code extension and scripts (58),
+the tsrs npm package, tools and playground (246) and standard-library
+declarations (116), and fallow's VS Code extension (123) and tools, npm
+packages and frontend (76) — v0.8.1 reports the same type, class and
+overlap pairs as v0.8.0. Function pairs change where the TypeScript API
+code is, in the TypeScript repository and in the copy the tsrs npm package
+bundles:
+
+| Target | Mode | v0.8.0 | v0.8.1 |
+| --- | --- | ---: | ---: |
+| TypeScript `packages/typescript/src` (59 files) | functions | 1,485 | 861 |
+| tsrs npm package, tools, playground (246 files) | functions | 1,460 | 836 |
+
+The 624 pairs gone from each are methods that call the module function of
+their own name, which scored 1.000 against each other: the type guards of
+the async and sync `Type` classes (`isUnionType()` returns
+`isUnionType(this)`, `isObjectType()` returns `isObjectType(this)`) and
+the `getChildren`/`getFirstToken`/`getLastToken` wrappers of the generated
+node classes. Each method still pairs with its copy in the other file
+(`isUnionType` in the async and the sync class). One score changes:
+fallow declares `type SimilarCodeProvider = 'official-local-companion'` in
+its N-API typings and the double-quoted spelling in its npm output
+contract, and the pair scores 1.000 instead of 0.935.
+
+### Accuracy
+
+| Engine | Corpus | Wrong labels | Error rate | Accuracy |
+| --- | --- | ---: | ---: | ---: |
+| v0.8.0 | 337 pairs | 12 / 337 | 3.56% | 96.44% |
+| v0.8.1 | 337 pairs | 0 / 337 | 0.00% | 100.00% |
+
 ## 0.8.0 — 2026-11-04
 
 Accuracy work driven by three more real codebases. The engine was run over
@@ -23,10 +127,11 @@ correctly and keeps the original 300 at 100%.
   `new Promise(…)` or a `Promise.*(…)` call, or chains the promise the async
   side awaits (`return fetch(u).then((r) => …)` vs `const r = await
   fetch(u); …`, which the canonicalizer already lowers to the same `await`).
-  The sync and async API packages' `getSymbol` twins scored 0.970, and
-  static async methods and accessors, whose class wrapper never carried the
-  `async` marker, scored 1.000 against their sync versions. (XF-N42,
-  XF-N43, XF-N44)
+  On v0.7.0 the sync and async API packages' `getSymbol` twins scored
+  0.970, and a static async method scored 1.000 against its sync version
+  (the label of a class-wrapped method never carried the `async` marker);
+  v0.8.0 keeps these pairs below the 0.8 threshold. (XF-N42, XF-N43,
+  XF-N44)
 - **Functions — named function expressions** (recall): `const factorial =
   function recur(n) {…}` may recurse through either name. The body is
   compared under the function's own binding, and the variable binding is
