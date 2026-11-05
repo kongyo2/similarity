@@ -40,10 +40,10 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: native/similarity-core-fork
+          workspaces: native
 
-      - name: Run core engine tests
-        run: cargo test --manifest-path native/similarity-core-fork/Cargo.toml
+      - name: Run Rust tests
+        run: cargo test --manifest-path native/Cargo.toml --workspace --locked
 
   # Builds the real WASM engine and runs the full vitest suite against it,
   # including the labeled-corpus accuracy gate (325 pairs): every labeled
@@ -68,7 +68,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: native/similarity-wasm
+          workspaces: native
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
