@@ -2156,4 +2156,87 @@ export declare class PartialStore {
     },
     forbidPairs: [["DraftStore", "PartialStore"]],
   },
+
+  // -------------------------------------------------------------------
+  // 0.8.1 — type parameters declared in another order, constructors that
+  // narrow a parameter before storing it
+  // -------------------------------------------------------------------
+  {
+    id: "XC-P17",
+    mode: "classes",
+    category: "generic-rename",
+    description:
+      "A settled-outcome holder copied with its type parameters renamed AND declared in the other order; every member uses them in a union",
+    files: {
+      "settled.ts": `
+export class Settled<TValue, TError> {
+  private outcome: TValue | TError | undefined;
+  settle(outcome: TValue | TError): void {
+    this.outcome = outcome;
+  }
+  peek(): TValue | TError | undefined {
+    return this.outcome;
+  }
+  take(): TValue | TError | undefined {
+    const outcome = this.outcome;
+    this.outcome = undefined;
+    return outcome;
+  }
+}
+`,
+      "outcome.ts": `
+export class Outcome<E, T> {
+  private outcome: T | E | undefined;
+  settle(outcome: T | E): void {
+    this.outcome = outcome;
+  }
+  peek(): T | E | undefined {
+    return this.outcome;
+  }
+  take(): T | E | undefined {
+    const outcome = this.outcome;
+    this.outcome = undefined;
+    return outcome;
+  }
+}
+`,
+    },
+    expectPairs: [["Settled", "Outcome"]],
+  },
+  {
+    id: "XC-P18",
+    mode: "classes",
+    category: "constructor-wiring",
+    description:
+      "Wiring-only constructors where one side narrows a parameter with `as` before storing it — still wiring, not constructor work",
+    files: {
+      "renderer.ts": `
+export class Renderer {
+  private canvas: HTMLCanvasElement;
+  private scale: number;
+  constructor(canvas: HTMLElement, scale: number) {
+    this.canvas = canvas as HTMLCanvasElement;
+    this.scale = scale;
+  }
+  width(): number {
+    return this.canvas.width * this.scale;
+  }
+}
+`,
+      "painter.ts": `
+export class Painter {
+  private canvas: HTMLCanvasElement;
+  private scale: number;
+  constructor(canvas: HTMLCanvasElement, scale: number) {
+    this.canvas = canvas;
+    this.scale = scale;
+  }
+  width(): number {
+    return this.canvas.width * this.scale;
+  }
+}
+`,
+    },
+    expectPairs: [["Renderer", "Painter"]],
+  },
 ];

@@ -1335,4 +1335,82 @@ export interface PreactCardProps {
     },
     forbidPairs: [["ReactCardProps", "PreactCardProps"]],
   },
+
+  // -------------------------------------------------------------------
+  // 0.8.1 — string literals that contain quotes or use single quotes
+  // -------------------------------------------------------------------
+  {
+    id: "XT-N24",
+    mode: "types",
+    category: "discriminant",
+    description:
+      "Discriminated variants whose literal discriminants contain double quotes (`'\"'` vs `\"'\"`, `'say \"yes\"'` vs `'say \"no\"'`)",
+    files: {
+      "tokens.ts": `
+export interface DoubleQuotedString {
+  quote: '"';
+  value: string;
+  start: number;
+  end: number;
+}
+export interface SingleQuotedString {
+  quote: "'";
+  value: string;
+  start: number;
+  end: number;
+}
+`,
+      "consent.ts": `
+export interface ConsentGranted {
+  kind: 'say "yes"';
+  data: string;
+  meta: number;
+}
+export interface ConsentDenied {
+  kind: 'say "no"';
+  data: string;
+  meta: number;
+}
+`,
+    },
+    forbidPairs: [
+      ["DoubleQuotedString", "SingleQuotedString"],
+      ["ConsentGranted", "ConsentDenied"],
+    ],
+  },
+  {
+    id: "XT-N25",
+    mode: "types",
+    category: "atomic-alias",
+    description:
+      "Independently versioned singletons written with single quotes — the quote style must not skip the atomic-alias name check",
+    files: {
+      "versions.ts": `
+export type ManifestVersion = '2';
+export type LockfileVersion = '2';
+export type CacheVersion = '2';
+`,
+    },
+    forbidPairs: [
+      ["ManifestVersion", "LockfileVersion"],
+      ["ManifestVersion", "CacheVersion"],
+      ["LockfileVersion", "CacheVersion"],
+    ],
+  },
+  {
+    id: "XT-P25",
+    mode: "types",
+    category: "atomic-alias",
+    description:
+      "The same single-literal alias copied into two files formatted with different quote styles",
+    files: {
+      "client.ts": `
+export type ProtocolVersion = '3';
+`,
+      "server.ts": `
+export type ProtocolVersion = "3";
+`,
+    },
+    expectPairs: [["ProtocolVersion", "ProtocolVersion"]],
+  },
 ];

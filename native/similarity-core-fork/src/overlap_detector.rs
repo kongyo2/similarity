@@ -566,4 +566,61 @@ function validateOrder(order: Order): string[] {
         assert!(!scanned.is_empty());
         assert_eq!(scanned, pairwise);
     }
+
+    #[test]
+    fn sides_prepared_for_other_options_are_prepared_again() {
+        // Sides prepared for another window range or size tolerance than
+        // the comparison's give the overlaps of sides prepared for it.
+        let file_a = r"
+function validateUser(user: User): string[] {
+    const errors: string[] = [];
+    if (!user.email) { errors.push('email'); }
+    if (!user.name) { errors.push('name'); }
+    if (user.age < 0) { errors.push('age'); }
+    return errors;
+}
+";
+        let file_b = r"
+function validateOrder(order: Order): string[] {
+    const errors: string[] = [];
+    if (!order.email) { errors.push('email'); }
+    if (!order.name) { errors.push('name'); }
+    if (order.total < 0) { errors.push('total'); }
+    return errors;
+}
+";
+        let options = OverlapOptions {
+            min_window_size: 5,
+            max_window_size: 30,
+            threshold: 0.5,
+            size_tolerance: 0.25,
+        };
+        let narrow = OverlapOptions { max_window_size: 8, ..options.clone() };
+        let loose = OverlapOptions { size_tolerance: 0.5, ..options.clone() };
+        let left = index_file_functions("a.ts", file_a);
+        let right = index_file_functions("b.ts", file_b);
+        let signature = |overlaps: Vec<PartialOverlap>| -> Vec<(u32, u32, u32, u32, String)> {
+            overlaps
+                .into_iter()
+                .map(|p| {
+                    (
+                        p.source_lines.0,
+                        p.source_lines.1,
+                        p.target_lines.0,
+                        p.target_lines.1,
+                        p.node_type,
+                    )
+                })
+                .collect()
+        };
+        let expected = signature(detect_partial_overlaps(&left[0], &right[0], &options));
+        assert!(!expected.is_empty());
+        for (source_options, target_options) in
+            [(&options, &narrow), (&narrow, &options), (&options, &loose), (&loose, &narrow)]
+        {
+            let source = OverlapSource::new(&left[0], source_options);
+            let target = OverlapTarget::new(&right[0], target_options);
+            assert_eq!(signature(detect_prepared_overlaps(&source, &target, &options)), expected);
+        }
+    }
 }

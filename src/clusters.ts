@@ -24,11 +24,20 @@ function locationKey(location: AnalyzerLocation): string {
   ].join("\u0000");
 }
 
+/**
+ * Code-unit order, the same on every machine. `localeCompare` depends on
+ * the host's default locale and ICU data, and the member and cluster order
+ * is part of the JSON report.
+ */
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function compareLocations(a: AnalyzerLocation, b: AnalyzerLocation): number {
   return (
-    a.filePath.localeCompare(b.filePath) ||
+    compareStrings(a.filePath, b.filePath) ||
     a.startLine - b.startLine ||
-    a.symbolName.localeCompare(b.symbolName)
+    compareStrings(a.symbolName, b.symbolName)
   );
 }
 
@@ -143,4 +152,30 @@ export function buildClusters(
   byMode: Partial<Record<AnalyzerMode, SimilarityPair[]>>,
 ): SimilarityCluster[] {
   return CLUSTERED_MODES.flatMap((mode) => clusterPairs(mode, byMode[mode] ?? []).clusters);
+}
+
+/**
+ * The pairs of one mode that given clusters do not cover — those whose two
+ * declarations are not members of one cluster of that mode — in input
+ * order. For clusters built from the same pairs this is
+ * {@link clusterPairs}' `standalone` list.
+ */
+export function standalonePairs(
+  mode: AnalyzerMode,
+  pairs: SimilarityPair[],
+  clusters: SimilarityCluster[],
+): SimilarityPair[] {
+  const clusterOf = new Map<string, number>();
+  clusters.forEach((cluster, index) => {
+    if (cluster.mode !== mode) {
+      return;
+    }
+    for (const member of cluster.members) {
+      clusterOf.set(locationKey(member), index);
+    }
+  });
+  return pairs.filter((pair) => {
+    const left = clusterOf.get(locationKey(pair.left));
+    return left === undefined || left !== clusterOf.get(locationKey(pair.right));
+  });
 }

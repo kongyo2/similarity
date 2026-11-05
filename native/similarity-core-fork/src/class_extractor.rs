@@ -268,11 +268,11 @@ impl ClassExtractor {
                             Self::type_parameter_names(arrow.type_parameters.as_ref());
                         methods.push(ClassMethod {
                             name,
-                            parameters: vec![Self::scoped(
+                            parameters: vec![Self::scoped_parameters(
                                 &self.extract_function_params(&arrow.params),
                                 &method_generics,
                             )],
-                            return_type: Self::scoped(&return_type, &method_generics),
+                            return_type: Self::scoped_type(&return_type, &method_generics),
                             is_static: prop.r#static,
                             is_private: false,
                             is_async: arrow.r#async,
@@ -433,8 +433,11 @@ impl ClassExtractor {
 
                         methods.push(ClassMethod {
                             name,
-                            parameters: vec![Self::scoped(&parameters, &method_generics)],
-                            return_type: Self::scoped(&return_type, &method_generics),
+                            parameters: vec![Self::scoped_parameters(
+                                &parameters,
+                                &method_generics,
+                            )],
+                            return_type: Self::scoped_type(&return_type, &method_generics),
                             is_static: method.r#static,
                             is_private: false, // Would need to check for private keyword
                             is_async: method.value.r#async,
@@ -455,17 +458,31 @@ impl ClassExtractor {
         // spells them positionally (`#0`, `#1`, …) — the substitution type
         // mode applies to interfaces. Method-level parameters were already
         // spelled `#m0`, `#m1`, … above, so they cannot collide.
+        //
+        // Substitution can undo what normalization sorted: `x: T | U` is
+        // `#0 | #1` in `Alpha<T, U>` but `#1 | #0` in `Beta<U, T>`, so a
+        // substituted annotation is normalized again on its final tokens.
+        // Heritage clauses take the same normalization as annotations, so
+        // their type arguments compare like member types.
         let generics = Self::type_parameter_names(class.type_parameters.as_ref());
-        let positional = |text: &str| TypeExtractor::substitute_generic_tokens(text, &generics);
+        let substitute = |text: &str| TypeExtractor::substitute_generic_tokens(text, &generics);
+        let positional = |text: &str| normalize_type_name(&substitute(text));
         if !generics.is_empty() {
             for property in &mut properties {
                 property.type_annotation = positional(&property.type_annotation);
             }
             for method in &mut methods {
-                method.parameters = method.parameters.iter().map(|p| positional(p)).collect();
+                method.parameters = method
+                    .parameters
+                    .iter()
+                    .map(|p| Self::normalize_parameter_list(&substitute(p)))
+                    .collect();
                 method.return_type = positional(&method.return_type);
             }
-            constructor_params = constructor_params.iter().map(|p| positional(p)).collect();
+            constructor_params = constructor_params
+                .iter()
+                .map(|p| Self::normalize_parameter_list(&substitute(p)))
+                .collect();
         }
         let extends = extends.map(|text| positional(&text));
         let implements: Vec<String> =
@@ -489,9 +506,44 @@ impl ClassExtractor {
 
     /// Spell a method's own type parameters positionally (`#m0`, `#m1`, …):
     /// `map<U>(fn: (item: T) => U): U[]` and `map<R>(fn: (item: T) => R):
-    /// R[]` are the same signature.
-    fn scoped(text: &str, method_generics: &[String]) -> String {
-        TypeExtractor::substitute_generic_tokens_with(text, method_generics, "#m")
+    /// R[]` are the same signature. The result is normalized again, as the
+    /// class-level substitution is (see `extract_class`).
+    fn scoped_type(text: &str, method_generics: &[String]) -> String {
+        if method_generics.is_empty() {
+            return text.to_string();
+        }
+        normalize_type_name(&TypeExtractor::substitute_generic_tokens_with(
+            text,
+            method_generics,
+            "#m",
+        ))
+    }
+
+    /// [`Self::scoped_type`] for a `name: type, …` parameter list.
+    fn scoped_parameters(text: &str, method_generics: &[String]) -> String {
+        if method_generics.is_empty() {
+            return text.to_string();
+        }
+        Self::normalize_parameter_list(&TypeExtractor::substitute_generic_tokens_with(
+            text,
+            method_generics,
+            "#m",
+        ))
+    }
+
+    /// Normalize the type of every `name: type` piece of a parameter list
+    /// (see [`Self::extract_function_params`]); the list as a whole is not
+    /// a type.
+    fn normalize_parameter_list(text: &str) -> String {
+        crate::type_normalizer::split_top_level(text, ',')
+            .iter()
+            .filter(|piece| !piece.is_empty())
+            .map(|piece| match piece.split_once(": ") {
+                Some((name, annotation)) => format!("{name}: {}", normalize_type_name(annotation)),
+                None => piece.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Where a constructor stores its parameters — see
@@ -739,6 +791,9 @@ impl ClassExtractor {
             };
             match &expr_stmt.expression {
                 Expression::CallExpression(call) => matches!(call.callee, Expression::Super(_)),
+                // Parentheses and `as`/`satisfies`/`!` around the stored
+                // parameter are transparent, as in `constructor_wiring`:
+                // `this.x = (x)` and `this.x = x as T` are wiring too.
                 Expression::AssignmentExpression(assign) => {
                     assign.operator == AssignmentOperator::Assign
                         && matches!(
@@ -747,7 +802,7 @@ impl ClassExtractor {
                                 if matches!(member.object, Expression::ThisExpression(_))
                         )
                         && matches!(
-                            &assign.right,
+                            assign.right.get_inner_expression(),
                             Expression::Identifier(ident)
                                 if parameters.contains(ident.name.as_str())
                         )
@@ -1025,10 +1080,33 @@ export class Plain extends Base {}
             "h.ts",
         )
         .unwrap();
-        assert_eq!(classes[0].extends.as_deref(), Some("React.Component<Props,State>"));
+        // Type arguments are normalized like annotations (`Props, State`).
+        assert_eq!(classes[0].extends.as_deref(), Some("React.Component<Props, State>"));
         assert_eq!(classes[0].implements, vec!["ts.Node", "Disposable"]);
         assert_eq!(classes[1].extends.as_deref(), Some("Mixin(Base)"));
         assert_eq!(classes[2].extends.as_deref(), Some("Base"));
+    }
+
+    #[test]
+    fn transparent_wrappers_around_stored_parameters_are_wiring() {
+        // `this.x = (x)` and `this.x = x as T` store the parameter like
+        // `this.x = x`: wiring, not constructor work.
+        for source in [
+            "export class A { x: number; y: number; constructor(x: number, y: number) { this.x = (x); this.y = y; } }",
+            "export class B { x: number; y: number; constructor(x: number, y: number) { this.x = x as number; this.y = y!; } }",
+            "export class C { x: number; y: number; constructor(x: number, y: number) { this.x = x satisfies number; this.y = <number>y; } }",
+        ] {
+            let classes = extract_classes_from_code(source, "wrap.ts").unwrap();
+            assert!(
+                classes[0].methods.iter().all(|m| m.kind != MethodKind::Constructor),
+                "{source}: a wiring-only constructor is not a member"
+            );
+            assert_eq!(
+                classes[0].constructor_wiring,
+                vec![("#0".to_string(), "x".to_string()), ("#1".to_string(), "y".to_string())],
+                "{source}"
+            );
+        }
     }
 
     #[test]

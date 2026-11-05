@@ -376,6 +376,8 @@ pub fn create_sliding_windows(
 /// every target the function was compared with.
 pub struct OverlapSource<'a> {
     func: &'a IndexedFunction,
+    /// The `(min_window_size, max_window_size)` the windows were built for.
+    window_range: (u32, u32),
     /// Natural subtrees in `[min_window_size, max_window_size]`, sorted.
     natural: Vec<&'a SubtreeFingerprint>,
     /// Sliding windows per window size, `min_window_size` first.
@@ -390,7 +392,16 @@ impl<'a> OverlapSource<'a> {
         let windows = (options.min_window_size..=options.max_window_size)
             .map(|window_size| create_sliding_windows(func, window_size))
             .collect();
-        Self { func, natural, windows }
+        Self {
+            func,
+            window_range: (options.min_window_size, options.max_window_size),
+            natural,
+            windows,
+        }
+    }
+
+    fn is_prepared_for(&self, options: &OverlapOptions) -> bool {
+        self.window_range == (options.min_window_size, options.max_window_size)
     }
 }
 
@@ -398,6 +409,10 @@ impl<'a> OverlapSource<'a> {
 /// [`OverlapSource`]).
 pub struct OverlapTarget<'a> {
     func: &'a IndexedFunction,
+    /// The `(min_window_size, max_window_size)` the buckets were built for.
+    window_range: (u32, u32),
+    /// The size tolerance the per-window buckets were built with.
+    size_tolerance: f64,
     /// Natural subtrees in `[min_window_size, max_window_size]` by hash,
     /// each list in sorted order.
     natural_by_hash: HashMap<u64, Vec<&'a SubtreeFingerprint>>,
@@ -420,7 +435,18 @@ impl<'a> OverlapTarget<'a> {
                 func.get_subtrees_in_size_range(size_min, size_max)
             })
             .collect();
-        Self { func, natural_by_hash, by_window }
+        Self {
+            func,
+            window_range: (options.min_window_size, options.max_window_size),
+            size_tolerance: options.size_tolerance,
+            natural_by_hash,
+            by_window,
+        }
+    }
+
+    fn is_prepared_for(&self, options: &OverlapOptions) -> bool {
+        self.window_range == (options.min_window_size, options.max_window_size)
+            && self.size_tolerance.to_bits() == options.size_tolerance.to_bits()
     }
 }
 
@@ -443,11 +469,31 @@ pub fn detect_partial_overlaps(
 
 /// [`detect_partial_overlaps`] over prepared sides, for scans that compare
 /// each function with many others.
+///
+/// A prepared side lays its windows and size buckets out by the window
+/// range and size tolerance it was built with. A side prepared for other
+/// options than `options` is prepared again for them first: read at the
+/// offsets of another range, its buckets would be the wrong ones, or end
+/// before the range does.
 pub fn detect_prepared_overlaps(
     source: &OverlapSource,
     target: &OverlapTarget,
     options: &OverlapOptions,
 ) -> Vec<PartialOverlap> {
+    if !source.is_prepared_for(options) {
+        return detect_prepared_overlaps(
+            &OverlapSource::new(source.func, options),
+            target,
+            options,
+        );
+    }
+    if !target.is_prepared_for(options) {
+        return detect_prepared_overlaps(
+            source,
+            &OverlapTarget::new(target.func, options),
+            options,
+        );
+    }
     let source_func = source.func;
     let target_func = target.func;
     let mut overlaps = Vec::new();

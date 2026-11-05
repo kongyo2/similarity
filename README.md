@@ -78,19 +78,23 @@ score as equal:
   `arr.at(-1)`, reordered independent `const` declarations
 - interfaces ⇔ structurally identical type aliases, reordered members,
   renamed-but-identically-typed property sets, `Array<T>` ⇔ `T[]`,
-  `x?: T` ⇔ `x: T | undefined`, reordered unions, renamed generic params
+  `x?: T` ⇔ `x: T | undefined`, reordered unions, renamed generic params,
+  `'a'` ⇔ `"a"` literal types
 - classes: reordered members, renamed private fields, renamed class type
   parameters (`ItemList<T> extends Collection<T>` ⇔ `EntryList<U> extends
-  Collection<U>`), constructor parameter properties ⇔ explicit field +
-  assignment, and fully renamed method names when the canonical method
-  bodies match
+  Collection<U>`, also when they are declared in another order and used
+  together, as in `T | U`), constructor parameter properties ⇔ explicit
+  field + assignment (a parameter stored as `this.x = x as T` is still
+  stored), and fully renamed method names when the canonical method bodies
+  match
 
 Every declaration form takes part: function declarations, arrow and
 function expressions bound to a variable (also when parenthesized or
 wrapped in `as`/`satisfies`; a named function expression keeps recursing
 through either of its names), the methods and function-valued properties of
 an object literal bound to a name or default-exported (`handlers.onSave`,
-nested objects included), `export default` classes and functions, class
+nested objects included; a named function expression there recurses
+through its own name), `export default` classes and functions, class
 methods and arrow-function class fields, constructors, and declarations
 inside `namespace`/`module` blocks, which are reported under their
 qualified name (`Legacy.Options`). Bodiless declarations — overload
@@ -113,31 +117,32 @@ stringify adjacent values (`` `${a}${b}` `` vs numeric `a + b`), and on the
 type side `Promise<ShopUser>` vs `Promise<ShopOrder>` payloads, `Map<K, V>`
 vs `Map<V, K>` swaps, index signatures vs concrete members,
 discriminated-union variants that differ in their `kind` literal or enum
-member (signed numbers and bigints included), differing `extends` heritage
-(type arguments included: `Box<string>` is not `Box<number>`), brand
-markers (`_fooBrand: any`), `typeof`/type-predicate members naming
-different things, qualified generic bases (`React.ComponentType<P>` vs
-`Preact.ComponentType<P>`), one- or two-member shapes whose only shared
-trait is a primitive, and aliases of a single atom (`type GLsizei =
-number`, `type SchemaVersion = "1"`), which pair only when they are also
-named alike — the same alias copied into two files. On the class side
-member annotations compare the way type mode compares them (literal unions,
-enum members, qualified and generic types keep their identity; renamed
-class type parameters do not count), a constructor that does real work
-counts as a member, constructors storing the same parameters into different
-fields (`this.x = y; this.y = x`) or `super(…)` slots differ, a static
-member is not its instance namesake, an optional member is not a required
-one, a different, qualified-vs-absent, or one-sided base class is a
-contract difference, an `implements` clause the other side lacks is one
-more difference, and a single shared field is not a duplicate class. Twins
-that differ **only in data literals** (a table name, a status code, a
-locale string) are reported — parameterizing them is the refactor.
+member (signed numbers, bigints and string literals containing quotes
+included), differing `extends` heritage (type arguments included:
+`Box<string>` is not `Box<number>`), brand markers (`_fooBrand: any`),
+`typeof`/type-predicate members naming different things, qualified generic
+bases (`React.ComponentType<P>` vs `Preact.ComponentType<P>`), one- or
+two-member shapes whose only shared trait is a primitive, and aliases of a
+single atom (`type GLsizei = number`, `type SchemaVersion = "1"` in either
+quote style), which pair only when they are also named alike — the same
+alias copied into two files. On the class side member annotations compare
+the way type mode compares them (literal unions, enum members, qualified
+and generic types keep their identity; renamed class type parameters do
+not count), a constructor that does real work counts as a member,
+constructors storing the same parameters into different fields
+(`this.x = y; this.y = x`) or `super(…)` slots differ, a static member is
+not its instance namesake, an optional member is not a required one, a
+different, qualified-vs-absent, or one-sided base class is a contract
+difference, an `implements` clause the other side lacks is one more
+difference, and a single shared field is not a duplicate class. Twins that
+differ **only in data literals** (a table name, a status code, a locale
+string) are reported — parameterizing them is the refactor.
 
 ## Accuracy
 
 Accuracy is tracked by a labeled benchmark (`bench/cases.ts` plus the
 extended corpora in `bench/cases/`) that mirrors the refactoring flow
-above: **325 ground-truth pairs** across functions, types, and classes —
+above: **335 ground-truth pairs** across functions, types, and classes —
 semantic duplicates a refactoring plan must see, and similarly-shaped
 lookalikes it must not flag — evaluated at the default threshold. The
 corpus covers whole-function renames, guard/negation/ternary spellings,
@@ -154,7 +159,10 @@ found on the fallow, tsrs and TypeScript repositories: sync/async API
 siblings, single-atom type aliases, qualified generic bases, class members
 whose annotations differ, renamed class type parameters, constructor
 wiring, static/instance and optional members, object-literal members and
-wrapped initializers.
+wrapped initializers — and, since 0.8.1, string literals that contain
+quotes or use single quotes, object members that recurse through their own
+name, class type parameters declared in another order, and constructors
+that narrow a parameter before storing it.
 
 | Engine | Corpus | Wrong labels | Error rate | Accuracy |
 | --- | --- | ---: | ---: | ---: |
@@ -166,7 +174,9 @@ wrapped initializers.
 | v0.6.0 | 300 pairs | 29 / 300 | 9.67% | 90.33% |
 | v0.7.0 | 300 pairs | 0 / 300 | 0.00% | 100.00% |
 | v0.7.0 | 325 pairs | 22 / 325 | 6.77% | 93.23% |
-| **v0.8.0** | **325 pairs** | **0 / 325** | **0.00%** | **100.00%** |
+| v0.8.0 | 325 pairs | 0 / 325 | 0.00% | 100.00% |
+| v0.8.0 | 335 pairs | 10 / 335 | 2.99% | 97.01% |
+| **v0.8.1** | **335 pairs** | **0 / 335** | **0.00%** | **100.00%** |
 
 v0.7.0 was audited against real code: run over the TypeScript compiler's
 API package, its VS Code extension, and 1,482 conformance test files, the
@@ -239,10 +249,11 @@ size-penalty layers documented above are this project's additions on top
 of that metric; the operation-weight sensitivity they exploit is the
 paper's RQ3 finding that TSED's penalty weights are influential and
 language-dependent. Following that finding, the weights are re-validated
-against the labeled corpus on every accuracy release: for 0.8.0 every
-setting in rename 0.2–0.5 × delete/insert 0.8–1.0 classifies all 325 pairs
+against the labeled corpus on every accuracy release: for 0.8.1 every
+setting in rename 0.2–0.5 × delete/insert 0.8–1.0 classifies all 335 pairs
 correctly (the closest call is XF-N36 at rename 0.2, 0.797 against the 0.8
-threshold, the same as on v0.7.0), so the calibrated defaults stand.
+threshold, the same as on v0.7.0 and v0.8.0), so the calibrated defaults
+stand.
 
 - Yewei Song, Cedric Lothritz, Daniel Tang, Tegawendé F. Bissyandé, and
   Jacques Klein. 2024. *Revisiting Code Similarity Evaluation with

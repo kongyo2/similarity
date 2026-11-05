@@ -68,7 +68,7 @@ jobs:
         run: cargo test --manifest-path native/Cargo.toml --workspace --locked
 
   # Builds the real WASM engine and runs the full vitest suite against it,
-  # including the labeled-corpus accuracy gate (325 pairs): every labeled
+  # including the labeled-corpus accuracy gate (335 pairs): every labeled
   # pair must classify correctly — any mislabel fails the suite.
   tests-and-accuracy:
     runs-on: ubuntu-latest
