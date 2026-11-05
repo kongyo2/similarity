@@ -1,0 +1,2 @@
+# Same style as upstream mizchi/similarity, which similarity-core-fork is forked from.
+use_small_heuristics = "Max"

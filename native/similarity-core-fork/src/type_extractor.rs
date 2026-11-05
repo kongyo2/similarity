@@ -363,8 +363,7 @@ impl TypeExtractor {
                             }
                         }
                         oxc_ast::ast::Declaration::TSTypeAliasDeclaration(type_alias) => {
-                            if let Some(type_def) = self.extract_type_alias(type_alias, qualifier)
-                            {
+                            if let Some(type_def) = self.extract_type_alias(type_alias, qualifier) {
                                 types.push(type_def);
                             }
                         }
@@ -437,7 +436,6 @@ impl TypeExtractor {
 
         Ok(type_literals)
     }
-
 
     /// Replace each generic parameter name with a positional `#N` token
     /// (whole identifiers only) in every property annotation, so two
@@ -715,8 +713,8 @@ impl TypeExtractor {
                             self.extract_type_string(&parameter.type_annotation.type_annotation)
                         },
                     );
-                    let value_type = self
-                        .extract_type_string(&index_sig.type_annotation.type_annotation);
+                    let value_type =
+                        self.extract_type_string(&index_sig.type_annotation.type_annotation);
                     properties.push(PropertyDefinition {
                         name: format!("[index: {key_type}]"),
                         type_annotation: value_type,
@@ -846,8 +844,11 @@ impl TypeExtractor {
                 // equal (they previously both rendered as just "Array").
                 match &type_ref.type_arguments {
                     Some(args) if !args.params.is_empty() => {
-                        let rendered: Vec<String> =
-                            args.params.iter().map(|param| self.extract_type_string(param)).collect();
+                        let rendered: Vec<String> = args
+                            .params
+                            .iter()
+                            .map(|param| self.extract_type_string(param))
+                            .collect();
                         format!("{base}<{}>", rendered.join(", "))
                     }
                     _ => base,
@@ -882,8 +883,7 @@ impl TypeExtractor {
                     oxc_ast::ast::TSTypeOperatorOperator::Readonly => {
                         // `readonly T[]` is the same runtime shape as
                         // `ReadonlyArray<T>`; canonicalize the spelling.
-                        format!("ReadonlyArray<{}>",
-                            operand.strip_suffix("[]").unwrap_or(&operand))
+                        format!("ReadonlyArray<{}>", operand.strip_suffix("[]").unwrap_or(&operand))
                     }
                     oxc_ast::ast::TSTypeOperatorOperator::Unique => format!("unique {operand}"),
                 }
@@ -997,9 +997,7 @@ impl TypeExtractor {
             .iter()
             .map(|heritage| {
                 let base = match &heritage.expression {
-                    oxc_ast::ast::Expression::Identifier(ident) => {
-                        ident.name.as_str().to_string()
-                    }
+                    oxc_ast::ast::Expression::Identifier(ident) => ident.name.as_str().to_string(),
                     other => {
                         let span = other.span();
                         let (start, end) = (span.start as usize, span.end as usize);
@@ -1012,8 +1010,11 @@ impl TypeExtractor {
                 };
                 let rendered = match &heritage.type_arguments {
                     Some(args) if !args.params.is_empty() => {
-                        let rendered: Vec<String> =
-                            args.params.iter().map(|param| self.extract_type_string(param)).collect();
+                        let rendered: Vec<String> = args
+                            .params
+                            .iter()
+                            .map(|param| self.extract_type_string(param))
+                            .collect();
                         format!("{base}<{}>", rendered.join(", "))
                     }
                     _ => base,
@@ -1119,10 +1120,7 @@ impl TypeExtractor {
                 if let Some(type_annotation) = &param.type_annotation {
                     if let Some(type_literal) = self.extract_type_literal_from_ts_type(
                         &type_annotation.type_annotation,
-                        TypeLiteralContext::FunctionParameter(
-                            func_name.clone(),
-                            param_name,
-                        ),
+                        TypeLiteralContext::FunctionParameter(func_name.clone(), param_name),
                     ) {
                         type_literals.push(type_literal);
                     }
@@ -1518,10 +1516,7 @@ export interface WithBare {
         let bare = types.iter().find(|t| t.name == "WithBare").unwrap();
         assert_eq!(qualified.properties[0].type_annotation, "React.FC");
         assert_eq!(bare.properties[0].type_annotation, "FC");
-        assert_ne!(
-            qualified.properties[0].type_annotation,
-            bare.properties[0].type_annotation
-        );
+        assert_ne!(qualified.properties[0].type_annotation, bare.properties[0].type_annotation);
     }
 
     #[test]
@@ -1533,10 +1528,8 @@ export type Box<T> = T[];
 export type Bag<U> = U[];
 ";
         let types = extract_types_from_code(code, "test.ts").unwrap();
-        let bodies: Vec<&str> = types
-            .iter()
-            .map(|t| t.properties[0].type_annotation.as_str())
-            .collect();
+        let bodies: Vec<&str> =
+            types.iter().map(|t| t.properties[0].type_annotation.as_str()).collect();
         assert_eq!(bodies.len(), 2);
         assert_eq!(bodies[0], bodies[1], "positional substitution must unify {bodies:?}");
         assert!(bodies[0].contains("#0"));

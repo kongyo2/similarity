@@ -169,11 +169,10 @@ fn calculate_structural_similarity(
         // named empties (the interface ⇔ alias cross-kind case) still
         // reach ~1.0, related names (EmptyA/EmptyB) stay above the
         // default threshold, unrelated names fall well below it.
-        let name_similarity =
-            crate::type_normalizer::calculate_property_similarity(
-                &type1.original_name,
-                &type2.original_name,
-            );
+        let name_similarity = crate::type_normalizer::calculate_property_similarity(
+            &type1.original_name,
+            &type2.original_name,
+        );
         return 0.6 + 0.4 * name_similarity;
     }
 
@@ -707,7 +706,11 @@ mod tests {
         let type3 = create_test_type("Empty", vec![]);
         let type4 = create_test_type("Empty", vec![]);
         let same = compare_types(&type3, &type4, &options);
-        assert!(same.similarity >= 0.9, "identical empty names must match, got {}", same.similarity);
+        assert!(
+            same.similarity >= 0.9,
+            "identical empty names must match, got {}",
+            same.similarity
+        );
     }
 
     #[test]
@@ -717,9 +720,11 @@ mod tests {
         fn members(names: [&str; 3]) -> Vec<(&str, &str, bool, bool)> {
             names.iter().map(|name| (*name, "string", false, false)).collect()
         }
-        let mut with_base = create_test_type("AuditEvent", members(["actorId", "action", "targetId"]));
+        let mut with_base =
+            create_test_type("AuditEvent", members(["actorId", "action", "targetId"]));
         with_base.extends = vec!["EventBase".to_string()];
-        let without_base = create_test_type("AuditRecord", members(["actorId", "action", "targetId"]));
+        let without_base =
+            create_test_type("AuditRecord", members(["actorId", "action", "targetId"]));
         let result = compare_types(&with_base, &without_base, &options);
         assert!(
             result.similarity < 0.8,
@@ -727,10 +732,15 @@ mod tests {
             result.similarity
         );
 
-        let mut same_base = create_test_type("ChargeEvent", members(["actorId", "action", "targetId"]));
+        let mut same_base =
+            create_test_type("ChargeEvent", members(["actorId", "action", "targetId"]));
         same_base.extends = vec!["EventBase".to_string()];
         let same = compare_types(&with_base, &same_base, &options);
-        assert!(same.similarity > 0.95, "shared heritage must not be penalized, got {}", same.similarity);
+        assert!(
+            same.similarity > 0.95,
+            "shared heritage must not be penalized, got {}",
+            same.similarity
+        );
     }
 
     #[test]
@@ -758,9 +768,11 @@ mod tests {
         }
         // The same alias declared twice (copied into two files), or a
         // case variant of its name, is still one declaration.
-        let copied = compare_types(&alias("UserId", "string"), &alias("UserId", "string"), &options);
+        let copied =
+            compare_types(&alias("UserId", "string"), &alias("UserId", "string"), &options);
         assert!(copied.similarity > 0.99, "got {}", copied.similarity);
-        let variant = compare_types(&alias("UserId", "string"), &alias("UserID", "string"), &options);
+        let variant =
+            compare_types(&alias("UserId", "string"), &alias("UserID", "string"), &options);
         assert!(variant.similarity >= 0.8, "got {}", variant.similarity);
         // Structured bodies are unaffected: literal unions and generic
         // instantiations still pair under unrelated names (T-P05, T-P09).
@@ -800,11 +812,29 @@ mod tests {
         );
         let twin = variant("ForInLoop", "SyntaxKind.ForInStatement");
         let same = compare_types(&for_in, &twin, &options);
-        assert!(same.similarity > 0.95, "same discriminant is a plain twin, got {}", same.similarity);
+        assert!(
+            same.similarity > 0.95,
+            "same discriminant is a plain twin, got {}",
+            same.similarity
+        );
 
         // String-literal discriminants behave the same way.
-        let click = create_test_type("ClickEvt", vec![("kind", "\"click\"", false, false), ("x", "number", false, false), ("y", "number", false, false)]);
-        let tap = create_test_type("TapEvt", vec![("kind", "\"tap\"", false, false), ("x", "number", false, false), ("y", "number", false, false)]);
+        let click = create_test_type(
+            "ClickEvt",
+            vec![
+                ("kind", "\"click\"", false, false),
+                ("x", "number", false, false),
+                ("y", "number", false, false),
+            ],
+        );
+        let tap = create_test_type(
+            "TapEvt",
+            vec![
+                ("kind", "\"tap\"", false, false),
+                ("x", "number", false, false),
+                ("y", "number", false, false),
+            ],
+        );
         let literal = compare_types(&click, &tap, &options);
         assert!(literal.similarity < 0.7, "got {}", literal.similarity);
     }

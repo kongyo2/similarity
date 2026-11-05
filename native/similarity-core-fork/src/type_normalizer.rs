@@ -180,8 +180,7 @@ pub fn normalize_type_name(type_name: &str) -> String {
     // Union arms: normalize each, sort, dedupe.
     let union_arms = split_top_level(trimmed, '|');
     if union_arms.len() > 1 {
-        let mut arms: Vec<String> =
-            union_arms.iter().map(|arm| normalize_type_name(arm)).collect();
+        let mut arms: Vec<String> = union_arms.iter().map(|arm| normalize_type_name(arm)).collect();
         arms.sort();
         arms.dedup();
         return arms.join(" | ");
@@ -221,7 +220,11 @@ pub fn normalize_type_name(type_name: &str) -> String {
                 }
             })
             .collect();
-        return format!("({}) => {}", normalized_params.join(", "), normalize_type_name(&return_type));
+        return format!(
+            "({}) => {}",
+            normalized_params.join(", "),
+            normalize_type_name(&return_type)
+        );
     }
 
     // `T[]` — normalize the element type, keep the suffix.
@@ -397,15 +400,13 @@ pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
     }
 
     // Handle union types specially
-    if split_top_level(&normalized1, '|').len() > 1
-        || split_top_level(&normalized2, '|').len() > 1
+    if split_top_level(&normalized1, '|').len() > 1 || split_top_level(&normalized2, '|').len() > 1
     {
         return calculate_union_type_similarity(&normalized1, &normalized2);
     }
 
     // Handle intersection types specially
-    if split_top_level(&normalized1, '&').len() > 1
-        || split_top_level(&normalized2, '&').len() > 1
+    if split_top_level(&normalized1, '&').len() > 1 || split_top_level(&normalized2, '&').len() > 1
     {
         return calculate_intersection_type_similarity(&normalized1, &normalized2);
     }
@@ -692,8 +693,8 @@ fn typeof_query_operand(type_name: &str) -> Option<&str> {
 fn type_predicate_target(type_name: &str) -> Option<&str> {
     let rest = type_name.strip_prefix("asserts ").unwrap_or(type_name);
     let (subject, target) = rest.split_once(" is ")?;
-    let subject_is_identifier = !subject.is_empty()
-        && subject.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+    let subject_is_identifier =
+        !subject.is_empty() && subject.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
     let target = target.trim();
     (subject_is_identifier && !target.is_empty()).then_some(target)
 }
@@ -867,9 +868,7 @@ pub fn find_property_matches(
 
     // Sort by overall similarity (descending), NaN-safe.
     matches.sort_by(|a, b| {
-        b.overall_similarity
-            .total_cmp(&a.overall_similarity)
-            .then_with(|| a.prop1.cmp(&b.prop1))
+        b.overall_similarity.total_cmp(&a.overall_similarity).then_with(|| a.prop1.cmp(&b.prop1))
     });
 
     matches
@@ -1018,28 +1017,16 @@ mod tests {
         // comparison (edit distance on the parenthesized strings scored
         // one-arm-different unions as a ~0.8 near-match).
         let similar = calculate_type_similarity("(User | Error)[]", "(Order | Error)[]");
-        assert!(
-            similar <= 0.3,
-            "one-arm-different union arrays must score low, got {similar}"
-        );
-        assert_eq!(
-            calculate_type_similarity("(User | Error)[]", "(Error | User)[]"),
-            1.0
-        );
+        assert!(similar <= 0.3, "one-arm-different union arrays must score low, got {similar}");
+        assert_eq!(calculate_type_similarity("(User | Error)[]", "(Error | User)[]"), 1.0);
     }
 
     #[test]
     fn permuted_generic_arguments_are_a_swapped_contract() {
         // Key/value swap admits (and returns) entirely different values.
-        assert_eq!(
-            calculate_type_similarity("Map<string, number>", "Map<number, string>"),
-            0.25
-        );
+        assert_eq!(calculate_type_similarity("Map<string, number>", "Map<number, string>"), 0.25);
         // Identical argument lists still compare as equal…
-        assert_eq!(
-            calculate_type_similarity("Map<string, number>", "Map<string, number>"),
-            1.0
-        );
+        assert_eq!(calculate_type_similarity("Map<string, number>", "Map<string, number>"), 1.0);
         // …and non-permutation argument differences keep the graded
         // same-container score.
         let graded = calculate_type_similarity("Map<string, number>", "Map<string, boolean>");
@@ -1050,7 +1037,8 @@ mod tests {
     fn index_signatures_never_pair_with_concrete_properties() {
         // XT-N12 shape: an open string-keyed map vs a single concrete
         // boolean member. The rename-tolerant phase must not unify them.
-        let flags = create_test_type("FeatureFlags", vec![("[index: string]", "boolean", false, false)]);
+        let flags =
+            create_test_type("FeatureFlags", vec![("[index: string]", "boolean", false, false)]);
         let toggle = create_test_type("FeatureToggle", vec![("enabled", "boolean", false, false)]);
         let options = NormalizationOptions::default();
         let matches = find_property_matches(
@@ -1061,7 +1049,8 @@ mod tests {
         assert!(matches.is_empty(), "index signature must not match a concrete property");
 
         // Two identically-keyed index signatures still match (phase 1).
-        let toggles = create_test_type("ToggleMap", vec![("[index: string]", "boolean", false, false)]);
+        let toggles =
+            create_test_type("ToggleMap", vec![("[index: string]", "boolean", false, false)]);
         let matches = find_property_matches(
             &normalize_type(&flags, &options),
             &normalize_type(&toggles, &options),
@@ -1144,7 +1133,8 @@ mod tests {
             1.0
         );
         // Same qualified container, different payloads: graded.
-        let payload = calculate_type_similarity("ts.NodeArray<Statement>", "ts.NodeArray<Expression>");
+        let payload =
+            calculate_type_similarity("ts.NodeArray<Statement>", "ts.NodeArray<Expression>");
         assert!((payload - 0.43).abs() < 1e-9, "got {payload}");
         // Qualified generics normalize their arguments like bare ones.
         assert_eq!(normalize_type_name("ns.Box<Array<string>>"), "ns.Box<string[]>");
@@ -1185,8 +1175,10 @@ mod tests {
         let options = NormalizationOptions::default();
         // One renamed property carries no evidence at all (XT-N16).
         let start = create_test_type("LSServerStart", vec![("version", "string", false, false)]);
-        let error =
-            create_test_type("LSConnectionError", vec![("resultingAction", "string", false, false)]);
+        let error = create_test_type(
+            "LSConnectionError",
+            vec![("resultingAction", "string", false, false)],
+        );
         let matches = find_property_matches(
             &normalize_type(&start, &options),
             &normalize_type(&error, &options),
@@ -1208,8 +1200,13 @@ mod tests {
             &normalize_type(&marker, &options),
             0.7,
         );
-        let renamed = matches.iter().find(|m| m.prop1 == "version").expect("version pairs with value");
-        assert!((renamed.overall_similarity - 0.475).abs() < 1e-9, "got {}", renamed.overall_similarity);
+        let renamed =
+            matches.iter().find(|m| m.prop1 == "version").expect("version pairs with value");
+        assert!(
+            (renamed.overall_similarity - 0.475).abs() < 1e-9,
+            "got {}",
+            renamed.overall_similarity
+        );
 
         // Three members: full rename credit (the XT-P04 skeleton).
         let address = create_test_type(

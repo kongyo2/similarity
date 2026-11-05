@@ -159,11 +159,8 @@ impl ClassExtractor {
                 };
                 match &new_expr.type_arguments {
                     Some(args) if !args.params.is_empty() => {
-                        let rendered: Vec<String> = args
-                            .params
-                            .iter()
-                            .map(|arg| self.types.render_type(arg))
-                            .collect();
+                        let rendered: Vec<String> =
+                            args.params.iter().map(|arg| self.types.render_type(arg)).collect();
                         normalize_type_name(&format!("{callee}<{}>", rendered.join(", ")))
                     }
                     _ => callee,
@@ -365,9 +362,8 @@ impl ClassExtractor {
                         // explicit field-plus-assignment spelling extract
                         // the same shape.
                         for param in &method.value.params.items {
-                            let is_property = param.accessibility.is_some()
-                                || param.readonly
-                                || param.r#override;
+                            let is_property =
+                                param.accessibility.is_some() || param.readonly || param.r#override;
                             if !is_property {
                                 continue;
                             }
@@ -647,9 +643,9 @@ impl ClassExtractor {
             // identically. Field names still matter for the property-set
             // comparison, so the signal isn't lost — it's just not
             // double-counted against the method bodies.
-            let this_member = matches!(node.value.as_str(),
-                "StaticMemberExpression" | "PrivateFieldExpression")
-                && node.children.first().is_some_and(|obj| obj.value == "ThisExpression");
+            let this_member =
+                matches!(node.value.as_str(), "StaticMemberExpression" | "PrivateFieldExpression")
+                    && node.children.first().is_some_and(|obj| obj.value == "ThisExpression");
             for (index, child) in node.children.iter().enumerate() {
                 if this_member
                     && index == 1
@@ -764,10 +760,7 @@ impl ClassExtractor {
     /// Fingerprint for an arrow-function class field, shaped exactly like
     /// [`Self::method_body_fingerprint`] so `handle = () => {…}` and
     /// `handle() {…}` with equal bodies hash identically.
-    fn arrow_body_fingerprint(
-        &self,
-        arrow: &oxc_ast::ast::ArrowFunctionExpression,
-    ) -> Option<u64> {
+    fn arrow_body_fingerprint(&self, arrow: &oxc_ast::ast::ArrowFunctionExpression) -> Option<u64> {
         let slice = |span: oxc_span::Span| -> Option<&str> {
             let start = span.start as usize;
             let end = span.end as usize;
@@ -806,9 +799,9 @@ impl ClassExtractor {
             node.label.hash(hasher);
             node.value.hash(hasher);
             node.children.len().hash(hasher);
-            let this_member = matches!(node.value.as_str(),
-                "StaticMemberExpression" | "PrivateFieldExpression")
-                && node.children.first().is_some_and(|obj| obj.value == "ThisExpression");
+            let this_member =
+                matches!(node.value.as_str(), "StaticMemberExpression" | "PrivateFieldExpression")
+                    && node.children.first().is_some_and(|obj| obj.value == "ThisExpression");
             for (index, child) in node.children.iter().enumerate() {
                 if this_member
                     && index == 1

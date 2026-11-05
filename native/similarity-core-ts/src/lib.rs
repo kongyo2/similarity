@@ -95,22 +95,14 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
     // Note: elapsed_ms is always set to 0 here because std::time::Instant is
     // unsupported on wasm32-unknown-unknown. The JavaScript caller measures
     // the wall-clock elapsed time and overwrites this field before returning.
-    let files: Vec<(String, String)> = input
-        .files
-        .iter()
-        .map(|f| (f.file_path.clone(), f.content.clone()))
-        .collect();
+    let files: Vec<(String, String)> =
+        input.files.iter().map(|f| (f.file_path.clone(), f.content.clone())).collect();
 
     let same_file_only = input.same_file_only.unwrap_or(false);
     let cross_file_only = input.cross_file_only.unwrap_or(false);
 
     let mut warnings = Vec::<AnalyzeWarning>::new();
-    let mut by_mode = ByMode {
-        functions: vec![],
-        types: vec![],
-        classes: vec![],
-        overlap: vec![],
-    };
+    let mut by_mode = ByMode { functions: vec![], types: vec![], classes: vec![], overlap: vec![] };
 
     let mut skipped_files: Vec<String> = Vec::new();
 
@@ -135,7 +127,8 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
         // Single unified scan: every function is extracted and parsed
         // exactly once regardless of scope (the previous split into a
         // cross-file pass plus per-file passes did all of that twice).
-        let (pairs, skipped) = find_similar_function_pairs(&files, input.threshold, &options, scope);
+        let (pairs, skipped) =
+            find_similar_function_pairs(&files, input.threshold, &options, scope);
         for (file_path, error) in skipped {
             warnings.push(AnalyzeWarning {
                 file_path: Some(file_path.clone()),
@@ -176,28 +169,23 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
     }
 
     if input.modes.iter().any(|m| m == "types") {
-        let mut all_types: Vec<_> = extract_types_from_files(&files)
-            .into_values()
-            .flatten()
-            .collect();
+        let mut all_types: Vec<_> =
+            extract_types_from_files(&files).into_values().flatten().collect();
 
         if input.include_type_literals.unwrap_or(false) {
-            all_types.extend(
-                extract_type_literals_from_files(&files)
-                    .into_values()
-                    .flatten()
-                    .map(|literal| similarity_core::TypeDefinition {
-                        name: literal.name,
-                        kind: TypeKind::TypeLiteral,
-                        properties: literal.properties,
-                        generics: vec![],
-                        extends: vec![],
-                        start_line: literal.start_line,
-                        end_line: literal.end_line,
-                        file_path: literal.file_path,
-                        has_ignore_directive: false,
-                    }),
-            );
+            all_types.extend(extract_type_literals_from_files(&files).into_values().flatten().map(
+                |literal| similarity_core::TypeDefinition {
+                    name: literal.name,
+                    kind: TypeKind::TypeLiteral,
+                    properties: literal.properties,
+                    generics: vec![],
+                    extends: vec![],
+                    start_line: literal.start_line,
+                    end_line: literal.end_line,
+                    file_path: literal.file_path,
+                    has_ignore_directive: false,
+                },
+            ));
         }
 
         // `extract_types_from_files` hands back a HashMap keyed by file, so
@@ -268,7 +256,6 @@ pub fn analyze_project(input: AnalyzeInput) -> AnalyzeOutput {
                 })),
             })
             .collect();
-
     }
 
     if input.modes.iter().any(|m| m == "classes") {

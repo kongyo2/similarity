@@ -103,15 +103,9 @@ pub fn calculate_tsed_with_threshold(
 /// threshold-based fast path.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-fn finalize_tsed_similarity(
-    distance: f64,
-    size1: f64,
-    size2: f64,
-    options: &TSEDOptions,
-) -> f64 {
+fn finalize_tsed_similarity(distance: f64, size1: f64, size2: f64, options: &TSEDOptions) -> f64 {
     let max_size = size1.max(size2);
-    let tsed_similarity =
-        if max_size > 0.0 { (1.0 - distance / max_size).max(0.0) } else { 1.0 };
+    let tsed_similarity = if max_size > 0.0 { (1.0 - distance / max_size).max(0.0) } else { 1.0 };
 
     let tsed_similarity = if distance == 0.0 && size1 != size2 {
         let size_ratio = size1.min(size2) / size1.max(size2);

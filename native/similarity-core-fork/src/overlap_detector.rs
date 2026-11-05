@@ -78,13 +78,9 @@ pub fn find_function_overlaps(
     let same_file = std::ptr::eq(source_code, target_code);
 
     let source_indexed = index_file_functions("source.ts", source_code);
-    let target_indexed = if same_file {
-        Vec::new()
-    } else {
-        index_file_functions("target.ts", target_code)
-    };
-    let target_view: &[IndexedFunction] =
-        if same_file { &source_indexed } else { &target_indexed };
+    let target_indexed =
+        if same_file { Vec::new() } else { index_file_functions("target.ts", target_code) };
+    let target_view: &[IndexedFunction] = if same_file { &source_indexed } else { &target_indexed };
 
     let mut all_overlaps = Vec::new();
     for (source_position, source_func) in source_indexed.iter().enumerate() {
@@ -122,10 +118,8 @@ pub fn find_overlaps_across_files(
     let mut files: Vec<(&String, &String)> = file_contents.iter().collect();
     files.sort_by_key(|(name, _)| name.as_str());
 
-    let indexed_per_file: Vec<Vec<IndexedFunction>> = files
-        .iter()
-        .map(|(name, source)| index_file_functions(name, source))
-        .collect();
+    let indexed_per_file: Vec<Vec<IndexedFunction>> =
+        files.iter().map(|(name, source)| index_file_functions(name, source)).collect();
 
     // The per-function halves of the pairwise comparison are prepared
     // once: target sides for every function up front (they only borrow
@@ -539,20 +533,35 @@ function validateOrder(order: Order): string[] {
         let mut files = HashMap::new();
         files.insert("a.ts".to_string(), file_a.to_string());
         files.insert("b.ts".to_string(), file_b.to_string());
-        let scanned: Vec<(u32, u32, u32, u32, String)> = find_overlaps_across_files(&files, &options)
-            .unwrap()
-            .into_iter()
-            .map(|o| {
-                let p = o.overlap;
-                (p.source_lines.0, p.source_lines.1, p.target_lines.0, p.target_lines.1, p.node_type)
-            })
-            .collect();
+        let scanned: Vec<(u32, u32, u32, u32, String)> =
+            find_overlaps_across_files(&files, &options)
+                .unwrap()
+                .into_iter()
+                .map(|o| {
+                    let p = o.overlap;
+                    (
+                        p.source_lines.0,
+                        p.source_lines.1,
+                        p.target_lines.0,
+                        p.target_lines.1,
+                        p.node_type,
+                    )
+                })
+                .collect();
         let left = index_file_functions("a.ts", file_a);
         let right = index_file_functions("b.ts", file_b);
         let pairwise: Vec<(u32, u32, u32, u32, String)> =
             detect_partial_overlaps(&left[0], &right[0], &options)
                 .into_iter()
-                .map(|p| (p.source_lines.0, p.source_lines.1, p.target_lines.0, p.target_lines.1, p.node_type))
+                .map(|p| {
+                    (
+                        p.source_lines.0,
+                        p.source_lines.1,
+                        p.target_lines.0,
+                        p.target_lines.1,
+                        p.node_type,
+                    )
+                })
                 .collect();
         assert!(!scanned.is_empty());
         assert_eq!(scanned, pairwise);
