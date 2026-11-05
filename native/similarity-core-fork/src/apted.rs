@@ -45,10 +45,7 @@ pub const DISTANCE_EXCEEDED: f64 = f64::MAX / 4.0;
 // stay outside this allow-list and end up paying the higher within-kind
 // rename cost.
 fn is_identifier_like_kind(value: &str) -> bool {
-    matches!(
-        value,
-        "Identifier" | "BindingIdentifier" | "PrivateIdentifier" | "Parameter"
-    )
+    matches!(value, "Identifier" | "BindingIdentifier" | "PrivateIdentifier" | "Parameter")
 }
 
 /// Built-in collection/utility member names whose identity IS the behavior
@@ -167,7 +164,6 @@ fn label_rename_cost(
         (options.rename_cost * 3.0).min(cross_kind_rename_cap(options))
     }
 }
-
 
 /// Maximum cost we allow a within-kind rename to charge.
 ///
@@ -322,8 +318,7 @@ fn subtree_distance(
     } else {
         let replace_cost =
             options.delete_cost * tree1.size(i) + options.insert_cost * tree2.size(j);
-        let rename_plus_cost =
-            rename_cost + children_alignment(tree1, tree2, options, memo, i, j);
+        let rename_plus_cost = rename_cost + children_alignment(tree1, tree2, options, memo, i, j);
         replace_cost.min(rename_plus_cost)
     };
 
@@ -445,10 +440,7 @@ pub fn compute_edit_distance_with_cutoff(
     // prunes the "similar size, unrelated content" pairs that the pure
     // size-gap bound cannot touch — the case where skipping the full
     // O(n1·n2) DP actually matters.
-    let cheapest_edit = options
-        .delete_cost
-        .min(options.insert_cost)
-        .min(options.rename_cost);
+    let cheapest_edit = options.delete_cost.min(options.insert_cost).min(options.rename_cost);
     if cheapest_edit > 0.0 {
         let mut labels: std::collections::HashMap<(&str, &str), i64> =
             std::collections::HashMap::with_capacity(flat1.len());
@@ -465,8 +457,7 @@ pub fn compute_edit_distance_with_cutoff(
             }
         }
         #[allow(clippy::cast_precision_loss)]
-        let histogram_bound =
-            (flat1.len().max(flat2.len()) - overlap) as f64 * cheapest_edit;
+        let histogram_bound = (flat1.len().max(flat2.len()) - overlap) as f64 * cheapest_edit;
         if histogram_bound > max_distance {
             return DISTANCE_EXCEEDED;
         }
@@ -498,12 +489,7 @@ mod tests {
     }
 
     fn unit_options() -> APTEDOptions {
-        APTEDOptions {
-            rename_cost: 1.0,
-            delete_cost: 1.0,
-            insert_cost: 1.0,
-            compare_values: false,
-        }
+        APTEDOptions { rename_cost: 1.0, delete_cost: 1.0, insert_cost: 1.0, compare_values: false }
     }
 
     #[test]
@@ -547,13 +533,21 @@ mod tests {
             "F",
             "K",
             0,
-            vec![leaf("a", "Identifier", 1), leaf("b", "Identifier", 2), leaf("c", "Identifier", 3)],
+            vec![
+                leaf("a", "Identifier", 1),
+                leaf("b", "Identifier", 2),
+                leaf("c", "Identifier", 3),
+            ],
         );
         let t2 = node(
             "F",
             "K",
             0,
-            vec![leaf("a", "Identifier", 1), leaf("x", "Identifier", 2), leaf("c", "Identifier", 3)],
+            vec![
+                leaf("a", "Identifier", 1),
+                leaf("x", "Identifier", 2),
+                leaf("c", "Identifier", 3),
+            ],
         );
         let options = unit_options();
         let exact = compute_edit_distance(&t1, &t2, &options);
@@ -563,12 +557,8 @@ mod tests {
 
     #[test]
     fn cutoff_flags_pairs_beyond_budget() {
-        let t1 = node(
-            "F",
-            "K",
-            0,
-            (1..=12).map(|i| leaf(&format!("a{i}"), "Identifier", i)).collect(),
-        );
+        let t1 =
+            node("F", "K", 0, (1..=12).map(|i| leaf(&format!("a{i}"), "Identifier", i)).collect());
         let t2 = node("G", "K", 0, vec![leaf("z", "Identifier", 1)]);
         let distance = compute_edit_distance_with_cutoff(&t1, &t2, &unit_options(), 1.0);
         assert!(distance >= DISTANCE_EXCEEDED);
@@ -578,18 +568,10 @@ mod tests {
     fn cutoff_prunes_same_size_unrelated_trees() {
         // Equal sizes defeat the size-gap bound; the label-histogram bound
         // must still flag the pair without running the full DP.
-        let t1 = node(
-            "F",
-            "K",
-            0,
-            (1..=12).map(|i| leaf(&format!("a{i}"), "Identifier", i)).collect(),
-        );
-        let t2 = node(
-            "F",
-            "K",
-            0,
-            (1..=12).map(|i| leaf(&format!("z{i}"), "Identifier", i)).collect(),
-        );
+        let t1 =
+            node("F", "K", 0, (1..=12).map(|i| leaf(&format!("a{i}"), "Identifier", i)).collect());
+        let t2 =
+            node("F", "K", 0, (1..=12).map(|i| leaf(&format!("z{i}"), "Identifier", i)).collect());
         let options = APTEDOptions { rename_cost: 0.3, compare_values: false, ..unit_options() };
         let distance = compute_edit_distance_with_cutoff(&t1, &t2, &options, 1.0);
         assert!(distance >= DISTANCE_EXCEEDED);

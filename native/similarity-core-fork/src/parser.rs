@@ -114,11 +114,8 @@ fn relabel_canonical_ordinals(root: &Rc<TreeNode>) -> Rc<TreeNode> {
             node.value.as_str(),
             "Identifier" | "BindingIdentifier" | "FunctionDeclaration" | "ClassDeclaration"
         );
-        let label = if relabel {
-            remap_label(&node.label, mapping, next)
-        } else {
-            node.label.clone()
-        };
+        let label =
+            if relabel { remap_label(&node.label, mapping, next) } else { node.label.clone() };
         let mut fresh = TreeNode::new(label, node.value.clone(), *ids);
         *ids += 1;
         fresh.source_span = node.source_span;
@@ -411,7 +408,10 @@ fn statement_to_tree_nodes(stmt: &Statement, id_counter: &mut usize) -> Vec<Rc<T
     nodes
 }
 
-fn statement_to_tree_nodes_unstamped(stmt: &Statement, id_counter: &mut usize) -> Vec<Rc<TreeNode>> {
+fn statement_to_tree_nodes_unstamped(
+    stmt: &Statement,
+    id_counter: &mut usize,
+) -> Vec<Rc<TreeNode>> {
     if canonicalize_enabled() {
         match stmt {
             Statement::ReturnStatement(ret_stmt) => {
@@ -558,8 +558,7 @@ fn match_then_call<'a, 'b>(expr: &'b Expression<'a>) -> Option<ThenCallParts<'a,
                 return None;
             }
             let body = if arrow.expression {
-                let Some(Statement::ExpressionStatement(expr_stmt)) =
-                    arrow.body.statements.first()
+                let Some(Statement::ExpressionStatement(expr_stmt)) = arrow.body.statements.first()
                 else {
                     return None;
                 };
@@ -574,10 +573,7 @@ fn match_then_call<'a, 'b>(expr: &'b Expression<'a>) -> Option<ThenCallParts<'a,
                 return None;
             }
             let body = func.body.as_ref()?;
-            (
-                func.params.items.first().map(|p| &p.pattern),
-                CallbackBody::Block(&body.statements),
-            )
+            (func.params.items.first().map(|p| &p.pattern), CallbackBody::Block(&body.statements))
         }
         _ => return None,
     };
@@ -589,9 +585,7 @@ fn match_then_call<'a, 'b>(expr: &'b Expression<'a>) -> Option<ThenCallParts<'a,
 /// switch cases, try clauses and labels, but not into nested functions,
 /// arrows or classes — their `return`s exit the nested scope, not this
 /// one.
-fn statements_contain_own_return<'a>(
-    statements: &oxc_allocator::Vec<'a, Statement<'a>>,
-) -> bool {
+fn statements_contain_own_return<'a>(statements: &oxc_allocator::Vec<'a, Statement<'a>>) -> bool {
     statements.iter().any(statement_contains_own_return)
 }
 
@@ -608,10 +602,9 @@ fn statement_contains_own_return(stmt: &Statement) -> bool {
         Statement::ForOfStatement(for_of) => statement_contains_own_return(&for_of.body),
         Statement::WhileStatement(while_stmt) => statement_contains_own_return(&while_stmt.body),
         Statement::DoWhileStatement(do_stmt) => statement_contains_own_return(&do_stmt.body),
-        Statement::SwitchStatement(switch_stmt) => switch_stmt
-            .cases
-            .iter()
-            .any(|case| statements_contain_own_return(&case.consequent)),
+        Statement::SwitchStatement(switch_stmt) => {
+            switch_stmt.cases.iter().any(|case| statements_contain_own_return(&case.consequent))
+        }
         Statement::TryStatement(try_stmt) => {
             statements_contain_own_return(&try_stmt.block.body)
                 || try_stmt
@@ -777,10 +770,7 @@ fn lower_ternary_chain(
 /// flattening) normalize to. Branch values recurse through
 /// [`canonical_return_nodes`], so nested ternaries flatten into
 /// successive guards.
-fn lower_return_ternary(
-    cond: &ConditionalExpression,
-    id_counter: &mut usize,
-) -> Vec<Rc<TreeNode>> {
+fn lower_return_ternary(cond: &ConditionalExpression, id_counter: &mut usize) -> Vec<Rc<TreeNode>> {
     let normalized = normalize_ternary(cond);
     let mut if_node = make_node("IfStatement", "IfStatement", id_counter);
     if let Some(test_node) = normalized.render_test(id_counter) {
@@ -848,9 +838,7 @@ fn lower_declaration_ternary(
         let consequent = strip_parentheses(&cond.consequent);
         let alternate = strip_parentheses(&cond.alternate);
         match classify_nullish_test(test) {
-            Some(NullishTest::IsNullish(subject))
-                if pure_expressions_equal(subject, alternate) =>
-            {
+            Some(NullishTest::IsNullish(subject)) if pure_expressions_equal(subject, alternate) => {
                 return None;
             }
             Some(NullishTest::NotNullish(subject))
@@ -861,8 +849,7 @@ fn lower_declaration_ternary(
             _ => {}
         }
         if is_side_effect_free(test)
-            && (pure_expressions_equal(test, consequent)
-                || pure_expressions_equal(test, alternate))
+            && (pure_expressions_equal(test, consequent) || pure_expressions_equal(test, alternate))
         {
             return None;
         }
@@ -915,8 +902,7 @@ fn lower_foreach_statement(expr: &Expression, id_counter: &mut usize) -> Option<
                 return None;
             };
             let body = if arrow.expression {
-                let Some(Statement::ExpressionStatement(expr_stmt)) =
-                    arrow.body.statements.first()
+                let Some(Statement::ExpressionStatement(expr_stmt)) = arrow.body.statements.first()
                 else {
                     return None;
                 };
@@ -980,7 +966,9 @@ fn is_switch_jump_statement(stmt: &Statement) -> bool {
 /// Case body minus the trailing unlabeled `break` (the switch's own exit,
 /// which has no analogue in an if-chain; labeled breaks target an outer
 /// statement and must stay).
-fn switch_case_statements<'a, 'b>(case: &'b oxc_ast::ast::SwitchCase<'a>) -> Vec<&'b Statement<'a>> {
+fn switch_case_statements<'a, 'b>(
+    case: &'b oxc_ast::ast::SwitchCase<'a>,
+) -> Vec<&'b Statement<'a>> {
     let mut statements: Vec<&Statement> = case.consequent.iter().collect();
     if let Some(Statement::BreakStatement(break_stmt)) = statements.last() {
         if break_stmt.label.is_none() {
@@ -1034,30 +1022,26 @@ fn lower_switch_statement(
         Rc::new(block)
     };
 
-    let guard_node = |case: &oxc_ast::ast::SwitchCase,
-                      test: &Expression,
-                      ids: &mut usize|
-     -> Rc<TreeNode> {
-        let mut if_node = make_node("IfStatement", "IfStatement", ids);
-        let mut equality = make_node("StrictEquality", "BinaryExpression", ids);
-        if let Some(disc) = expression_to_tree_node(&switch_stmt.discriminant, ids) {
-            equality.add_child(disc);
-        }
-        if let Some(test_node) = expression_to_tree_node(test, ids) {
-            equality.add_child(test_node);
-        }
-        if_node.add_child(Rc::new(equality));
-        if_node.add_child(case_body_block(case, ids));
-        Rc::new(if_node)
-    };
+    let guard_node =
+        |case: &oxc_ast::ast::SwitchCase, test: &Expression, ids: &mut usize| -> Rc<TreeNode> {
+            let mut if_node = make_node("IfStatement", "IfStatement", ids);
+            let mut equality = make_node("StrictEquality", "BinaryExpression", ids);
+            if let Some(disc) = expression_to_tree_node(&switch_stmt.discriminant, ids) {
+                equality.add_child(disc);
+            }
+            if let Some(test_node) = expression_to_tree_node(test, ids) {
+                equality.add_child(test_node);
+            }
+            if_node.add_child(Rc::new(equality));
+            if_node.add_child(case_body_block(case, ids));
+            Rc::new(if_node)
+        };
 
     // Whether a case body (after break-stripping) still always exits —
     // those cases become flat guards; break-terminated ones must keep the
     // else-chain so control flow past the switch stays represented.
     let case_flattens = |case: &oxc_ast::ast::SwitchCase| -> bool {
-        switch_case_statements(case)
-            .last()
-            .is_some_and(|stmt| statement_always_terminates(stmt))
+        switch_case_statements(case).last().is_some_and(|stmt| statement_always_terminates(stmt))
     };
 
     let mut nodes: Vec<Rc<TreeNode>> = Vec::new();
@@ -1153,9 +1137,10 @@ fn assignment_target_matches_expression(
 ) -> bool {
     use oxc_ast::ast::AssignmentTarget;
     match (target, strip_parentheses(expr)) {
-        (AssignmentTarget::AssignmentTargetIdentifier(ident), Expression::Identifier(expr_ident)) => {
-            ident.name == expr_ident.name
-        }
+        (
+            AssignmentTarget::AssignmentTargetIdentifier(ident),
+            Expression::Identifier(expr_ident),
+        ) => ident.name == expr_ident.name,
         (
             AssignmentTarget::StaticMemberExpression(member),
             Expression::StaticMemberExpression(expr_member),
@@ -1287,9 +1272,7 @@ fn pure_expressions_equal(a: &Expression, b: &Expression) -> bool {
 /// the undefined value.
 fn is_undefined_expr(expr: &Expression) -> bool {
     match strip_parentheses(expr) {
-        Expression::Identifier(ident) => {
-            ident.name == "undefined" && !is_locally_bound(ident.span)
-        }
+        Expression::Identifier(ident) => ident.name == "undefined" && !is_locally_bound(ident.span),
         Expression::UnaryExpression(unary) => {
             unary.operator == UnaryOperator::Void && is_side_effect_free(&unary.argument)
         }
@@ -1494,10 +1477,7 @@ fn equality_operand_order<'a, 'b>(
 /// wrappers from an expression consumed only for its truthiness (an
 /// `if`/`while`/`for`/ternary test). Value positions keep them — there
 /// `!!x` and `x` are different values.
-fn test_expression_to_tree_node(
-    expr: &Expression,
-    id_counter: &mut usize,
-) -> Option<Rc<TreeNode>> {
+fn test_expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<Rc<TreeNode>> {
     if !canonicalize_enabled() {
         return expression_to_tree_node(expr, id_counter);
     }
@@ -1615,9 +1595,7 @@ fn canonical_if_nodes(
     // simplified by `test_expression_to_tree_node`.
     if let Some(alt) = alternate {
         let negated_form = match test {
-            Expression::UnaryExpression(unary)
-                if unary.operator == UnaryOperator::LogicalNot =>
-            {
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
                 Some((strip_parentheses(&unary.argument), NegationStyle::Unwrapped))
             }
             Expression::BinaryExpression(bin)
@@ -1775,8 +1753,7 @@ fn lower_destructuring_declaration(
     let mut nodes = Vec::with_capacity(lowered.len());
     for (key, binding_label) in lowered {
         let mut decl = make_node(&kind_label, "VariableDeclaration", id_counter);
-        let mut declarator_node =
-            make_node("VariableDeclarator", "VariableDeclarator", id_counter);
+        let mut declarator_node = make_node("VariableDeclarator", "VariableDeclarator", id_counter);
         declarator_node.add_child(leaf(&binding_label, "BindingIdentifier", id_counter));
         let access: Rc<TreeNode> = match key {
             KeyAccess::Static(name) => {
@@ -2193,9 +2170,8 @@ fn inline_single_use_constants(nodes: &mut Vec<Rc<TreeNode>>, id_counter: &mut u
             index += 1;
             continue;
         }
-        let Some(use_offset) = nodes[index + 1..]
-            .iter()
-            .position(|stmt| count_identifier_uses(stmt, &label) > 0)
+        let Some(use_offset) =
+            nodes[index + 1..].iter().position(|stmt| count_identifier_uses(stmt, &label) > 0)
         else {
             index += 1;
             continue;
@@ -2226,8 +2202,13 @@ fn inline_single_use_constants(nodes: &mut Vec<Rc<TreeNode>>, id_counter: &mut u
 /// other, so declaration order between them is style, not behavior.
 fn node_is_reorderable_init(node: &TreeNode) -> bool {
     match node.value.as_str() {
-        "CallExpression" | "NewExpression" | "AwaitExpression" | "YieldExpression"
-        | "AssignmentExpression" | "UpdateExpression" | "TaggedTemplateExpression"
+        "CallExpression"
+        | "NewExpression"
+        | "AwaitExpression"
+        | "YieldExpression"
+        | "AssignmentExpression"
+        | "UpdateExpression"
+        | "TaggedTemplateExpression"
         | "ImportExpression" => false,
         _ => node.children.iter().all(|child| node_is_reorderable_init(child)),
     }
@@ -2326,9 +2307,7 @@ fn normalize_statement_nodes(nodes: &mut Vec<Rc<TreeNode>>, id_counter: &mut usi
     inline_single_use_constants(nodes, id_counter);
     let mut index = 0;
     while index + 1 < nodes.len() {
-        if let Some(replacement) =
-            rewrite_push_loop(&nodes[index], &nodes[index + 1], id_counter)
-        {
+        if let Some(replacement) = rewrite_push_loop(&nodes[index], &nodes[index + 1], id_counter) {
             nodes[index] = replacement;
             nodes.remove(index + 1);
         } else {
@@ -2397,8 +2376,7 @@ fn statement_to_tree_node(stmt: &Statement, id_counter: &mut usize) -> Option<Rc
                             return Some(lower_ternary_chain(
                                 cond,
                                 &mut |expr, ids| {
-                                    let target_node =
-                                        assignment_target_to_tree_node(target, ids);
+                                    let target_node = assignment_target_to_tree_node(target, ids);
                                     assignment_leaf_statement(target_node, expr, ids)
                                 },
                                 id_counter,
@@ -2598,9 +2576,7 @@ fn statement_to_tree_node(stmt: &Statement, id_counter: &mut usize) -> Option<Rc
                         catch_node.add_child(param_node);
                     }
                 }
-                if let Some(body_node) =
-                    block_statement_to_tree_node(&handler.body, id_counter)
-                {
+                if let Some(body_node) = block_statement_to_tree_node(&handler.body, id_counter) {
                     catch_node.add_child(body_node);
                 }
                 node.add_child(Rc::new(catch_node));
@@ -2616,8 +2592,7 @@ fn statement_to_tree_node(stmt: &Statement, id_counter: &mut usize) -> Option<Rc
         }
         Statement::SwitchStatement(switch_stmt) => {
             let mut node = make_node("SwitchStatement", "SwitchStatement", id_counter);
-            if let Some(disc_node) =
-                expression_to_tree_node(&switch_stmt.discriminant, id_counter)
+            if let Some(disc_node) = expression_to_tree_node(&switch_stmt.discriminant, id_counter)
             {
                 node.add_child(disc_node);
             }
@@ -2959,11 +2934,7 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
                 for (index, quasi) in tpl.quasis.iter().enumerate() {
                     let cooked: &str = quasi.value.cooked.as_deref().unwrap_or("");
                     if !cooked.is_empty() {
-                        operands.push(leaf(
-                            &format!("\"{cooked}\""),
-                            "StringLiteral",
-                            id_counter,
-                        ));
+                        operands.push(leaf(&format!("\"{cooked}\""), "StringLiteral", id_counter));
                     }
                     if let Some(inner_expr) = tpl.expressions.get(index) {
                         if let Some(child) = expression_to_tree_node(inner_expr, id_counter) {
@@ -3124,8 +3095,7 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
                         {
                             node.add_child(left_node);
                         }
-                        if let Some(right_node) =
-                            expression_to_tree_node(&binary.right, id_counter)
+                        if let Some(right_node) = expression_to_tree_node(&binary.right, id_counter)
                         {
                             node.add_child(right_node);
                         }
@@ -3161,9 +3131,7 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
                 // `void 0` (or `void x` for pure x) IS the undefined
                 // value; collapse onto the `undefined` identifier so both
                 // spellings compare as equal.
-                if unary.operator == UnaryOperator::Void
-                    && is_side_effect_free(&unary.argument)
-                {
+                if unary.operator == UnaryOperator::Void && is_side_effect_free(&unary.argument) {
                     return Some(leaf("undefined", "Identifier", id_counter));
                 }
             }
@@ -3183,7 +3151,9 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
             let label = format!("{:?}-{}", update.operator, prefix_marker);
             let mut node = TreeNode::new(label, "UpdateExpression".to_string(), *id_counter);
             *id_counter += 1;
-            if let Some(arg_node) = simple_assignment_target_to_tree_node(&update.argument, id_counter) {
+            if let Some(arg_node) =
+                simple_assignment_target_to_tree_node(&update.argument, id_counter)
+            {
                 node.add_child(arg_node);
             }
             Some(Rc::new(node))
@@ -3272,11 +3242,8 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
         }
         Expression::StaticMemberExpression(mem) => {
             let label = if mem.optional { "?." } else { "." };
-            let mut node = TreeNode::new(
-                label.to_string(),
-                "StaticMemberExpression".to_string(),
-                *id_counter,
-            );
+            let mut node =
+                TreeNode::new(label.to_string(), "StaticMemberExpression".to_string(), *id_counter);
             *id_counter += 1;
             if let Some(obj_node) = expression_to_tree_node(&mem.object, id_counter) {
                 node.add_child(obj_node);
@@ -3339,11 +3306,8 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
         }
         Expression::PrivateFieldExpression(mem) => {
             let label = if mem.optional { "?.#" } else { ".#" };
-            let mut node = TreeNode::new(
-                label.to_string(),
-                "PrivateFieldExpression".to_string(),
-                *id_counter,
-            );
+            let mut node =
+                TreeNode::new(label.to_string(), "PrivateFieldExpression".to_string(), *id_counter);
             *id_counter += 1;
             if let Some(obj_node) = expression_to_tree_node(&mem.object, id_counter) {
                 node.add_child(obj_node);
@@ -3409,7 +3373,8 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
             Some(Rc::new(node))
         }
         Expression::YieldExpression(yield_expr) => {
-            let label = if yield_expr.delegate { "YieldDelegateExpression" } else { "YieldExpression" };
+            let label =
+                if yield_expr.delegate { "YieldDelegateExpression" } else { "YieldExpression" };
             let mut node = make_node(label, "YieldExpression", id_counter);
             if let Some(arg) = &yield_expr.argument {
                 if let Some(arg_node) = expression_to_tree_node(arg, id_counter) {
@@ -3439,11 +3404,7 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
         Expression::ThisExpression(_) => Some(leaf("ThisExpression", "ThisExpression", id_counter)),
         Expression::Super(_) => Some(leaf("Super", "Super", id_counter)),
         Expression::MetaProperty(meta) => {
-            let label = format!(
-                "{}.{}",
-                meta.meta.name.as_str(),
-                meta.property.name.as_str()
-            );
+            let label = format!("{}.{}", meta.meta.name.as_str(), meta.property.name.as_str());
             Some(leaf(&label, "MetaProperty", id_counter))
         }
         Expression::ImportExpression(import_expr) => {
@@ -3465,8 +3426,7 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
             // Encode async/generator into the label so async vs sync arrow
             // functions don't collapse into the same node.
             let label = if arrow.r#async { "AsyncArrowFunction" } else { "ArrowFunction" };
-            let mut node =
-                make_node(label, "ArrowFunctionExpression", id_counter);
+            let mut node = make_node(label, "ArrowFunctionExpression", id_counter);
 
             for param in &arrow.params.items {
                 if let Some(param_node) = formal_parameter_to_tree_node(param, id_counter) {
@@ -3484,10 +3444,8 @@ fn expression_to_tree_node(expr: &Expression, id_counter: &mut usize) -> Option<
                         // body in the explicit block/return shape so both
                         // spellings (and nested callbacks in particular)
                         // produce identical trees.
-                        let mut block =
-                            make_node("BlockStatement", "BlockStatement", id_counter);
-                        for child in
-                            canonical_return_nodes(Some(&expr_stmt.expression), id_counter)
+                        let mut block = make_node("BlockStatement", "BlockStatement", id_counter);
+                        for child in canonical_return_nodes(Some(&expr_stmt.expression), id_counter)
                         {
                             block.add_child(child);
                         }
@@ -3560,9 +3518,7 @@ fn argument_to_tree_node(
             }
             Some(Rc::new(node))
         }
-        _ => arg
-            .as_expression()
-            .and_then(|expr| expression_to_tree_node(expr, id_counter)),
+        _ => arg.as_expression().and_then(|expr| expression_to_tree_node(expr, id_counter)),
     }
 }
 
@@ -3580,9 +3536,7 @@ fn array_element_to_tree_node(
             Some(Rc::new(node))
         }
         ArrayExpressionElement::Elision(_) => Some(leaf("Elision", "Elision", id_counter)),
-        _ => elem
-            .as_expression()
-            .and_then(|expr| expression_to_tree_node(expr, id_counter)),
+        _ => elem.as_expression().and_then(|expr| expression_to_tree_node(expr, id_counter)),
     }
 }
 
@@ -3615,24 +3569,15 @@ fn object_property_to_tree_node(
     }
 }
 
-fn property_key_to_tree_node(
-    key: &PropertyKey,
-    id_counter: &mut usize,
-) -> Option<Rc<TreeNode>> {
+fn property_key_to_tree_node(key: &PropertyKey, id_counter: &mut usize) -> Option<Rc<TreeNode>> {
     match key {
-        PropertyKey::StaticIdentifier(ident) => Some(leaf(
-            ident.name.as_str(),
-            "Identifier",
-            id_counter,
-        )),
-        PropertyKey::PrivateIdentifier(ident) => Some(leaf(
-            &format!("#{}", ident.name.as_str()),
-            "PrivateIdentifier",
-            id_counter,
-        )),
-        _ => key
-            .as_expression()
-            .and_then(|expr| expression_to_tree_node(expr, id_counter)),
+        PropertyKey::StaticIdentifier(ident) => {
+            Some(leaf(ident.name.as_str(), "Identifier", id_counter))
+        }
+        PropertyKey::PrivateIdentifier(ident) => {
+            Some(leaf(&format!("#{}", ident.name.as_str()), "PrivateIdentifier", id_counter))
+        }
+        _ => key.as_expression().and_then(|expr| expression_to_tree_node(expr, id_counter)),
     }
 }
 
@@ -3642,21 +3587,15 @@ fn assignment_target_to_tree_node(
 ) -> Option<Rc<TreeNode>> {
     use oxc_ast::ast::AssignmentTarget;
     match target {
-        AssignmentTarget::AssignmentTargetIdentifier(ident) => Some(leaf(
-            &identifier_label(ident.span, &ident.name),
-            "Identifier",
-            id_counter,
-        )),
-        AssignmentTarget::ArrayAssignmentTarget(_) => Some(leaf(
-            "ArrayAssignmentTarget",
-            "ArrayAssignmentTarget",
-            id_counter,
-        )),
-        AssignmentTarget::ObjectAssignmentTarget(_) => Some(leaf(
-            "ObjectAssignmentTarget",
-            "ObjectAssignmentTarget",
-            id_counter,
-        )),
+        AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+            Some(leaf(&identifier_label(ident.span, &ident.name), "Identifier", id_counter))
+        }
+        AssignmentTarget::ArrayAssignmentTarget(_) => {
+            Some(leaf("ArrayAssignmentTarget", "ArrayAssignmentTarget", id_counter))
+        }
+        AssignmentTarget::ObjectAssignmentTarget(_) => {
+            Some(leaf("ObjectAssignmentTarget", "ObjectAssignmentTarget", id_counter))
+        }
         AssignmentTarget::StaticMemberExpression(mem) => {
             let mut node = make_node(".", "StaticMemberExpression", id_counter);
             if let Some(obj_node) = expression_to_tree_node(&mem.object, id_counter) {
@@ -3697,11 +3636,9 @@ fn simple_assignment_target_to_tree_node(
 ) -> Option<Rc<TreeNode>> {
     use oxc_ast::ast::SimpleAssignmentTarget;
     match target {
-        SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => Some(leaf(
-            &identifier_label(ident.span, &ident.name),
-            "Identifier",
-            id_counter,
-        )),
+        SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
+            Some(leaf(&identifier_label(ident.span, &ident.name), "Identifier", id_counter))
+        }
         SimpleAssignmentTarget::StaticMemberExpression(mem) => {
             let mut node = make_node(".", "StaticMemberExpression", id_counter);
             if let Some(obj_node) = expression_to_tree_node(&mem.object, id_counter) {
@@ -3808,11 +3745,9 @@ fn binding_pattern_to_tree_node(
     id_counter: &mut usize,
 ) -> Option<Rc<TreeNode>> {
     match pattern {
-        BindingPattern::BindingIdentifier(ident) => Some(leaf(
-            &identifier_label(ident.span, &ident.name),
-            "BindingIdentifier",
-            id_counter,
-        )),
+        BindingPattern::BindingIdentifier(ident) => {
+            Some(leaf(&identifier_label(ident.span, &ident.name), "BindingIdentifier", id_counter))
+        }
         BindingPattern::ObjectPattern(obj) => {
             let mut node = make_node("ObjectPattern", "ObjectPattern", id_counter);
             for prop in &obj.properties {
@@ -3922,7 +3857,11 @@ fn constructor_body_to_tree_node(
         member.add_child(leaf(ident.name.as_str(), "Identifier", id_counter));
         let mut assign = make_node("Assign", "AssignmentExpression", id_counter);
         assign.add_child(Rc::new(member));
-        assign.add_child(leaf(&identifier_label(ident.span, &ident.name), "Identifier", id_counter));
+        assign.add_child(leaf(
+            &identifier_label(ident.span, &ident.name),
+            "Identifier",
+            id_counter,
+        ));
         let mut stmt = make_node("ExpressionStatement", "ExpressionStatement", id_counter);
         stmt.add_child(Rc::new(assign));
         synthesized.push(Rc::new(stmt));
@@ -3931,10 +3870,8 @@ fn constructor_body_to_tree_node(
     // top-level `super(…)` call, which (since TS 4.6) may be preceded by
     // statements that do not touch `this`; a constructor without one gets
     // them at the top.
-    let insert_at = statements
-        .iter()
-        .position(|stmt| node_is_super_call(stmt))
-        .map_or(0, |index| index + 1);
+    let insert_at =
+        statements.iter().position(|stmt| node_is_super_call(stmt)).map_or(0, |index| index + 1);
     statements.splice(insert_at..insert_at, synthesized);
     normalize_statement_nodes(&mut statements, id_counter);
     for child in statements {
@@ -4062,8 +3999,8 @@ fn class_element_to_tree_node(
 #[cfg(test)]
 mod canonicalization_tests {
     use super::*;
-    use crate::apted::APTEDOptions;
     use crate::apted::compute_edit_distance;
+    use crate::apted::APTEDOptions;
 
     fn canonical_tree(source: &str) -> Rc<TreeNode> {
         parse_and_convert_to_tree_canonical("test.ts", source).expect("source must parse")

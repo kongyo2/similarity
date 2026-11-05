@@ -434,11 +434,7 @@ fn extract_variable_functions(var_decl: &VariableDeclaration, ctx: &mut Extracti
 /// reported under the binding (`handlers.onSave`,
 /// `table[SyntaxKind.Block]`); an object passed as an argument or returned
 /// from a function stays part of the function that builds it.
-fn extract_object_members(
-    object: &ObjectExpression,
-    qualifier: &str,
-    ctx: &mut ExtractionContext,
-) {
+fn extract_object_members(object: &ObjectExpression, qualifier: &str, ctx: &mut ExtractionContext) {
     for property in &object.properties {
         let ObjectPropertyKind::ObjectProperty(prop) = property else {
             continue;
@@ -681,7 +677,6 @@ fn extract_from_function_body(body: &FunctionBody, ctx: &mut ExtractionContext) 
     }
 }
 
-
 /// Compare similarity between two functions
 pub fn compare_functions(
     func1: &FunctionDefinition,
@@ -916,7 +911,10 @@ fn is_promise_annotation(annotation: Option<&TSTypeAnnotation>) -> bool {
 fn is_function_like_node(value: &str) -> bool {
     matches!(
         value,
-        "FunctionDeclaration" | "FunctionExpression" | "ArrowFunctionExpression" | "MethodDefinition"
+        "FunctionDeclaration"
+            | "FunctionExpression"
+            | "ArrowFunctionExpression"
+            | "MethodDefinition"
     )
 }
 
@@ -1025,7 +1023,12 @@ struct AtomDifference {
 fn boundary_builtin(name: &str) -> bool {
     matches!(
         name,
-        "at" | "slice" | "splice" | "charAt" | "charCodeAt" | "codePointAt" | "substring"
+        "at" | "slice"
+            | "splice"
+            | "charAt"
+            | "charCodeAt"
+            | "codePointAt"
+            | "substring"
             | "substr"
     )
 }
@@ -1073,12 +1076,17 @@ fn collect_behavioral_atoms_inner(
     string_literal_locals: &std::collections::HashSet<String>,
 ) {
     let is_value_atom = match node.value.as_str() {
-        "Identifier" | "BindingIdentifier" | "PrivateIdentifier" => {
-            !node.label.starts_with('§')
-        }
-        "BinaryExpression" | "LogicalExpression" | "UnaryExpression" | "UpdateExpression"
-        | "AssignmentExpression" | "RegExpLiteral" | "StaticMemberExpression"
-        | "ComputedMemberExpression" | "PrivateFieldExpression" | "CallExpression"
+        "Identifier" | "BindingIdentifier" | "PrivateIdentifier" => !node.label.starts_with('§'),
+        "BinaryExpression"
+        | "LogicalExpression"
+        | "UnaryExpression"
+        | "UpdateExpression"
+        | "AssignmentExpression"
+        | "RegExpLiteral"
+        | "StaticMemberExpression"
+        | "ComputedMemberExpression"
+        | "PrivateFieldExpression"
+        | "CallExpression"
         | "NullLiteral" => true,
         _ => false,
     };
@@ -1275,10 +1283,9 @@ fn collect_fold_direction_atoms(
     // concatenation from the expression itself; a target declared with a
     // string-literal initializer (`let trail = "";`) proves it from the
     // declaration. Either way the fold direction is behavioral.
-    let target_is_string_local = matches!(
-        target.value.as_str(),
-        "Identifier" | "BindingIdentifier"
-    ) && string_literal_locals.contains(&target.label);
+    let target_is_string_local =
+        matches!(target.value.as_str(), "Identifier" | "BindingIdentifier")
+            && string_literal_locals.contains(&target.label);
     let chain = &node.children[1];
     let mut leaves = Vec::new();
     if node.label == "Addition" {
@@ -1343,10 +1350,7 @@ fn behavioral_atom_difference(
             + synthetic_missing(&atoms1.synthetic_atoms, &atoms2.synthetic_atoms),
         missing_in_left: atoms2.value_atoms.difference(&atoms1.value_atoms).count()
             + synthetic_missing(&atoms2.synthetic_atoms, &atoms1.synthetic_atoms),
-        control: atoms1
-            .control_atoms
-            .symmetric_difference(&atoms2.control_atoms)
-            .count(),
+        control: atoms1.control_atoms.symmetric_difference(&atoms2.control_atoms).count(),
     }
 }
 
@@ -1563,10 +1567,7 @@ fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> String 
             } else {
                 func.display_name.clone()
             };
-            format!(
-                "class __C__ {{ {}{}{} {} }}",
-                prefix, method_name_text, params_text, body_text
-            )
+            format!("class __C__ {{ {}{}{} {} }}", prefix, method_name_text, params_text, body_text)
         }
         FunctionType::Function | FunctionType::Arrow => {
             // Carry async / generator flags through the wrapper so two
@@ -1867,9 +1868,7 @@ pub fn find_similar_function_pairs(
 
     // Sort by impact (descending), then by similarity (descending).
     similar_pairs.sort_by(|a, b| {
-        b.1.impact
-            .cmp(&a.1.impact)
-            .then(b.1.similarity.total_cmp(&a.1.similarity))
+        b.1.impact.cmp(&a.1.impact).then(b.1.similarity.total_cmp(&a.1.similarity))
     });
 
     (similar_pairs, skipped)
@@ -1966,7 +1965,6 @@ mod tests {
         let constructor = functions.iter().find(|f| f.name == "constructor").unwrap();
         assert_eq!(constructor.function_type, FunctionType::Constructor);
         assert_eq!(constructor.class_name, Some("Calculator".to_string()));
-
     }
 
     #[test]
@@ -1980,9 +1978,7 @@ mod tests {
                 return 42;
             }
         ";
-        let mut options = TSEDOptions::default();
-        options.min_lines = 1;
-        options.size_penalty = false;
+        let mut options = TSEDOptions { min_lines: 1, size_penalty: false, ..Default::default() };
 
         // Without a token gate the identical pair is reported…
         let (pairs, _) = find_similar_function_pairs(
@@ -2372,11 +2368,7 @@ export function copyQueue(tasks: string[]): string[] {
 ";
         let options = TSEDOptions::default();
         let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(
-            pairs.len(),
-            1,
-            "slice() vs slice(0) twins must stay reportable duplicates"
-        );
+        assert_eq!(pairs.len(), 1, "slice() vs slice(0) twins must stay reportable duplicates");
     }
 
     #[test]
@@ -2431,11 +2423,7 @@ export function headJob(tasks: string[], traceId: string): string {
 "#;
         let options = TSEDOptions::default();
         let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(
-            pairs.len(),
-            1,
-            "at(0) vs at(0, ignored) twins must stay reportable duplicates"
-        );
+        assert_eq!(pairs.len(), 1, "at(0) vs at(0, ignored) twins must stay reportable duplicates");
     }
 
     #[test]
@@ -2585,11 +2573,7 @@ export function gluePath(parts: string[]): string {
 "#;
         let options = TSEDOptions::default();
         let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(
-            pairs.len(),
-            1,
-            "same-direction folds must still report as duplicates"
-        );
+        assert_eq!(pairs.len(), 1, "same-direction folds must still report as duplicates");
     }
 
     #[test]
@@ -2779,7 +2763,8 @@ export class TapRelay {
             "function __f_default(line: string) {\n    return line.trim();\n}"
         );
         let arrows =
-            extract_functions("test.ts", "export default (line: string) => line.trim();\n").unwrap();
+            extract_functions("test.ts", "export default (line: string) => line.trim();\n")
+                .unwrap();
         assert_eq!(arrows[0].name, "default");
         assert!(arrows[0].is_arrow_expression);
     }

@@ -1,0 +1,3 @@
+[workspace]
+members = ["similarity-core-fork", "similarity-core-ts", "similarity-wasm"]
+resolver = "2"

@@ -248,7 +248,11 @@ fn normalized_signature_overlap(sig1: &str, sig2: &str) -> f64 {
     }
     let intersection = tokens1.intersection(&tokens2).count();
     let union = tokens1.union(&tokens2).count();
-    if union == 0 { 0.0 } else { intersection as f64 / union as f64 }
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
 }
 
 pub fn compare_classes(
@@ -539,7 +543,8 @@ fn calculate_structural_similarity(
             let name_sim = calculate_name_similarity(&prop1.name, &prop2.name);
             // Same runtime-surface and optionality rules as the strict
             // pass: a static field is not a rename of an instance field.
-            let score = (0.8 * type_match + 0.2 * name_sim) * property_modifier_factor(prop1, prop2);
+            let score =
+                (0.8 * type_match + 0.2 * name_sim) * property_modifier_factor(prop1, prop2);
             if best_match.is_none_or(|(_, b)| score > b) {
                 best_match = Some((name2, score));
             }
@@ -712,11 +717,8 @@ fn calculate_structural_similarity(
     // else would notice. A miswired parameter is wired on both sides, both
     // entries disagree, and it counts like a member present on both sides
     // with nothing matching: two unmatched elements.
-    let miswired = wiring_mismatches(
-        &class1.constructor_wiring,
-        &class2.constructor_wiring,
-        &field_pairing,
-    );
+    let miswired =
+        wiring_mismatches(&class1.constructor_wiring, &class2.constructor_wiring, &field_pairing);
 
     // Calculate overall structural similarity. Each side counts once, so
     // a "complete match" pair contributes 2 to the score and 2 to the
@@ -796,9 +798,8 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     for i in 1..=len1 {
         for j in 1..=len2 {
             let cost = usize::from(chars1[i - 1] != chars2[j - 1]);
-            matrix[i][j] = (matrix[i - 1][j] + 1)
-                .min(matrix[i][j - 1] + 1)
-                .min(matrix[i - 1][j - 1] + cost);
+            matrix[i][j] =
+                (matrix[i - 1][j] + 1).min(matrix[i][j - 1] + 1).min(matrix[i - 1][j - 1] + cost);
         }
     }
 
@@ -1277,7 +1278,11 @@ export class Beta<U> extends Base<U> {
 }
 ",
         );
-        assert!((result.structural_similarity - 1.0).abs() < 1e-9, "got {}", result.structural_similarity);
+        assert!(
+            (result.structural_similarity - 1.0).abs() < 1e-9,
+            "got {}",
+            result.structural_similarity
+        );
         // A concrete instantiation is still a different base.
         let concrete = compare_sources(
             "export class A extends Base<string> { add(item: string): void { this.items.push(item); } all(): string[] { return [...this.items]; } }",
@@ -1316,7 +1321,11 @@ export class PointC {
         assert!(compare_sources(swapped, straight).similarity < 0.8);
         assert!(compare_sources(swapped, shorthand).similarity < 0.8);
         let same = compare_sources(straight, shorthand);
-        assert!((same.structural_similarity - 1.0).abs() < 1e-9, "got {}", same.structural_similarity);
+        assert!(
+            (same.structural_similarity - 1.0).abs() < 1e-9,
+            "got {}",
+            same.structural_similarity
+        );
 
         // Forwarding to `super` in a different order is miswiring too.
         let forward = compare_sources(
@@ -1331,7 +1340,11 @@ export class PointC {
             "export class Pair { a: string; b: string; constructor(a: string, b: string) { this.a = a; this.b = b; } join(): string { return this.a + this.b; } }",
             "export class Triple { a: string; b: string; c: string; constructor(a: string, b: string, c: string) { this.a = a; this.b = b; this.c = c; } join(): string { return this.a + this.b; } }",
         );
-        assert!((extended.structural_similarity - 6.0 / 7.0).abs() < 1e-9, "got {}", extended.structural_similarity);
+        assert!(
+            (extended.structural_similarity - 6.0 / 7.0).abs() < 1e-9,
+            "got {}",
+            extended.structural_similarity
+        );
     }
 
     #[test]

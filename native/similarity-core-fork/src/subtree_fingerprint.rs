@@ -136,8 +136,12 @@ impl IndexedFunction {
         // HashMap iteration order is nondeterministic; sort so reported
         // overlaps (and which duplicate survives dedup) are stable.
         subtrees.sort_by(|a, b| {
-            (a.start_line, a.end_line, a.weight, a.hash)
-                .cmp(&(b.start_line, b.end_line, b.weight, b.hash))
+            (a.start_line, a.end_line, a.weight, a.hash).cmp(&(
+                b.start_line,
+                b.end_line,
+                b.weight,
+                b.hash,
+            ))
         });
         subtrees
     }
@@ -258,8 +262,7 @@ fn generate_subtree_fingerprints_inner(
     let mut child_hashes = Vec::new();
     let mut total_weight = 1u32; // Current node counts as 1
 
-    let effective_span =
-        if node.source_span.1 > 0 { node.source_span } else { fallback_span };
+    let effective_span = if node.source_span.1 > 0 { node.source_span } else { fallback_span };
 
     // Hash the node type/label
     node.label.hash(&mut hasher);
@@ -382,7 +385,8 @@ pub struct OverlapSource<'a> {
 impl<'a> OverlapSource<'a> {
     #[must_use]
     pub fn new(func: &'a IndexedFunction, options: &OverlapOptions) -> Self {
-        let natural = func.get_subtrees_in_size_range(options.min_window_size, options.max_window_size);
+        let natural =
+            func.get_subtrees_in_size_range(options.min_window_size, options.max_window_size);
         let windows = (options.min_window_size..=options.max_window_size)
             .map(|window_size| create_sliding_windows(func, window_size))
             .collect();
@@ -405,7 +409,8 @@ impl<'a> OverlapTarget<'a> {
     #[must_use]
     pub fn new(func: &'a IndexedFunction, options: &OverlapOptions) -> Self {
         let mut natural_by_hash: HashMap<u64, Vec<&SubtreeFingerprint>> = HashMap::new();
-        for fp in func.get_subtrees_in_size_range(options.min_window_size, options.max_window_size) {
+        for fp in func.get_subtrees_in_size_range(options.min_window_size, options.max_window_size)
+        {
             natural_by_hash.entry(fp.hash).or_default().push(fp);
         }
         let by_window = (options.min_window_size..=options.max_window_size)
@@ -487,9 +492,7 @@ pub fn detect_prepared_overlaps(
     let mut distinct_match_hashes: std::collections::HashSet<u64> =
         std::collections::HashSet::new();
     for src in source_natural {
-        if src.weight >= options.min_window_size
-            && target_natural_by_hash.contains_key(&src.hash)
-        {
+        if src.weight >= options.min_window_size && target_natural_by_hash.contains_key(&src.hash) {
             distinct_match_hashes.insert(src.hash);
         }
     }
@@ -605,8 +608,7 @@ pub fn detect_prepared_overlaps(
                             let target_total = target_func.root_fingerprint.weight.max(1);
                             let smaller_total = source_total.min(target_total);
                             if smaller_total >= 30 {
-                                let coverage =
-                                    source_window.weight as f64 / smaller_total as f64;
+                                let coverage = source_window.weight as f64 / smaller_total as f64;
                                 if coverage < 0.25 {
                                     continue;
                                 }
@@ -756,13 +758,8 @@ mod tests {
             depth: 0,
         };
 
-        let mut indexed = IndexedFunction::new(
-            "testFunc".to_string(),
-            "test.ts".to_string(),
-            1,
-            50,
-            root_fp,
-        );
+        let mut indexed =
+            IndexedFunction::new("testFunc".to_string(), "test.ts".to_string(), 1, 50, root_fp);
 
         indexed.add_subtree(SubtreeFingerprint {
             weight: 10,
