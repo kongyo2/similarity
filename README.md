@@ -103,8 +103,10 @@ there is no code behind them.
 
 Rewrites that change behavior keep their distinct shapes on purpose:
 swapped builtins (`.map` vs `.filter`, `Math.max` vs `Math.min`), a
-different free callee (`sendEmail` vs `sendSms`), flipped operators (`*` vs
-`/`, `&&` vs `||`, `<` vs `<=`), `??` vs `||`, `x == null` vs `x === null`,
+different free callee (`sendEmail` vs `sendSms`; a method's key binds
+nothing in its body, so `debug(…)` inside a `debug()` method calls the
+outer `debug`), flipped operators (`*` vs `/`, `&&` vs `||`, `<` vs `<=`),
+`??` vs `||`, `x == null` vs `x === null`,
 optional chaining vs plain access, `for-of` vs `for-in`, an added `break`,
 reordered statements that share data, `async` vs sync and generator vs
 plain contracts (a sync twin is the same code only when it visibly returns
@@ -142,7 +144,7 @@ string) are reported — parameterizing them is the refactor.
 
 Accuracy is tracked by a labeled benchmark (`bench/cases.ts` plus the
 extended corpora in `bench/cases/`) that mirrors the refactoring flow
-above: **335 ground-truth pairs** across functions, types, and classes —
+above: **337 ground-truth pairs** across functions, types, and classes —
 semantic duplicates a refactoring plan must see, and similarly-shaped
 lookalikes it must not flag — evaluated at the default threshold. The
 corpus covers whole-function renames, guard/negation/ternary spellings,
@@ -161,8 +163,9 @@ whose annotations differ, renamed class type parameters, constructor
 wiring, static/instance and optional members, object-literal members and
 wrapped initializers — and, since 0.8.1, string literals that contain
 quotes or use single quotes, object members that recurse through their own
-name, class type parameters declared in another order, and constructors
-that narrow a parameter before storing it.
+name, methods that delegate to a helper named like themselves, class type
+parameters declared in another order, and constructors that narrow a
+parameter before storing it.
 
 | Engine | Corpus | Wrong labels | Error rate | Accuracy |
 | --- | --- | ---: | ---: | ---: |
@@ -175,8 +178,8 @@ that narrow a parameter before storing it.
 | v0.7.0 | 300 pairs | 0 / 300 | 0.00% | 100.00% |
 | v0.7.0 | 325 pairs | 22 / 325 | 6.77% | 93.23% |
 | v0.8.0 | 325 pairs | 0 / 325 | 0.00% | 100.00% |
-| v0.8.0 | 335 pairs | 10 / 335 | 2.99% | 97.01% |
-| **v0.8.1** | **335 pairs** | **0 / 335** | **0.00%** | **100.00%** |
+| v0.8.0 | 337 pairs | 12 / 337 | 3.56% | 96.44% |
+| **v0.8.1** | **337 pairs** | **0 / 337** | **0.00%** | **100.00%** |
 
 v0.7.0 was audited against real code: run over the TypeScript compiler's
 API package, its VS Code extension, and 1,482 conformance test files, the
@@ -250,7 +253,7 @@ of that metric; the operation-weight sensitivity they exploit is the
 paper's RQ3 finding that TSED's penalty weights are influential and
 language-dependent. Following that finding, the weights are re-validated
 against the labeled corpus on every accuracy release: for 0.8.1 every
-setting in rename 0.2–0.5 × delete/insert 0.8–1.0 classifies all 335 pairs
+setting in rename 0.2–0.5 × delete/insert 0.8–1.0 classifies all 337 pairs
 correctly (the closest call is XF-N36 at rename 0.2, 0.797 against the 0.8
 threshold, the same as on v0.7.0 and v0.8.0), so the calibrated defaults
 stand.

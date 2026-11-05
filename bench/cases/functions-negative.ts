@@ -1327,4 +1327,74 @@ export function isTupleType(type: Type): type is TupleTypeReference {
     },
     forbidPairs: [["isTupleType", "isTupleType"]],
   },
+
+  // -------------------------------------------------------------------
+  // 0.8.1 — methods delegating to a helper named like themselves. A
+  // member key binds nothing inside the body, so `debug(…)` in a `debug`
+  // method calls the outer `debug`, and two facades over different sinks
+  // call different functions
+  // -------------------------------------------------------------------
+  {
+    id: "XF-N45",
+    mode: "functions",
+    category: "free-callee",
+    description:
+      "A logging facade object whose debug and info methods format the same way but hand the line to different sinks, each imported under the method's name",
+    files: {
+      "logger.ts": `
+import { debug, info } from "./sink";
+
+export const logger = {
+  debug(message: string, ...args: unknown[]): void {
+    if (!settings.enabled) {
+      return;
+    }
+    const line = format(message, args);
+    debug(\`\${settings.prefix} \${line}\`);
+  },
+  info(message: string, ...args: unknown[]): void {
+    if (!settings.enabled) {
+      return;
+    }
+    const line = format(message, args);
+    info(\`\${settings.prefix} \${line}\`);
+  },
+};
+`,
+    },
+    forbidPairs: [["logger.debug", "logger.info"]],
+  },
+  {
+    id: "XF-N46",
+    mode: "functions",
+    category: "free-callee",
+    description:
+      "A console channel class whose warn and error methods guard, prefix and count alike but write through different sinks, each imported under the method's name",
+    files: {
+      "channel.ts": `
+import { error, warn } from "./console-sink";
+
+export class ConsoleChannel {
+  warn(message: string, detail?: string): void {
+    if (this.muted) {
+      return;
+    }
+    const text = detail ? message + ": " + detail : message;
+    warn(this.prefix + text);
+    this.count += 1;
+  }
+
+  error(message: string, detail?: string): void {
+    if (this.muted) {
+      return;
+    }
+    const text = detail ? message + ": " + detail : message;
+    error(this.prefix + text);
+    this.count += 1;
+  }
+}
+`,
+    },
+    forbidPairs: [["warn", "error"]],
+  },
 ];
