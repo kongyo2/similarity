@@ -1,5 +1,4 @@
 use crate::tree::TreeNode;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
@@ -35,6 +34,12 @@ impl Default for APTEDOptions {
 /// failed. Above this size the lists are aligned along the children they
 /// share instead (see [`Alignment::align_wide`]).
 const EXACT_ALIGNMENT_CELLS: usize = 1 << 20;
+
+/// Most children two long lists may differ by — inserted plus deleted —
+/// for the children they share to be looked for (see
+/// [`common_subsequence`]). The search takes time and memory that grow
+/// with this number; lists further apart than this are not alike.
+const MAX_LIST_EDITS: usize = 2000;
 
 /// Sentinel value indicating the distance exceeds the cutoff budget. Picked
 /// to be unambiguous when compared against any realistic distance value,
@@ -446,19 +451,18 @@ impl<'t, 'a> Alignment<'t, 'a> {
     /// [`EXACT_ALIGNMENT_CELLS`]): the cost of one valid alignment, found
     /// along the children both lists share.
     ///
-    /// Equal subtrees cost nothing to match, so equal children at the
-    /// start and at the end of the two lists are matched outright, and so
-    /// are the children that occur exactly once in each list, in the
-    /// longest order both lists agree on. What lies between two such
-    /// anchors is aligned the same way; a stretch small enough is aligned
-    /// exactly, and one that is still too long and shares nothing is cut
-    /// into pieces that are.
+    /// Equal subtrees cost nothing to match. So the children the two lists
+    /// have in common, in order — their longest common subsequence — are
+    /// matched outright, and only what lies between two matches is aligned
+    /// by cost: a child that changed against its counterpart, a few that
+    /// were added against nothing. A stretch that is still too long and
+    /// shares nothing is cut into pieces that are not.
     ///
     /// For lists that are mostly the same — the only ones a long list can
     /// be similar to — this finds the alignment the exact computation
-    /// would, at a cost that grows with the lists instead of with their
-    /// product. For others the result may exceed the exact distance; it
-    /// never falls below it.
+    /// would, at a cost that grows with the lists and their differences
+    /// instead of with their product. For others the result may exceed the
+    /// exact distance; it never falls below it.
     fn align_wide(&mut self, left: ChildRange, right: ChildRange) -> f64 {
         if self.subtree_hashes.is_none() {
             self.subtree_hashes = Some((self.tree1.subtree_hashes(), self.tree2.subtree_hashes()));
@@ -473,17 +477,17 @@ impl<'t, 'a> Alignment<'t, 'a> {
                 cost += self.align(left, right);
                 continue;
             }
-            let anchors = self.unique_anchors(left, right);
-            if anchors.is_empty() {
+            let shared = self.shared_children(left, right);
+            if shared.is_empty() {
                 cost += self.align_in_pieces(left, right);
                 continue;
             }
-            // The stretches before, between and after the anchors.
+            // The stretches before, between and after the shared children.
             let (mut left_start, mut right_start) = (left.0, right.0);
-            for (left_anchor, right_anchor) in anchors {
-                pending.push(((left_start, left_anchor), (right_start, right_anchor)));
-                left_start = left_anchor + 1;
-                right_start = right_anchor + 1;
+            for (left_shared, right_shared) in shared {
+                pending.push(((left_start, left_shared), (right_start, right_shared)));
+                left_start = left_shared + 1;
+                right_start = right_shared + 1;
             }
             pending.push(((left_start, left.1), (right_start, right.1)));
         }
@@ -527,31 +531,19 @@ impl<'t, 'a> Alignment<'t, 'a> {
         (left, right)
     }
 
-    /// The children that occur exactly once in `left` and exactly once in
-    /// `right`, as `(left position, right position)` pairs: the longest
-    /// selection that is in order in both lists.
-    fn unique_anchors(&self, left: ChildRange, right: ChildRange) -> Vec<(usize, usize)> {
-        // Hash → (occurrences in `left`, position there, occurrences in
-        // `right`, position there).
-        let mut occurrences: HashMap<u64, (u32, usize, u32, usize)> = HashMap::new();
-        for position in left.0..left.1 {
-            let entry = occurrences.entry(self.left_hash(position)).or_insert((0, 0, 0, 0));
-            entry.0 += 1;
-            entry.1 = position;
-        }
-        for position in right.0..right.1 {
-            if let Some(entry) = occurrences.get_mut(&self.right_hash(position)) {
-                entry.2 += 1;
-                entry.3 = position;
-            }
-        }
-        let mut shared: Vec<(usize, usize)> = occurrences
-            .into_values()
-            .filter(|&(in_left, _, in_right, _)| in_left == 1 && in_right == 1)
-            .map(|(_, left_position, _, right_position)| (left_position, right_position))
-            .collect();
-        shared.sort_unstable();
-        longest_increasing_by_second(&shared)
+    /// The equal children of `left` and `right`, in order, as `(left
+    /// position, right position)` pairs; none when the lists are too far
+    /// apart to look (see [`MAX_LIST_EDITS`]).
+    fn shared_children(&self, left: ChildRange, right: ChildRange) -> Vec<(usize, usize)> {
+        let left_hashes: Vec<u64> =
+            (left.0..left.1).map(|position| self.left_hash(position)).collect();
+        let right_hashes: Vec<u64> =
+            (right.0..right.1).map(|position| self.right_hash(position)).collect();
+        common_subsequence(&left_hashes, &right_hashes, MAX_LIST_EDITS)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(in_left, in_right)| (left.0 + in_left, right.0 + in_right))
+            .collect()
     }
 
     /// Alignment of two long lists that share no anchor: both are cut into
@@ -570,31 +562,102 @@ impl<'t, 'a> Alignment<'t, 'a> {
     }
 }
 
-/// The longest run of `pairs` — sorted by their first component — whose
-/// second components increase.
-fn longest_increasing_by_second(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    // Patience sorting: `tails[k]` is the pair that ends the best run of
-    // length `k + 1` found so far, `previous[i]` the pair before `pairs[i]`
-    // in its run.
-    let mut tails: Vec<usize> = Vec::new();
-    let mut previous: Vec<Option<usize>> = vec![None; pairs.len()];
-    for (index, &(_, second)) in pairs.iter().enumerate() {
-        let length = tails.partition_point(|&tail| pairs[tail].1 < second);
-        previous[index] = length.checked_sub(1).map(|shorter| tails[shorter]);
-        if length == tails.len() {
-            tails.push(index);
-        } else {
-            tails[length] = index;
+/// A longest common subsequence of `left` and `right`, as pairs of
+/// positions, or `None` when turning one list into the other takes more
+/// than `max_edits` insertions and deletions.
+///
+/// Myers' greedy algorithm: for a growing number of edits, the furthest
+/// point reachable on each diagonal of the edit graph. Time and memory
+/// grow with the lists' length times their difference — not with the
+/// product of their lengths.
+fn common_subsequence(
+    left: &[u64],
+    right: &[u64],
+    max_edits: usize,
+) -> Option<Vec<(usize, usize)>> {
+    let (left_len, right_len) = (left.len() as isize, right.len() as isize);
+    let max_edits = max_edits.min(left.len() + right.len()) as isize;
+    // `furthest[offset + k]`: the largest position in `left` reached on
+    // diagonal `k` (position in `left` minus position in `right`).
+    let offset = max_edits + 1;
+    let mut furthest = vec![0isize; (2 * max_edits + 3) as usize];
+    // The reachable diagonals after each number of edits, to walk back
+    // through.
+    let mut rounds: Vec<Vec<isize>> = Vec::new();
+
+    for edits in 0..=max_edits {
+        let mut diagonal = -edits;
+        while diagonal <= edits {
+            let below = furthest[(offset + diagonal - 1) as usize];
+            let above = furthest[(offset + diagonal + 1) as usize];
+            // Reach this diagonal by inserting from the one above, or by
+            // deleting from the one below — whichever got further.
+            let mut in_left = if diagonal == -edits || (diagonal != edits && below < above) {
+                above
+            } else {
+                below + 1
+            };
+            let mut in_right = in_left - diagonal;
+            while in_left < left_len
+                && in_right < right_len
+                && left[in_left as usize] == right[in_right as usize]
+            {
+                in_left += 1;
+                in_right += 1;
+            }
+            furthest[(offset + diagonal) as usize] = in_left;
+            if in_left >= left_len && in_right >= right_len {
+                return Some(walk_back(&rounds, left_len, right_len));
+            }
+            diagonal += 2;
         }
+        rounds.push(furthest[(offset - edits) as usize..=(offset + edits) as usize].to_vec());
     }
-    let mut run = Vec::with_capacity(tails.len());
-    let mut current = tails.last().copied();
-    while let Some(index) = current {
-        run.push(pairs[index]);
-        current = previous[index];
+    None
+}
+
+/// The matches along the path [`common_subsequence`] found: back from the
+/// ends of both lists, through the state after each number of edits.
+/// `rounds[e]` holds the diagonals `-e..=e`.
+fn walk_back(rounds: &[Vec<isize>], left_len: isize, right_len: isize) -> Vec<(usize, usize)> {
+    let mut matches = Vec::new();
+    let (mut in_left, mut in_right) = (left_len, right_len);
+    for edits in (1..=rounds.len() as isize).rev() {
+        let previous = &rounds[(edits - 1) as usize];
+        // `previous` covers the diagonals `-(edits - 1)..=(edits - 1)`.
+        let reached = |diagonal: isize| previous[(diagonal + edits - 1) as usize];
+        let diagonal = in_left - in_right;
+        let from = if diagonal == -edits
+            || (diagonal != edits && reached(diagonal - 1) < reached(diagonal + 1))
+        {
+            diagonal + 1
+        } else {
+            diagonal - 1
+        };
+        let from_left = reached(from);
+        let from_right = from_left - from;
+        // The matches run back to where the edit landed.
+        let (landed_left, landed_right) = if from == diagonal + 1 {
+            (from_left, from_right + 1)
+        } else {
+            (from_left + 1, from_right)
+        };
+        while in_left > landed_left && in_right > landed_right {
+            in_left -= 1;
+            in_right -= 1;
+            matches.push((in_left as usize, in_right as usize));
+        }
+        in_left = from_left;
+        in_right = from_right;
     }
-    run.reverse();
-    run
+    // Before the first edit both lists run in step.
+    while in_left > 0 && in_right > 0 {
+        in_left -= 1;
+        in_right -= 1;
+        matches.push((in_left as usize, in_right as usize));
+    }
+    matches.reverse();
+    matches
 }
 
 #[must_use]
@@ -819,18 +882,61 @@ mod tests {
         }
     }
 
+    /// The length of the longest common subsequence, by the textbook
+    /// table.
+    fn subsequence_length(left: &[u64], right: &[u64]) -> usize {
+        let mut table = vec![vec![0usize; right.len() + 1]; left.len() + 1];
+        for (i, a) in left.iter().enumerate() {
+            for (j, b) in right.iter().enumerate() {
+                table[i + 1][j + 1] =
+                    if a == b { table[i][j] + 1 } else { table[i][j + 1].max(table[i + 1][j]) };
+            }
+        }
+        table[left.len()][right.len()]
+    }
+
     #[test]
-    fn increasing_runs_are_found() {
-        let run = |seconds: &[usize]| -> Vec<usize> {
-            let pairs: Vec<(usize, usize)> = seconds.iter().copied().enumerate().collect();
-            longest_increasing_by_second(&pairs).into_iter().map(|(_, second)| second).collect()
-        };
-        assert_eq!(run(&[]), Vec::<usize>::new());
-        assert_eq!(run(&[5]), [5]);
-        assert_eq!(run(&[1, 2, 3, 4]), [1, 2, 3, 4]);
-        assert_eq!(run(&[4, 3, 2, 1]).len(), 1);
-        assert_eq!(run(&[2, 9, 3, 4, 1, 5]), [2, 3, 4, 5]);
-        assert_eq!(run(&[10, 0, 11, 1, 12, 2, 3]), [0, 1, 2, 3]);
+    fn common_subsequences_are_found() {
+        let found = |left: &[u64], right: &[u64]| common_subsequence(left, right, 100).unwrap();
+        assert_eq!(found(&[], &[]), []);
+        assert_eq!(found(&[1, 2, 3], &[]), []);
+        assert_eq!(found(&[], &[1, 2, 3]), []);
+        assert_eq!(found(&[1, 2, 3], &[1, 2, 3]), [(0, 0), (1, 1), (2, 2)]);
+        assert_eq!(found(&[1, 2, 3], &[4, 5, 6]), []);
+        // One changed, one inserted, one removed.
+        assert_eq!(found(&[1, 2, 3], &[1, 9, 3]), [(0, 0), (2, 2)]);
+        assert_eq!(found(&[1, 2, 3], &[1, 2, 9, 3]), [(0, 0), (1, 1), (2, 3)]);
+        assert_eq!(found(&[1, 2, 9, 3], &[1, 2, 3]), [(0, 0), (1, 1), (3, 2)]);
+        // Repeated values: the lone 7s sit at opposite ends and must not
+        // be matched at the price of everything between them.
+        let left = [7, 1, 2, 1, 2, 1, 2];
+        let right = [1, 2, 1, 2, 1, 2, 7];
+        assert_eq!(found(&left, &right).len(), 6);
+    }
+
+    #[test]
+    fn common_subsequences_are_longest_and_in_order() {
+        let mut next = random_numbers(11);
+        for round in 0..300 {
+            let alphabet = 1 + next(6);
+            let left: Vec<u64> = (0..next(40)).map(|_| next(alphabet) as u64).collect();
+            let right: Vec<u64> = (0..next(40)).map(|_| next(alphabet) as u64).collect();
+            let found = common_subsequence(&left, &right, usize::MAX).unwrap();
+            assert_eq!(found.len(), subsequence_length(&left, &right), "round {round}");
+            for &(in_left, in_right) in &found {
+                assert_eq!(left[in_left], right[in_right], "round {round}");
+            }
+            assert!(
+                found.windows(2).all(|pair| pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1),
+                "round {round}: {found:?}"
+            );
+            // The edits it takes are the elements left unmatched.
+            let edits = left.len() + right.len() - 2 * found.len();
+            assert!(common_subsequence(&left, &right, edits).is_some(), "round {round}");
+            if edits > 0 {
+                assert!(common_subsequence(&left, &right, edits - 1).is_none(), "round {round}");
+            }
+        }
     }
 
     #[test]
@@ -864,9 +970,9 @@ mod tests {
         assert_eq!(distance_with_limit(&left, &block(base.clone()), 16), 0.0);
 
         // A moved block is where the two part ways: the statements that
-        // stayed anchor the alignment, so the block is deleted and
-        // inserted, while the exact computation shifts every statement in
-        // between onto its neighbour at the price of renames.
+        // stayed are matched, so the block is deleted and inserted, while
+        // the exact computation shifts every statement in between onto
+        // its neighbour at the price of renames.
         let mut moved = base;
         let chunk: Vec<Rc<TreeNode>> = moved.drain(10..15).collect();
         moved.splice(35..35, chunk);
@@ -916,6 +1022,27 @@ mod tests {
                 assert!(wide <= replace + 1e-9, "round {round}: {wide} > {replace}");
             }
         }
+    }
+
+    #[test]
+    fn repeated_entries_do_not_mislead_the_alignment_of_long_lists() {
+        // A table of repeating values in which each side changes one entry
+        // to the same new value, far apart. Matching the two new entries —
+        // the only ones that occur once on each side — would cost the
+        // whole table in between.
+        let table = |changed: usize| {
+            let entries: Vec<Rc<TreeNode>> = (0..1500)
+                .map(|i| {
+                    let value = if i == changed { 9999 } else { i % 7 };
+                    leaf(&value.to_string(), "NumericLiteral")
+                })
+                .collect();
+            node("ArrayExpression", "ArrayExpression", entries)
+        };
+        let options = APTEDOptions { rename_cost: 0.3, compare_values: false, ..unit_options() };
+        let distance = compute_edit_distance(&table(10), &table(1400), &options);
+        // Two entries renamed.
+        assert!((distance - 2.0 * 0.6).abs() < 1e-9, "{distance}");
     }
 
     #[test]
