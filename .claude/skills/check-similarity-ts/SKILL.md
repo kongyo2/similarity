@@ -40,7 +40,12 @@ unless the generator itself is the subject.
   copies of one fragment inside functions that differ as a whole — a guard,
   a lookup, a block. `fragment` gives its size in syntax nodes and the kind
   of its root (`IfStatement`, `VariableDeclaration`, …); the members are
-  the line ranges to replace with a call to one extracted helper.
+  the line ranges to replace with a call to one extracted helper. Overlap
+  fragments are compared as written, so these are pasted copies, not
+  rewrites.
+- `symbolName` is the path to a declaration: `Repo.save` is the method
+  `save` of the class `Repo`, `handlers.onSave` a member of the object
+  `handlers`, `Legacy.parse` a function in the namespace `Legacy`.
 - **Standalone pairs** are two declarations, or two fragments, with no
   third copy.
 - `similarity` 1.000 means the canonical trees are identical: the code is
