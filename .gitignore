@@ -5,3 +5,6 @@ coverage/
 
 # Rust build artifacts
 native/**/target/
+
+# Tarballs from `npm pack`
+*.tgz

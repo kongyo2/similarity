@@ -1,49 +1,45 @@
-use oxc_ast::ast::*;
+//! Function discovery: every function-shaped declaration of a source file.
+
+use oxc_ast::ast::{
+    ArrowFunctionExpression, BindingPattern, Class, ClassElement, Declaration,
+    ExportDefaultDeclarationKind, Expression, FormalParameters, Function, FunctionBody,
+    MethodDefinitionKind, ObjectExpression, ObjectProperty, ObjectPropertyKind, Program,
+    PropertyKey, PropertyKind, Statement, TSModuleDeclaration, TSModuleDeclarationBody, TSType,
+    TSTypeAnnotation, TSTypeName, VariableDeclaration,
+};
 use oxc_span::{GetSpan, Span};
 
-use crate::ignore_directive::has_similarity_ignore_directive;
-use crate::parser::parse_and_convert_to_tree_canonical;
-use crate::tsed::{calculate_tsed, TSEDOptions};
-
-type CrossFileSimilarityResult = Vec<(String, SimilarityResult, String)>;
-
-#[derive(Debug, Clone)]
-pub struct SimilarityResult {
-    pub func1: FunctionDefinition,
-    pub func2: FunctionDefinition,
-    pub similarity: f64,
-    pub impact: u32, // Total lines that could be removed
-}
-
-impl SimilarityResult {
-    pub fn new(func1: FunctionDefinition, func2: FunctionDefinition, similarity: f64) -> Self {
-        // Impact is the smaller function's line count (since we'd remove the duplicate)
-        let impact = func1.line_count().min(func2.line_count());
-        SimilarityResult { func1, func2, similarity, impact }
-    }
-}
+use crate::ignore_directive::has_ignore_directive_above;
+use crate::module_scope::{module_qualifier, qualified_name};
+use crate::source::{slice, with_checked_program, LineIndex};
 
 #[derive(Debug, Clone)]
 pub struct FunctionDefinition {
+    /// The name the function is reported under: the path that leads to it
+    /// from the top of the file — the namespaces it is declared in, then
+    /// the class or the object literal that holds it (`Legacy.parse`,
+    /// `Repo.save`, `handlers.onSave`, `Legacy.Repo.constructor`). A
+    /// function declared inside another function is reported under its own
+    /// name alone.
     pub name: String,
     pub function_type: FunctionType,
     pub parameters: Vec<String>,
-    /// Span of the whole function (header + body). Misleadingly named — kept
-    /// for backwards compatibility with the surrounding code that uses it to
-    /// detect nested-function containment.
-    pub body_span: Span,
+    /// Span of the whole declaration: the function or arrow itself, or the
+    /// class or object member that holds it. Its text parses on its own the
+    /// way [`Self::form`] says; nested functions sit strictly inside it.
+    pub span: Span,
+    pub form: SourceForm,
     /// Span of the formal parameter list (`(x, y)` or, for arrow functions
     /// with a single un-parenthesised parameter, just `x`). Used together
-    /// with `body_block_span` to assemble a normalization wrapper that
-    /// treats arrow functions and regular function declarations
-    /// equivalently.
+    /// with `body_span` to assemble a normalization wrapper that treats
+    /// arrow functions and regular function declarations equivalently.
     pub params_span: Span,
     /// Span of just the function body (the `{ ... }` block, or the
     /// expression for expression-bodied arrow functions). Used to extract
     /// a normalized comparison fragment so a `function foo` and a
     /// `const foo = () => ...` with identical bodies look structurally
     /// equivalent to the comparator.
-    pub body_block_span: Span,
+    pub body_span: Span,
     /// True when this is an arrow function whose body is a single
     /// expression (e.g. `x => x + 1`). The normalization wrapper has to
     /// add an explicit `return` in that case.
@@ -87,35 +83,37 @@ pub struct FunctionDefinition {
     pub self_alias: Option<String>,
     pub start_line: u32,
     pub end_line: u32,
+    /// For a class member, the class as it is reported (see [`Self::name`]).
     pub class_name: Option<String>,
     pub parent_function: Option<String>,
+    /// Whether a `// similarity-ignore` comment excludes the function from
+    /// the report: one right above it, above the statement that declares
+    /// it, or above a declaration it is nested in (its class, the object
+    /// literal that holds it, an enclosing function or namespace).
     pub has_ignore_directive: bool,
 }
 
 impl FunctionDefinition {
+    #[must_use]
     pub fn line_count(&self) -> u32 {
         self.end_line - self.start_line + 1
     }
 
-    /// Check if this function is a parent or child of another function
+    /// Whether one of the two functions is nested inside the other.
+    #[must_use]
     pub fn is_parent_child_relationship(&self, other: &FunctionDefinition) -> bool {
-        // Check if 'other' is inside 'self' (self is parent of other)
-        let other_inside_self = self.start_line <= other.start_line
-            && self.end_line >= other.end_line
-            && self.body_span.start < other.body_span.start
-            && self.body_span.end > other.body_span.end;
+        self.contains(other) || other.contains(self)
+    }
 
-        // Check if 'self' is inside 'other' (other is parent of self)
-        let self_inside_other = other.start_line <= self.start_line
-            && other.end_line >= self.end_line
-            && other.body_span.start < self.body_span.start
-            && other.body_span.end > self.body_span.end;
-
-        other_inside_self || self_inside_other
+    fn contains(&self, inner: &FunctionDefinition) -> bool {
+        self.start_line <= inner.start_line
+            && self.end_line >= inner.end_line
+            && self.span.start < inner.span.start
+            && self.span.end > inner.span.end
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionType {
     Function,
     Method,
@@ -123,554 +121,610 @@ pub enum FunctionType {
     Constructor,
 }
 
+impl FunctionType {
+    /// The name the report uses for this kind of function.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FunctionType::Function => "function",
+            FunctionType::Method => "method",
+            FunctionType::Arrow => "arrow",
+            FunctionType::Constructor => "constructor",
+        }
+    }
+}
+
 /// Class-method kind preserved across normalization so a `get` accessor
 /// and a regular method, or `set` vs `get`, never collapse into the same
 /// tree. Non-method functions always carry `Normal`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodKind {
     Normal,
     Getter,
     Setter,
 }
 
-/// Best-effort source text for a method key. For static identifiers and
-/// private identifiers we already have a clean string form on the AST node,
-/// but for string literals, numeric literals, and computed expressions the
-/// original key text (e.g. `"alpha"`, `[Symbol.iterator]`) is the only
-/// signal that survives into the normalization wrapper. Returns `None`
-/// when the span is empty or out of bounds so callers fall back to the
-/// existing name.
-fn method_key_source_text(key: &PropertyKey, source: &str) -> Option<String> {
-    let span = key.span();
-    let s = span.start as usize;
-    let e = span.end as usize;
-    if s < e && e <= source.len() {
-        Some(source[s..e].to_string())
-    } else {
-        None
-    }
+/// How the text of a declaration's [`FunctionDefinition::span`] parses on
+/// its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceForm {
+    /// A named `function` declaration: a statement as it stands.
+    Statement,
+    /// An arrow or an anonymous `function`: an expression.
+    Expression,
+    /// A method, accessor or constructor: valid inside a class body.
+    ClassMember,
+    /// A method, accessor or function-valued property: valid inside an
+    /// object literal.
+    ObjectMember,
 }
 
-/// Extract all functions from TypeScript/JavaScript code
+/// Extract all functions from TypeScript/JavaScript code.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be analyzed: syntax errors, or
+/// nesting beyond the limits of [`crate::source`].
 pub fn extract_functions(
     filename: &str,
     source_text: &str,
 ) -> Result<Vec<FunctionDefinition>, String> {
-    use oxc_allocator::Allocator;
-    use oxc_parser::Parser;
-    use oxc_span::SourceType;
-
-    let allocator = Allocator::default();
-    let source_type = SourceType::from_path(filename).unwrap_or(SourceType::tsx());
-    let ret = Parser::new(&allocator, source_text, source_type).parse();
-
-    if !ret.errors.is_empty() {
-        // Create a more readable error message
-        let error_messages: Vec<String> =
-            ret.errors.iter().map(|e| e.message.to_string()).collect();
-        return Err(format!("Parse errors: {}", error_messages.join(", ")));
-    }
-
-    let mut functions = Vec::new();
-    let line_offsets = build_line_offsets(source_text);
-    let mut context = ExtractionContext {
-        functions: &mut functions,
-        source_text,
-        line_offsets: &line_offsets,
-        class_name: None,
-        parent_function: None,
-    };
-
-    extract_from_program(&ret.program, &mut context);
-    Ok(functions)
+    let lines = LineIndex::new(source_text);
+    with_checked_program(filename, source_text, |program| {
+        extract_functions_from_program(program, source_text, &lines)
+    })
 }
 
-struct ExtractionContext<'a> {
-    functions: &'a mut Vec<FunctionDefinition>,
-    source_text: &'a str,
-    /// Byte offset of the start of each line, so span→line lookups are a
-    /// binary search instead of an O(file) rescan per call.
-    line_offsets: &'a [u32],
+/// [`extract_functions`] for an already parsed file.
+#[must_use]
+pub fn extract_functions_from_program(
+    program: &Program,
+    source_text: &str,
+    lines: &LineIndex,
+) -> Vec<FunctionDefinition> {
+    let mut context = ExtractionContext {
+        functions: Vec::new(),
+        source_text,
+        lines,
+        qualifier: String::new(),
+        parent_function: None,
+        ignored: false,
+    };
+    for stmt in &program.body {
+        context.statement(stmt);
+    }
+    context.functions
+}
+
+/// The parts every function form shares, whether it is written as a
+/// `function` or as an arrow.
+struct Callable<'a, 'b> {
+    params: &'b FormalParameters<'a>,
+    body: &'b FunctionBody<'a>,
+    return_type: Option<&'b TSTypeAnnotation<'a>>,
+    is_async: bool,
+    is_generator: bool,
+    /// An arrow whose body is a single expression.
+    is_expression: bool,
+}
+
+impl<'a, 'b> Callable<'a, 'b> {
+    /// `None` for a bodiless declaration — an overload signature, a
+    /// `declare function …;`, an abstract or ambient member. There is no
+    /// code to deduplicate there, and comparing their (type-less)
+    /// parameter lists used to report every overload of the same function
+    /// as a 1.0 duplicate of the next one.
+    fn of_function(func: &'b Function<'a>) -> Option<Self> {
+        Some(Self {
+            params: &func.params,
+            body: func.body.as_deref()?,
+            return_type: func.return_type.as_deref(),
+            is_async: func.r#async,
+            is_generator: func.generator,
+            is_expression: false,
+        })
+    }
+
+    fn of_arrow(arrow: &'b ArrowFunctionExpression<'a>) -> Self {
+        Self {
+            params: &arrow.params,
+            body: &arrow.body,
+            return_type: arrow.return_type.as_deref(),
+            is_async: arrow.r#async,
+            is_generator: false,
+            is_expression: arrow.expression,
+        }
+    }
+}
+
+/// How a [`Callable`] is declared: what it is called and where it sits.
+struct DeclarationSite {
+    name: String,
+    /// The name functions nested in the body record as their parent.
+    scope_name: String,
+    function_type: FunctionType,
+    method_kind: MethodKind,
+    is_static: bool,
+    display_name: String,
+    self_alias: Option<String>,
     class_name: Option<String>,
+    span: Span,
+    form: SourceForm,
+    /// The span whose lines the function is reported at. An arrow-valued
+    /// class field is reported at the field, not at the arrow alone.
+    reported: Span,
+}
+
+struct ExtractionContext<'s> {
+    functions: Vec<FunctionDefinition>,
+    source_text: &'s str,
+    lines: &'s LineIndex,
+    /// Dotted path of the `namespace`/`module` blocks being walked (`""` at
+    /// the top level and inside a function body, whose declarations no
+    /// path leads to); see [`crate::module_scope`].
+    qualifier: String,
+    /// Name of the function whose body is being walked.
     parent_function: Option<String>,
+    /// Whether the scope being walked belongs to a declaration under a
+    /// `similarity-ignore` directive.
+    ignored: bool,
 }
 
 impl ExtractionContext<'_> {
-    fn line_number(&self, offset: u32) -> u32 {
-        line_number_for_offset(self.line_offsets, offset)
+    /// `name` as it is reported: under the namespaces it is declared in.
+    fn qualified(&self, name: &str) -> String {
+        qualified_name(&self.qualifier, name)
     }
-}
 
-/// 1-based line number for a byte offset, given the per-line start
-/// offsets (always non-empty; index 0 is line 1 at offset 0).
-fn line_number_for_offset(line_offsets: &[u32], offset: u32) -> u32 {
-    let index = line_offsets.partition_point(|&start| start <= offset);
-    index.max(1) as u32
-}
-
-/// Byte offsets at which each line starts.
-fn build_line_offsets(source_text: &str) -> Vec<u32> {
-    let mut offsets = Vec::with_capacity(source_text.len() / 24 + 1);
-    offsets.push(0);
-    for (position, byte) in source_text.bytes().enumerate() {
-        if byte == b'\n' {
-            offsets.push(position as u32 + 1);
-        }
+    /// Whether a directive sits right above the line `offset` is on.
+    fn directive_above(&self, offset: u32) -> bool {
+        has_ignore_directive_above(self.source_text, self.lines, self.lines.line_of(offset))
     }
-    offsets
-}
 
-fn extract_from_program(program: &Program, ctx: &mut ExtractionContext) {
-    for stmt in &program.body {
-        extract_from_statement(stmt, ctx);
+    /// Run `walk` with the scope marked ignored when `ignored` says so (or
+    /// when it already is).
+    fn within_scope(&mut self, ignored: bool, walk: impl FnOnce(&mut Self)) {
+        let outer = self.ignored;
+        self.ignored = outer || ignored;
+        walk(self);
+        self.ignored = outer;
     }
-}
 
-fn extract_from_statement(stmt: &Statement, ctx: &mut ExtractionContext) {
-    match stmt {
-        Statement::FunctionDeclaration(func) => {
-            if let Some(name) = &func.id {
-                push_function_like(func, name.name.to_string(), ctx);
-            }
-        }
-        Statement::ClassDeclaration(class) => extract_class_members(class, ctx),
-        Statement::VariableDeclaration(var_decl) => extract_variable_functions(var_decl, ctx),
-        // `namespace`/`module` blocks are ordinary declaration scopes for
-        // the functions they contain (`namespace ts { export function
-        // isBlock(node) {…} }` is the classic TypeScript-compiler style);
-        // skipping them hid every function declared that way.
-        Statement::TSModuleDeclaration(module) => extract_module_body(module, ctx),
-        Statement::ExportNamedDeclaration(export) => {
-            if let Some(decl) = &export.declaration {
-                extract_from_declaration(decl, ctx);
-            }
-        }
-        // `export default` takes a declaration or an expression; the class
-        // and expression forms used to contribute nothing, so an arrow
-        // field or method in `export default class Relay {…}` never met
-        // its twin in a named class.
-        Statement::ExportDefaultDeclaration(export) => match &export.declaration {
-            ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
-                let name = func
-                    .id
-                    .as_ref()
-                    .map(|id| id.name.to_string())
-                    .unwrap_or_else(|| "default".to_string());
-                push_function_like(func, name, ctx);
-            }
-            ExportDefaultDeclarationKind::ClassDeclaration(class) => {
-                extract_class_members(class, ctx);
-            }
-            // Expression forms, looking through transparent wrappers the
-            // same way variable initializers do (`export default (() =>
-            // {…}) satisfies Handler`).
-            other => match other.as_expression().map(Expression::get_inner_expression) {
-                Some(Expression::FunctionExpression(func)) => {
-                    push_function_like(func, "default".to_string(), ctx);
+    fn statement(&mut self, stmt: &Statement) {
+        // A directive above a statement covers everything it declares:
+        // `export const handler: Handler<…> = async (event) => {…}` may
+        // start its arrow lines below the comment.
+        let ignored = self.directive_above(stmt.span().start);
+        self.within_scope(ignored, |this| this.statement_declarations(stmt));
+    }
+
+    fn statement_declarations(&mut self, stmt: &Statement) {
+        match stmt {
+            Statement::FunctionDeclaration(func) => {
+                if let Some(name) = &func.id {
+                    self.function(func, name.name.to_string());
                 }
-                Some(Expression::ArrowFunctionExpression(arrow)) => {
-                    push_arrow_binding(arrow, "default".to_string(), ctx);
+            }
+            Statement::ClassDeclaration(class) => self.class_members(class, own_name(class)),
+            Statement::VariableDeclaration(var_decl) => self.variable_functions(var_decl),
+            // `namespace`/`module` blocks are ordinary declaration scopes for
+            // the functions they contain (`namespace ts { export function
+            // isBlock(node) {…} }` is the classic TypeScript-compiler style);
+            // skipping them hid every function declared that way.
+            Statement::TSModuleDeclaration(module) => self.module_body(module),
+            Statement::ExportNamedDeclaration(export) => match &export.declaration {
+                Some(Declaration::FunctionDeclaration(func)) => {
+                    if let Some(name) = &func.id {
+                        self.function(func, name.name.to_string());
+                    }
                 }
-                Some(Expression::ObjectExpression(object)) => {
-                    extract_object_members(object, "default", ctx);
+                Some(Declaration::ClassDeclaration(class)) => {
+                    self.class_members(class, own_name(class));
                 }
+                Some(Declaration::VariableDeclaration(var_decl)) => {
+                    self.variable_functions(var_decl);
+                }
+                Some(Declaration::TSModuleDeclaration(module)) => self.module_body(module),
                 _ => {}
             },
-        },
-        _ => {}
-    }
-}
-
-fn extract_from_declaration(decl: &Declaration, ctx: &mut ExtractionContext) {
-    match decl {
-        Declaration::FunctionDeclaration(func) => {
-            if let Some(name) = &func.id {
-                push_function_like(func, name.name.to_string(), ctx);
-            }
-        }
-        Declaration::ClassDeclaration(class) => extract_class_members(class, ctx),
-        Declaration::VariableDeclaration(var) => extract_variable_functions(var, ctx),
-        Declaration::TSModuleDeclaration(module) => extract_module_body(module, ctx),
-        _ => {}
-    }
-}
-
-/// Walk a `namespace`/`module` body (including the nested-name form
-/// `namespace a.b.c { … }`, which oxc represents as nested declarations).
-fn extract_module_body(module: &TSModuleDeclaration, ctx: &mut ExtractionContext) {
-    let Some(body) = &module.body else {
-        return;
-    };
-    match body {
-        TSModuleDeclarationBody::TSModuleDeclaration(inner) => extract_module_body(inner, ctx),
-        TSModuleDeclarationBody::TSModuleBlock(block) => {
-            for stmt in &block.body {
-                extract_from_statement(stmt, ctx);
-            }
+            // `export default` takes a declaration or an expression; the class
+            // and expression forms used to contribute nothing, so an arrow
+            // field or method in `export default class Relay {…}` never met
+            // its twin in a named class.
+            Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+                ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+                    let name = func
+                        .id
+                        .as_ref()
+                        .map_or_else(|| "default".to_string(), |id| id.name.to_string());
+                    self.function(func, name);
+                }
+                // Like a default-exported function, a class is reported
+                // under its own name when it has one.
+                ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                    self.class_members(class, own_name(class).or(Some("default")));
+                }
+                // Expression forms, looking through transparent wrappers the
+                // same way variable initializers do (`export default (() =>
+                // {…}) satisfies Handler`).
+                other => {
+                    if let Some(expression) = other.as_expression() {
+                        self.bound_expression(expression, "default");
+                    }
+                }
+            },
+            _ => {}
         }
     }
-}
 
-/// Record a `function` (declaration, default export, or a function
-/// expression bound to a variable) under `name` and walk its body for
-/// nested functions.
-///
-/// Bodiless declarations — overload signatures, `declare function …;`,
-/// ambient members — are skipped entirely: there is no code to
-/// deduplicate, and comparing their (type-less) parameter lists used to
-/// report every overload of the same function as a 1.0 duplicate of the
-/// next one.
-fn push_function_like(func: &Function, name: String, ctx: &mut ExtractionContext) {
-    let Some(body) = &func.body else {
-        return;
-    };
-    // A named function expression (`const factorial = function recur(n)
-    // {…}`) binds its own name inside its body. The comparison fragment
-    // is rebuilt under that binding so `recur(n - 1)` keeps resolving to
-    // the function itself; rebuilding it under the variable name used to
-    // leave `recur` as a free identifier that differed between otherwise
-    // identical copies. The variable binding is the same function, so it
-    // is kept as an alias: a body recursing through `factorial(n - 1)`
-    // resolves to the function too.
-    let binding_name = func.id.as_ref().map_or_else(|| name.clone(), |id| id.name.to_string());
-    let self_alias = (binding_name != name && is_plain_identifier(&name)).then(|| name.clone());
-    let start_line = ctx.line_number(func.span.start);
-    ctx.functions.push(FunctionDefinition {
-        name: name.clone(),
-        function_type: FunctionType::Function,
-        parameters: extract_parameters(&func.params),
-        body_span: func.span,
-        params_span: func.params.span,
-        body_block_span: body.span,
-        is_arrow_expression: false,
-        is_async: func.r#async,
-        is_generator: func.generator,
-        declares_promise_return: is_promise_annotation(func.return_type.as_deref()),
-        is_static: false,
-        method_kind: MethodKind::Normal,
-        display_name: binding_name,
-        self_alias,
-        start_line,
-        end_line: ctx.line_number(func.span.end),
-        class_name: None,
-        parent_function: ctx.parent_function.clone(),
-        has_ignore_directive: has_similarity_ignore_directive(ctx.source_text, start_line as usize),
-    });
-
-    let saved_parent = ctx.parent_function.clone();
-    ctx.parent_function = Some(name);
-    extract_from_function_body(body, ctx);
-    ctx.parent_function = saved_parent;
-}
-
-/// Record an arrow function bound to a variable (`const f = (x) => …`).
-fn push_arrow_binding(arrow: &ArrowFunctionExpression, name: String, ctx: &mut ExtractionContext) {
-    let start_line = ctx.line_number(arrow.span.start);
-    ctx.functions.push(FunctionDefinition {
-        name: name.clone(),
-        function_type: FunctionType::Arrow,
-        parameters: extract_parameters(&arrow.params),
-        body_span: arrow.span,
-        params_span: arrow.params.span,
-        body_block_span: arrow.body.span,
-        is_arrow_expression: arrow.expression,
-        is_async: arrow.r#async,
-        is_generator: false,
-        declares_promise_return: is_promise_annotation(arrow.return_type.as_deref()),
-        is_static: false,
-        method_kind: MethodKind::Normal,
-        display_name: name.clone(),
-        self_alias: None,
-        start_line,
-        end_line: ctx.line_number(arrow.span.end),
-        class_name: None,
-        parent_function: ctx.parent_function.clone(),
-        has_ignore_directive: has_similarity_ignore_directive(ctx.source_text, start_line as usize),
-    });
-
-    if !arrow.expression {
-        let saved_parent = ctx.parent_function.clone();
-        ctx.parent_function = Some(name);
-        extract_from_function_body(&arrow.body, ctx);
-        ctx.parent_function = saved_parent;
+    /// Walk a `namespace`/`module` body (including the nested-name form
+    /// `namespace a.b.c { … }`, which oxc represents as nested declarations).
+    fn module_body(&mut self, module: &TSModuleDeclaration) {
+        let qualifier = module_qualifier(&module.id, &self.qualifier);
+        let outer = std::mem::replace(&mut self.qualifier, qualifier);
+        match &module.body {
+            Some(TSModuleDeclarationBody::TSModuleDeclaration(inner)) => self.module_body(inner),
+            Some(TSModuleDeclarationBody::TSModuleBlock(block)) => {
+                for stmt in &block.body {
+                    self.statement(stmt);
+                }
+            }
+            None => {}
+        }
+        self.qualifier = outer;
     }
-}
 
-/// `const f = (x) => …` and `const f = function (x) { … }` both bind a
-/// function to a name; the function-expression spelling used to be
-/// invisible to the scan.
-///
-/// Parentheses and TypeScript-only wrappers around the initializer are
-/// transparent at runtime — `const parse = (function (line) {…});`,
-/// `const handle = ((event) => {…}) as Handler;`, `… satisfies Handler`,
-/// `<Handler>(…)` and a trailing `!` all bind the inner function — so they
-/// are looked through instead of hiding the function from the scan.
-fn extract_variable_functions(var_decl: &VariableDeclaration, ctx: &mut ExtractionContext) {
-    for decl in &var_decl.declarations {
-        let BindingPattern::BindingIdentifier(ident) = &decl.id else {
-            continue;
-        };
-        let Some(init) = &decl.init else {
-            continue;
-        };
-        match init.get_inner_expression() {
+    /// `const f = (x) => …` and `const f = function (x) { … }` both bind a
+    /// function to a name; the function-expression spelling used to be
+    /// invisible to the scan.
+    fn variable_functions(&mut self, var_decl: &VariableDeclaration) {
+        for decl in &var_decl.declarations {
+            let BindingPattern::BindingIdentifier(ident) = &decl.id else {
+                continue;
+            };
+            if let Some(init) = &decl.init {
+                self.bound_expression(init, ident.name.as_str());
+            }
+        }
+    }
+
+    /// The functions an expression bound to `name` contributes: the
+    /// function or arrow itself, or the members of an object literal or of
+    /// a class expression (`const Store = class { … }` declares a class as
+    /// much as `class Store { … }` does).
+    ///
+    /// Parentheses and TypeScript-only wrappers around the expression are
+    /// transparent at runtime — `const parse = (function (line) {…});`,
+    /// `const handle = ((event) => {…}) as Handler;`, `… satisfies Handler`,
+    /// `<Handler>(…)` and a trailing `!` all bind the inner function — so
+    /// they are looked through instead of hiding the function from the scan.
+    fn bound_expression(&mut self, expression: &Expression, name: &str) {
+        match expression.get_inner_expression() {
             Expression::ArrowFunctionExpression(arrow) => {
-                push_arrow_binding(arrow, ident.name.to_string(), ctx);
+                self.arrow(arrow, self.qualified(name), name.to_string());
             }
-            Expression::FunctionExpression(func) => {
-                push_function_like(func, ident.name.to_string(), ctx);
-            }
+            Expression::FunctionExpression(func) => self.function(func, name.to_string()),
             Expression::ObjectExpression(object) => {
-                extract_object_members(object, ident.name.as_str(), ctx);
+                self.object_members(object, &self.qualified(name));
             }
+            // Reported under the binding, the name the rest of the module
+            // knows the class by.
+            Expression::ClassExpression(class) => self.class_members(class, Some(name)),
             _ => {}
         }
     }
-}
 
-/// Functions held by an object literal bound to a name — `const handlers
-/// = { onSave(doc) {…}, onClose: (doc) => {…} }`, `export default {
-/// transform(code) {…} }`, nested objects included. Dispatch tables,
-/// plugin and handler objects, and test doubles are written this way, and
-/// all of their functions used to be invisible to the scan. Members are
-/// reported under the binding (`handlers.onSave`,
-/// `table[SyntaxKind.Block]`); an object passed as an argument or returned
-/// from a function stays part of the function that builds it.
-fn extract_object_members(object: &ObjectExpression, qualifier: &str, ctx: &mut ExtractionContext) {
-    for property in &object.properties {
-        let ObjectPropertyKind::ObjectProperty(prop) = property else {
-            continue;
+    /// Record a `function` (declaration, default export, or a function
+    /// expression bound to a variable) that the scope it is declared in
+    /// knows as `name`.
+    fn function(&mut self, func: &Function, name: String) {
+        let Some(callable) = Callable::of_function(func) else {
+            return;
         };
-        let key = class_member_name(&prop.key, prop.computed, ctx.source_text);
-        let name = if key.starts_with('[') {
-            format!("{qualifier}{key}")
-        } else {
-            format!("{qualifier}.{key}")
-        };
-        match prop.value.get_inner_expression() {
-            // `save(doc) {…}`, `get size() {…}` and `save: function (doc)
-            // {…}` are methods: `this` is the object, exactly as in a class.
-            Expression::FunctionExpression(func) => {
-                push_object_method(func, prop, name, ctx);
-            }
-            Expression::ArrowFunctionExpression(arrow) => {
-                push_arrow_binding(arrow, name, ctx);
-            }
-            Expression::ObjectExpression(inner) => extract_object_members(inner, &name, ctx),
-            _ => {}
+        // A named function expression (`const factorial = function recur(n)
+        // {…}`) binds its own name inside its body. The comparison fragment
+        // is rebuilt under that binding so `recur(n - 1)` keeps resolving to
+        // the function itself; rebuilding it under the variable name used to
+        // leave `recur` as a free identifier that differed between otherwise
+        // identical copies. The variable binding is the same function, so it
+        // is kept as an alias: a body recursing through `factorial(n - 1)`
+        // resolves to the function too.
+        let binding_name = func.id.as_ref().map_or_else(|| name.clone(), |id| id.name.to_string());
+        let self_alias = (binding_name != name && is_plain_identifier(&name)).then(|| name.clone());
+        let name = self.qualified(&name);
+        self.record(
+            DeclarationSite {
+                scope_name: name.clone(),
+                name,
+                function_type: FunctionType::Function,
+                method_kind: MethodKind::Normal,
+                is_static: false,
+                display_name: binding_name,
+                self_alias,
+                class_name: None,
+                span: func.span,
+                // A function without a name of its own is no statement.
+                form: if func.id.is_some() {
+                    SourceForm::Statement
+                } else {
+                    SourceForm::Expression
+                },
+                reported: func.span,
+            },
+            &callable,
+        );
+    }
+
+    /// Record an arrow function bound to a name (`const f = (x) => …`):
+    /// reported as `name`, and known inside its own body as
+    /// `display_name`.
+    fn arrow(&mut self, arrow: &ArrowFunctionExpression, name: String, display_name: String) {
+        self.record(
+            DeclarationSite {
+                scope_name: name.clone(),
+                display_name,
+                name,
+                function_type: FunctionType::Arrow,
+                method_kind: MethodKind::Normal,
+                is_static: false,
+                self_alias: None,
+                class_name: None,
+                span: arrow.span,
+                form: SourceForm::Expression,
+                reported: arrow.span,
+            },
+            &Callable::of_arrow(arrow),
+        );
+    }
+
+    /// Functions held by an object literal bound to a name — `const handlers
+    /// = { onSave(doc) {…}, onClose: (doc) => {…} }`, `export default {
+    /// transform(code) {…} }`, nested objects included. Dispatch tables,
+    /// plugin and handler objects, and test doubles are written this way, and
+    /// all of their functions used to be invisible to the scan. Members are
+    /// reported under the binding (`handlers.onSave`,
+    /// `table[SyntaxKind.Block]`); an object passed as an argument or returned
+    /// from a function stays part of the function that builds it.
+    fn object_members(&mut self, object: &ObjectExpression, qualifier: &str) {
+        for property in &object.properties {
+            let ObjectPropertyKind::ObjectProperty(prop) = property else {
+                continue;
+            };
+            let key = member_name(&prop.key, prop.computed, self.source_text);
+            let name = member_path(qualifier, &key);
+            let ignored = self.directive_above(prop.span.start);
+            self.within_scope(ignored, |this| match prop.value.get_inner_expression() {
+                // `save(doc) {…}`, `get size() {…}` and `save: function (doc)
+                // {…}` are methods: `this` is the object, exactly as in a class.
+                Expression::FunctionExpression(func) => this.object_method(func, prop, name),
+                Expression::ArrowFunctionExpression(arrow) => this.arrow(arrow, name.clone(), name),
+                Expression::ObjectExpression(inner) => this.object_members(inner, &name),
+                _ => {}
+            });
         }
+    }
+
+    /// Record a function-valued object member as a method (see
+    /// [`Self::object_members`]).
+    fn object_method(&mut self, func: &Function, prop: &ObjectProperty, name: String) {
+        let Some(callable) = Callable::of_function(func) else {
+            return;
+        };
+        let method_kind = match prop.kind {
+            PropertyKind::Get => MethodKind::Getter,
+            PropertyKind::Set => MethodKind::Setter,
+            PropertyKind::Init => MethodKind::Normal,
+        };
+        let display_name = member_key_text(&prop.key, prop.computed, self.source_text)
+            .unwrap_or_else(|| name.clone());
+        self.record(
+            DeclarationSite {
+                scope_name: name.clone(),
+                name,
+                function_type: FunctionType::Method,
+                method_kind,
+                is_static: false,
+                display_name,
+                // `visit: function walk(node) {… walk(node.left) …}`: the
+                // function expression's own name is a binding inside the
+                // body, the property key is not. The own name is an alias of
+                // the fragment's declaration, so recursion through `walk`
+                // alpha-renames with the function instead of staying a free
+                // identifier that differs between otherwise identical copies.
+                // The fragment is not declared under the key (see
+                // `METHOD_FRAGMENT_NAME`), so a call to an outer `visit`
+                // stays free.
+                self_alias: func.id.as_ref().map(|id| id.name.to_string()),
+                class_name: None,
+                span: prop.span,
+                form: SourceForm::ObjectMember,
+                reported: prop.span,
+            },
+            &callable,
+        );
+    }
+
+    /// The methods, accessors, constructor and arrow-valued fields of a
+    /// class the scope it is declared in knows as `name`. They are reported
+    /// under the class (`Repo.save`, `Sequence[Symbol.iterator]`), like the
+    /// members of an object literal under its binding: a report that lists
+    /// four functions named `constructor` says nothing about which.
+    fn class_members(&mut self, class: &Class, name: Option<&str>) {
+        let class_name = name.map(|name| self.qualified(name));
+        let qualified = |member: &str| match &class_name {
+            Some(class) => member_path(class, member),
+            None => member.to_string(),
+        };
+        // Decorators sit above the `class` keyword (and above `export`).
+        let ignored =
+            class.decorators.first().is_some_and(|first| self.directive_above(first.span.start));
+        self.within_scope(ignored, |this| {
+            for element in &class.body.body {
+                match element {
+                    ClassElement::MethodDefinition(method) => {
+                        // Abstract methods and overload signatures have no
+                        // body — nothing to compare.
+                        let Some(callable) = Callable::of_function(&method.value) else {
+                            continue;
+                        };
+                        let key = member_name(&method.key, method.computed, this.source_text);
+                        // The key's source text keeps string, number and
+                        // computed keys spelled exactly during comparison,
+                        // and private `#name` methods apart from each other.
+                        let display_name =
+                            member_key_text(&method.key, method.computed, this.source_text)
+                                .unwrap_or_else(|| key.clone());
+                        let name = qualified(&key);
+                        this.record(
+                            DeclarationSite {
+                                scope_name: name.clone(),
+                                name,
+                                function_type: if method.kind == MethodDefinitionKind::Constructor {
+                                    FunctionType::Constructor
+                                } else {
+                                    FunctionType::Method
+                                },
+                                method_kind: match method.kind {
+                                    MethodDefinitionKind::Get => MethodKind::Getter,
+                                    MethodDefinitionKind::Set => MethodKind::Setter,
+                                    _ => MethodKind::Normal,
+                                },
+                                is_static: method.r#static,
+                                display_name,
+                                self_alias: None,
+                                class_name: class_name.clone(),
+                                span: method.span,
+                                form: SourceForm::ClassMember,
+                                reported: method.span,
+                            },
+                            &callable,
+                        );
+                    }
+                    // `handle = (event) => { … }` class fields are methods in
+                    // everything but declaration syntax (the class comparator
+                    // already treats them that way); extract them so an
+                    // arrow-field method and its `handle(event) { … }` twin
+                    // meet in the function scan.
+                    ClassElement::PropertyDefinition(prop) => {
+                        let Some(Expression::ArrowFunctionExpression(arrow)) =
+                            prop.value.as_ref().map(Expression::get_inner_expression)
+                        else {
+                            continue;
+                        };
+                        let key = member_name(&prop.key, prop.computed, this.source_text);
+                        let display_name =
+                            member_key_text(&prop.key, prop.computed, this.source_text)
+                                .unwrap_or_else(|| key.clone());
+                        let name = qualified(&key);
+                        this.record(
+                            DeclarationSite {
+                                scope_name: name.clone(),
+                                name,
+                                function_type: FunctionType::Method,
+                                method_kind: MethodKind::Normal,
+                                is_static: prop.r#static,
+                                display_name,
+                                self_alias: None,
+                                class_name: class_name.clone(),
+                                span: arrow.span,
+                                form: SourceForm::Expression,
+                                reported: prop.span,
+                            },
+                            &Callable::of_arrow(arrow),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Record one function and walk its body for the functions declared in
+    /// it.
+    fn record(&mut self, declaration: DeclarationSite, callable: &Callable) {
+        let ignored = self.ignored || self.directive_above(declaration.reported.start);
+        self.functions.push(FunctionDefinition {
+            name: declaration.name,
+            function_type: declaration.function_type,
+            parameters: parameter_names(callable.params),
+            span: declaration.span,
+            form: declaration.form,
+            params_span: callable.params.span,
+            body_span: callable.body.span,
+            is_arrow_expression: callable.is_expression,
+            is_async: callable.is_async,
+            is_generator: callable.is_generator,
+            declares_promise_return: is_promise_annotation(callable.return_type),
+            is_static: declaration.is_static,
+            method_kind: declaration.method_kind,
+            display_name: declaration.display_name,
+            self_alias: declaration.self_alias,
+            start_line: self.lines.line_of(declaration.reported.start),
+            end_line: self.lines.line_of(declaration.reported.end),
+            class_name: declaration.class_name,
+            parent_function: self.parent_function.clone(),
+            has_ignore_directive: ignored,
+        });
+
+        // An expression body declares nothing.
+        if callable.is_expression {
+            return;
+        }
+        let outer_parent = self.parent_function.replace(declaration.scope_name);
+        // No path leads to what a function declares for itself.
+        let outer_qualifier = std::mem::take(&mut self.qualifier);
+        self.within_scope(ignored, |this| {
+            for stmt in &callable.body.statements {
+                this.statement(stmt);
+            }
+        });
+        self.qualifier = outer_qualifier;
+        self.parent_function = outer_parent;
     }
 }
 
-/// Record a function-valued object member as a method (see
-/// [`extract_object_members`]).
-fn push_object_method(
-    func: &Function,
-    prop: &ObjectProperty,
-    name: String,
-    ctx: &mut ExtractionContext,
-) {
-    let Some(body) = &func.body else {
-        return;
-    };
-    let method_kind = match prop.kind {
-        PropertyKind::Get => MethodKind::Getter,
-        PropertyKind::Set => MethodKind::Setter,
-        PropertyKind::Init => MethodKind::Normal,
-    };
-    let display_name = method_key_display_text(&prop.key, prop.computed, ctx.source_text)
-        .unwrap_or_else(|| name.clone());
-    // `visit: function walk(node) {… walk(node.left) …}`: the function
-    // expression's own name is a binding inside the body, the property key
-    // is not. The own name is an alias of the fragment's declaration, so
-    // recursion through `walk` alpha-renames with the function instead of
-    // staying a free identifier that differs between otherwise identical
-    // copies. The fragment is not declared under the key (see
-    // `METHOD_FRAGMENT_NAME`), so a call to an outer `visit` stays free.
-    let self_alias = func.id.as_ref().map(|id| id.name.to_string());
-    let start_line = ctx.line_number(prop.span.start);
-    ctx.functions.push(FunctionDefinition {
-        name: name.clone(),
-        function_type: FunctionType::Method,
-        parameters: extract_parameters(&func.params),
-        body_span: prop.span,
-        params_span: func.params.span,
-        body_block_span: body.span,
-        is_arrow_expression: false,
-        is_async: func.r#async,
-        is_generator: func.generator,
-        declares_promise_return: is_promise_annotation(func.return_type.as_deref()),
-        is_static: false,
-        method_kind,
-        display_name,
-        self_alias,
-        start_line,
-        end_line: ctx.line_number(prop.span.end),
-        class_name: None,
-        parent_function: ctx.parent_function.clone(),
-        has_ignore_directive: has_similarity_ignore_directive(ctx.source_text, start_line as usize),
-    });
-
-    let saved_parent = ctx.parent_function.clone();
-    ctx.parent_function = Some(name);
-    extract_from_function_body(body, ctx);
-    ctx.parent_function = saved_parent;
+/// The path to the member `key` of `owner`, a class or an object bound to
+/// a name: `owner.key`, or `owner[key]` for a key the dot cannot spell — a
+/// computed key (which comes with its brackets) or a number.
+fn member_path(owner: &str, key: &str) -> String {
+    if key.starts_with('[') {
+        format!("{owner}{key}")
+    } else if key.starts_with(|first: char| first.is_ascii_digit()) {
+        format!("{owner}[{key}]")
+    } else {
+        format!("{owner}.{key}")
+    }
 }
 
-/// Member name for a class element key: identifiers as written, private
-/// names with their `#`, string-literal keys by value, numeric and
+/// The name a class declares for itself, if any.
+fn own_name<'a>(class: &'a Class) -> Option<&'a str> {
+    class.id.as_ref().map(|id| id.name.as_str())
+}
+
+/// Member name for a class or object member key: identifiers as written,
+/// private names with their `#`, string-literal keys by value, numeric and
 /// computed keys by their source text (`0`, `[Symbol.iterator]`). Every
 /// non-identifier key used to collapse onto `anonymous`, which made the
 /// reported name useless even though `display_name` kept such methods
 /// apart during comparison.
-fn class_member_name(key: &PropertyKey, computed: bool, source: &str) -> String {
+fn member_name(key: &PropertyKey, computed: bool, source_text: &str) -> String {
     match key {
         PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
         PropertyKey::PrivateIdentifier(ident) => format!("#{}", ident.name),
         PropertyKey::StringLiteral(literal) => literal.value.to_string(),
-        _ => method_key_display_text(key, computed, source)
-            .unwrap_or_else(|| "anonymous".to_string()),
+        _ => member_key_text(key, computed, source_text).unwrap_or_else(|| "anonymous".to_string()),
     }
 }
 
-/// Exact source text of a member key, bracketed when the key is computed
-/// so the text re-parses as a key inside the synthetic class wrapper.
-fn method_key_display_text(key: &PropertyKey, computed: bool, source: &str) -> Option<String> {
-    let text = method_key_source_text(key, source)?;
-    Some(if computed && !text.starts_with('[') { format!("[{text}]") } else { text })
+/// Exact source text of a member key (`"alpha"`, `#load`, `0`), bracketed
+/// when the key is computed so the text re-parses as a key inside the
+/// synthetic class wrapper. `None` when the span cannot be recovered.
+fn member_key_text(key: &PropertyKey, computed: bool, source_text: &str) -> Option<String> {
+    let text = slice(source_text, key.span())?;
+    Some(if computed && !text.starts_with('[') { format!("[{text}]") } else { text.to_string() })
 }
 
-fn extract_class_members(class: &Class, ctx: &mut ExtractionContext) {
-    let class_name = class.id.as_ref().map(|id| id.name.to_string());
-    let saved_class_name = ctx.class_name.clone();
-    ctx.class_name = class_name.clone();
-
-    for element in &class.body.body {
-        match element {
-            ClassElement::MethodDefinition(method) => {
-                // Abstract methods and overload signatures have no body —
-                // nothing to compare (see `push_function_like`).
-                let Some(body) = &method.value.body else {
-                    continue;
-                };
-                let method_name = class_member_name(&method.key, method.computed, ctx.source_text);
-                let function_type = if method.kind == MethodDefinitionKind::Constructor {
-                    FunctionType::Constructor
-                } else {
-                    FunctionType::Method
-                };
-                let method_kind = match method.kind {
-                    MethodDefinitionKind::Get => MethodKind::Getter,
-                    MethodDefinitionKind::Set => MethodKind::Setter,
-                    _ => MethodKind::Normal,
-                };
-                // Capture the original source text of the method key so
-                // string/number literal and computed keys keep their exact
-                // spelling during comparison, and so private `#name`
-                // methods survive the normalization wrapper instead of
-                // collapsing onto a `__sim__` placeholder.
-                let method_display_name =
-                    method_key_display_text(&method.key, method.computed, ctx.source_text)
-                        .unwrap_or_else(|| method_name.clone());
-                let method_full_name = match &class_name {
-                    Some(class) => format!("{class}.{method_name}"),
-                    None => method_name.clone(),
-                };
-                let start_line = ctx.line_number(method.span.start);
-
-                ctx.functions.push(FunctionDefinition {
-                    name: method_name,
-                    function_type,
-                    parameters: extract_parameters(&method.value.params),
-                    body_span: method.span,
-                    params_span: method.value.params.span,
-                    body_block_span: body.span,
-                    is_arrow_expression: false,
-                    is_async: method.value.r#async,
-                    is_generator: method.value.generator,
-                    declares_promise_return: is_promise_annotation(
-                        method.value.return_type.as_deref(),
-                    ),
-                    is_static: method.r#static,
-                    method_kind,
-                    display_name: method_display_name,
-                    self_alias: None,
-                    start_line,
-                    end_line: ctx.line_number(method.span.end),
-                    class_name: class_name.clone(),
-                    parent_function: ctx.parent_function.clone(),
-                    has_ignore_directive: has_similarity_ignore_directive(
-                        ctx.source_text,
-                        start_line as usize,
-                    ),
-                });
-
-                let saved_parent = ctx.parent_function.clone();
-                ctx.parent_function = Some(method_full_name);
-                extract_from_function_body(body, ctx);
-                ctx.parent_function = saved_parent;
-            }
-            // `handle = (event) => { … }` class fields are methods in
-            // everything but declaration syntax (the class comparator
-            // already treats them that way); extract them so an
-            // arrow-field method and its `handle(event) { … }` twin meet
-            // in the function scan.
-            ClassElement::PropertyDefinition(prop) => {
-                let Some(Expression::ArrowFunctionExpression(arrow)) =
-                    prop.value.as_ref().map(Expression::get_inner_expression)
-                else {
-                    continue;
-                };
-                let field_name = class_member_name(&prop.key, prop.computed, ctx.source_text);
-                let display_name =
-                    method_key_display_text(&prop.key, prop.computed, ctx.source_text)
-                        .unwrap_or_else(|| field_name.clone());
-                let field_full_name = match &class_name {
-                    Some(class) => format!("{class}.{field_name}"),
-                    None => field_name.clone(),
-                };
-                let start_line = ctx.line_number(prop.span.start);
-
-                ctx.functions.push(FunctionDefinition {
-                    name: field_name,
-                    function_type: FunctionType::Method,
-                    parameters: extract_parameters(&arrow.params),
-                    body_span: arrow.span,
-                    params_span: arrow.params.span,
-                    body_block_span: arrow.body.span,
-                    is_arrow_expression: arrow.expression,
-                    is_async: arrow.r#async,
-                    is_generator: false,
-                    declares_promise_return: is_promise_annotation(arrow.return_type.as_deref()),
-                    is_static: prop.r#static,
-                    method_kind: MethodKind::Normal,
-                    display_name,
-                    self_alias: None,
-                    start_line,
-                    end_line: ctx.line_number(prop.span.end),
-                    class_name: class_name.clone(),
-                    parent_function: ctx.parent_function.clone(),
-                    has_ignore_directive: has_similarity_ignore_directive(
-                        ctx.source_text,
-                        start_line as usize,
-                    ),
-                });
-
-                if !arrow.expression {
-                    let saved_parent = ctx.parent_function.clone();
-                    ctx.parent_function = Some(field_full_name);
-                    extract_from_function_body(&arrow.body, ctx);
-                    ctx.parent_function = saved_parent;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    ctx.class_name = saved_class_name;
-}
-
-fn extract_parameters(params: &oxc_ast::ast::FormalParameters) -> Vec<String> {
+fn parameter_names(params: &FormalParameters) -> Vec<String> {
     params
         .items
         .iter()
@@ -679,231 +733,6 @@ fn extract_parameters(params: &oxc_ast::ast::FormalParameters) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-fn extract_from_function_body(body: &FunctionBody, ctx: &mut ExtractionContext) {
-    for stmt in &body.statements {
-        extract_from_statement(stmt, ctx);
-    }
-}
-
-/// Compare similarity between two functions
-pub fn compare_functions(
-    func1: &FunctionDefinition,
-    func2: &FunctionDefinition,
-    source1: &str,
-    source2: &str,
-    options: &TSEDOptions,
-) -> Result<f64, String> {
-    compare_functions_with_threshold(func1, func2, source1, source2, options, 0.0)
-}
-
-/// Variant that allows callers to provide a similarity threshold so the
-/// inner APTED computation can abort early when the result is provably
-/// below `threshold`. Returns `Ok(sim)` either way — for sub-threshold
-/// pairs the `sim` value is `0.0` (the threshold guard already filtered
-/// them) so callers should still apply their own `>= threshold` check
-/// before recording the pair.
-pub fn compare_functions_with_threshold(
-    func1: &FunctionDefinition,
-    func2: &FunctionDefinition,
-    source1: &str,
-    source2: &str,
-    options: &TSEDOptions,
-    threshold: f64,
-) -> Result<f64, String> {
-    // Parse using the normalization-friendly fragments so arrow / regular /
-    // method declarations whose bodies agree end up structurally equivalent
-    // at the tree level. The old path passed the raw function text to
-    // `parse_function_fragment`, which preserved the surrounding declaration
-    // shape and made e.g. `(x) => x` vs `function f(x) { return x; }` look
-    // ~25% less similar than their bodies actually were.
-    let tree1 = parse_function_for_comparison("func1.ts", func1, source1)?;
-    let tree2 = parse_function_for_comparison("func2.ts", func2, source2)?;
-    compare_function_trees(&tree1, &tree2, func1, func2, options, threshold)
-}
-
-/// Tree-driven comparator shared by [`compare_functions`] and the
-/// pre-parsed batch path used by `find_similar_functions_*`. Splitting
-/// this out avoids re-parsing each function body O(N) times during a
-/// pairwise scan.
-fn compare_function_trees(
-    tree1: &std::rc::Rc<crate::tree::TreeNode>,
-    tree2: &std::rc::Rc<crate::tree::TreeNode>,
-    func1: &FunctionDefinition,
-    func2: &FunctionDefinition,
-    options: &TSEDOptions,
-    threshold: f64,
-) -> Result<f64, String> {
-    use crate::tsed::calculate_tsed_with_threshold;
-
-    // Pre-filter by size ratio. If the trees are too lopsided the
-    // post-penalty similarity can never reach threshold even at
-    // distance 0 — short-circuit here so the expensive APTED pass is
-    // skipped entirely.
-    let size1 = tree1.get_subtree_size() as f64;
-    let size2 = tree2.get_subtree_size() as f64;
-    // Pre-filter by size ratio. APTED's minimum edit distance is at least
-    // `|size1 - size2| * min(delete_cost, insert_cost)` (one tree has to
-    // consume the size gap via deletes or inserts at that per-op rate),
-    // so the base TSED is bounded above by
-    //   `1 - |size1 - size2| * min_op_cost / max_size`.
-    // When `delete_cost = insert_cost = 1.0` (the only configuration the
-    // WASM CLI ever sets and the documented default) this collapses to
-    // `size_ratio`, which gives us a clean `size_ratio < threshold` gate.
-    //
-    // Direct callers can override `apted_options` though, and with
-    // smaller per-op costs the bound is looser — pairs that the simple
-    // `size_ratio` formula would discard might still legitimately clear
-    // the threshold. Skip the prune entirely in that case rather than
-    // attempt a more elaborate bound; the threshold-aware APTED cutoff
-    // below still keeps the worst case bounded.
-    if threshold > 0.0 && size1 > 0.0 && size2 > 0.0 {
-        let delete_cost = options.apted_options.delete_cost;
-        let insert_cost = options.apted_options.insert_cost;
-        if delete_cost >= 1.0 && insert_cost >= 1.0 {
-            let size_ratio = size1.min(size2) / size1.max(size2);
-            if size_ratio < threshold {
-                return Ok(0.0);
-            }
-        }
-    }
-
-    // Use threshold-pruned APTED when the caller actually supplied a
-    // useful budget; otherwise fall through to the full computation so
-    // callers (notably the `compare_classes_*` and test fixtures) that
-    // expect the exact distance still get it.
-    let mut similarity = if threshold > 0.0 {
-        // Reserve some headroom for the line-count penalty that may
-        // follow — be conservative so we never under-report a real
-        // duplicate. Using `threshold * 0.7` keeps the budget loose
-        // enough that the penalty layer can shave the score without
-        // pushing it below an "exact-zero" sentinel.
-        let apted_threshold = (threshold * 0.7).max(0.0);
-        let sim = calculate_tsed_with_threshold(tree1, tree2, options, apted_threshold);
-        if sim == 0.0 {
-            return Ok(0.0);
-        }
-        sim
-    } else {
-        calculate_tsed(tree1, tree2, options)
-    };
-
-    // Apply line-count size penalty for short functions if enabled. This is a
-    // second, coarser guard on top of the node-count penalty in
-    // `calculate_tsed` — the purpose is to filter trivial lookalikes like
-    // `() => 0` vs `() => 1`. But the original formulation (`similarity *=
-    // avg_lines / 10.0` for functions under 10 lines) was far too aggressive
-    // for rename-only duplicates: a genuinely-duplicated 6-line helper with
-    // renamed identifiers would have its real ~0.91 TSED reduced to 0.55
-    // purely because it happened to be short, hiding obvious duplication from
-    // the default 0.8 threshold. We still want to discount pairs where the
-    // similarity signal is thin AND the function is short, but we should not
-    // punish high-similarity matches on short functions just for being short.
-    if options.size_penalty {
-        let avg_lines = (func1.line_count() + func2.line_count()) as f64 / 2.0;
-        if avg_lines < 10.0 {
-            // Confidence softener: scale the base short-function factor back
-            // toward 1.0 as the raw similarity approaches 1.0. At sim >= 0.92
-            // (essentially identical bodies) we apply no further penalty;
-            // below 0.6 we apply the full original short-function discount.
-            // The previous curve still pulled identical 3-line functions
-            // down by ~30% because the confidence range bottomed out at
-            // similarity 0.6 — but identical bodies already register at the
-            // node-count layer's softened score (~0.85) so the avg_lines
-            // multiplier should let those through.
-            let base_factor = (avg_lines / 10.0).max(0.1);
-            let confidence = ((similarity - 0.6) / 0.32).clamp(0.0, 1.0);
-            let effective_factor = base_factor + (1.0 - base_factor) * confidence;
-            similarity *= effective_factor;
-        }
-    }
-
-    // Behavioral-atom twin cap. Alpha-renaming makes true rename clones
-    // exactly equal, so a pair that is near-identical EXCEPT for a couple
-    // of behavior-carrying atoms — a different callee (`sendEmail` vs
-    // `sendSms`), a flipped operator (`*` vs `/`, `&&` vs `||`), a
-    // different builtin (`find` vs `findLast`), a for-of turned for-in —
-    // is precisely the "twins that do different things" false-positive
-    // shape. The direction of the difference matters:
-    //
-    //   * SUBSTITUTIONS (each side has atoms the other lacks) rewrite
-    //     behavior and cap hard;
-    //   * one-sided ADDITIONS (one function is the other plus extra
-    //     work, e.g. an added logging line) are the classic
-    //     copy-paste-and-extend duplicate and stay reportable;
-    //   * any CONTROL-flow atom difference (loop kind, `break`,
-    //     `continue`) caps hard even one-sided — an added `break`
-    //     changes what the loop computes, unlike an added call.
-    //
-    // Plain string/number/boolean literals are deliberately NOT atoms:
-    // twins differing only in data constants are parameterizable
-    // duplicates (the corpus's F-P02 precedent).
-    if similarity > 0.6 {
-        let difference = behavioral_atom_difference(tree1, tree2);
-        if difference.control > 0 {
-            similarity = similarity.min(0.72);
-        } else if difference.missing_in_left > 0 && difference.missing_in_right > 0 {
-            let total = difference.missing_in_left + difference.missing_in_right;
-            #[allow(clippy::cast_precision_loss)]
-            let cap = (0.75 - 0.03 * (total.saturating_sub(2)) as f64).max(0.55);
-            similarity = similarity.min(cap);
-        } else if difference.missing_in_left + difference.missing_in_right >= 4 {
-            similarity = similarity.min(0.85);
-        }
-    }
-
-    // Call-contract cap: an `async` function returns a promise and a
-    // generator returns an iterator, so a plain twin with the same body is
-    // a different contract for every caller (`getSymbol(): Promise<Symbol>`
-    // in an async API vs `getSymbol(): Symbol` in its sync sibling). The
-    // one equivalence is a sync function that chains the same promise —
-    // `return fetch(u).then((r) => …)` vs `const r = await fetch(u); …` —
-    // and the canonicalizer has already lowered that `.then` into the
-    // `await` the async twin spells, so an awaiting sync side is not a
-    // contract change. The marker used to be one relabelled node (or, for
-    // static methods and accessors, nothing at all), which identical
-    // bodies easily outweighed.
-    if similarity > 0.6 && call_contract_differs(tree1, tree2, func1, func2) {
-        similarity = similarity.min(0.72);
-    }
-
-    // Statement-order factor: two bodies made of the same statements in a
-    // different order share all their atoms and most of their tree. When
-    // the reordered statements touch the same identifiers, order is
-    // behavior (`total += fee; total *= rate;` vs the reverse) and the
-    // pair gets a distinctness multiplier; independent statements (two
-    // unrelated `const`s swapped) reorder freely and stay untouched.
-    if similarity >= 0.8 && dependent_statements_permuted(tree1, tree2) {
-        similarity *= 0.85;
-    }
-
-    Ok(similarity)
-}
-
-/// Whether the two functions expose different call contracts: generator vs
-/// plain, or `async` vs a sync function that cannot be shown to return a
-/// promise (see the call site). A sync function returns a promise when it
-/// declares `Promise<…>`/`PromiseLike<…>`, chains a promise the
-/// canonicalizer lowered to `await`, or returns `new Promise(…)` or a
-/// `Promise.*(…)` call; without any of those, nothing in the syntax says
-/// its callers get a promise.
-fn call_contract_differs(
-    tree1: &crate::tree::TreeNode,
-    tree2: &crate::tree::TreeNode,
-    func1: &FunctionDefinition,
-    func2: &FunctionDefinition,
-) -> bool {
-    if func1.is_generator != func2.is_generator {
-        return true;
-    }
-    if func1.is_async == func2.is_async {
-        return false;
-    }
-    let (sync_func, sync_tree) = if func1.is_async { (func2, tree2) } else { (func1, tree1) };
-    !(sync_func.declares_promise_return
-        || fragment_awaits(sync_tree)
-        || fragment_returns_promise(sync_tree))
 }
 
 /// `Promise<…>` or `PromiseLike<…>` as a declared return type.
@@ -918,772 +747,7 @@ fn is_promise_annotation(annotation: Option<&TSTypeAnnotation>) -> bool {
     )
 }
 
-fn is_function_like_node(value: &str) -> bool {
-    matches!(
-        value,
-        "FunctionDeclaration"
-            | "FunctionExpression"
-            | "ArrowFunctionExpression"
-            | "MethodDefinition"
-    )
-}
-
-/// Whether the comparison fragment's own function body contains an
-/// `await` (or `for await`) — awaits inside nested functions belong to
-/// those functions, not to the fragment.
-fn fragment_awaits(tree: &crate::tree::TreeNode) -> bool {
-    fn walk(node: &crate::tree::TreeNode, inside_fragment: bool) -> bool {
-        if inside_fragment
-            && (node.value == "AwaitExpression" || node.label == "ForAwaitOfStatement")
-        {
-            return true;
-        }
-        node.children.iter().any(|child| {
-            if is_function_like_node(&child.value) {
-                // The first function-like node is the fragment itself;
-                // any function inside it awaits for its own sake.
-                !inside_fragment && walk(child, true)
-            } else {
-                walk(child, inside_fragment)
-            }
-        })
-    }
-    walk(tree, false)
-}
-
-/// Whether one of the fragment's own `return`s yields `new Promise(…)` or
-/// a `Promise.resolve(…)`-style call.
-fn fragment_returns_promise(tree: &crate::tree::TreeNode) -> bool {
-    fn is_promise_global(node: &crate::tree::TreeNode) -> bool {
-        node.value == "Identifier" && node.label == "Promise"
-    }
-    fn returns_promise(node: &crate::tree::TreeNode) -> bool {
-        let Some(argument) = node.children.first() else {
-            return false;
-        };
-        let Some(callee) = argument.children.first() else {
-            return false;
-        };
-        match argument.value.as_str() {
-            "NewExpression" => is_promise_global(callee),
-            "CallExpression" => {
-                callee.value == "StaticMemberExpression"
-                    && callee.children.first().is_some_and(|object| is_promise_global(object))
-            }
-            _ => false,
-        }
-    }
-    fn walk(node: &crate::tree::TreeNode, inside_fragment: bool) -> bool {
-        if inside_fragment && node.value == "ReturnStatement" && returns_promise(node) {
-            return true;
-        }
-        node.children.iter().any(|child| {
-            if is_function_like_node(&child.value) {
-                !inside_fragment && walk(child, true)
-            } else {
-                walk(child, inside_fragment)
-            }
-        })
-    }
-    walk(tree, false)
-}
-
-#[derive(Debug, Default)]
-struct AtomSets {
-    /// Value-level atoms: free identifiers, operators, member/call
-    /// optionality markers, null, regexes.
-    value_atoms: std::collections::HashSet<String>,
-    /// Control-flow atoms: loop kinds and loop jumps.
-    control_atoms: std::collections::HashSet<String>,
-    /// Synthetic atoms (`boundary:*`, `fold:*`) carry occurrence COUNTS:
-    /// a function reading `a.at(0)` and `b.at(0)` differs from one
-    /// reading `a.at(0)` and `b.at(-1)` by one substituted occurrence,
-    /// which plain set semantics would misread as a one-sided addition
-    /// (`at[0]=0` present on both sides, `at[0]=-1` only on one).
-    synthetic_atoms: std::collections::HashMap<String, usize>,
-}
-
-impl AtomSets {
-    fn add_synthetic(&mut self, atom: String) {
-        *self.synthetic_atoms.entry(atom).or_insert(0) += 1;
-    }
-}
-
-/// Total occurrences in `left` not covered by `right` (multiset
-/// asymmetric difference).
-fn synthetic_missing(
-    left: &std::collections::HashMap<String, usize>,
-    right: &std::collections::HashMap<String, usize>,
-) -> usize {
-    left.iter()
-        .map(|(atom, &count)| count.saturating_sub(right.get(atom).copied().unwrap_or(0)))
-        .sum()
-}
-
-struct AtomDifference {
-    missing_in_left: usize,
-    missing_in_right: usize,
-    control: usize,
-}
-
-/// Positional/slicing builtins whose numeric arguments are boundary
-/// semantics. `splice` is special-cased in two ways below: its trailing
-/// arguments are inserted values (not positions), and its zero-argument
-/// form is NOT equivalent to an explicit leading `0`.
-fn boundary_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "at" | "slice"
-            | "splice"
-            | "charAt"
-            | "charCodeAt"
-            | "codePointAt"
-            | "substring"
-            | "substr"
-    )
-}
-
-/// Collect behavior-carrying labels: free identifiers (anything
-/// alpha-renaming left intact — call targets, property names, globals),
-/// operator labels, optional-chaining markers, `null`, regex literals,
-/// plus loop kinds and loop jumps as a separate control class.
-///
-/// Destructuring-pattern KEYS are skipped: `function f({ x, y })` vs
-/// `function f({ left, top })` renames the parameter contract the same
-/// way renaming two positional parameters does, and the corpus treats
-/// those as duplicates.
-fn collect_behavioral_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) {
-    // Pre-pass: locals declared with a string-literal initializer
-    // (`let trail = "";`) are provably string accumulators, so their
-    // folds are direction-sensitive even when the `+` chain itself
-    // carries no literal (`trail = trail + segment` vs
-    // `trail = segment + trail`).
-    let mut string_literal_locals = std::collections::HashSet::new();
-    collect_string_literal_locals(node, &mut string_literal_locals);
-    collect_behavioral_atoms_inner(node, atoms, &string_literal_locals);
-}
-
-/// Labels of locals whose declarator initializer is a string literal.
-fn collect_string_literal_locals(
-    node: &crate::tree::TreeNode,
-    locals: &mut std::collections::HashSet<String>,
-) {
-    if node.value == "VariableDeclarator" && node.children.len() == 2 {
-        let target = &node.children[0];
-        let init = &node.children[1];
-        if target.value == "BindingIdentifier" && init.value == "StringLiteral" {
-            locals.insert(target.label.clone());
-        }
-    }
-    for child in &node.children {
-        collect_string_literal_locals(child, locals);
-    }
-}
-
-fn collect_behavioral_atoms_inner(
-    node: &crate::tree::TreeNode,
-    atoms: &mut AtomSets,
-    string_literal_locals: &std::collections::HashSet<String>,
-) {
-    let is_value_atom = match node.value.as_str() {
-        "Identifier" | "BindingIdentifier" | "PrivateIdentifier" => !node.label.starts_with('§'),
-        "BinaryExpression"
-        | "LogicalExpression"
-        | "UnaryExpression"
-        | "UpdateExpression"
-        | "AssignmentExpression"
-        | "RegExpLiteral"
-        | "StaticMemberExpression"
-        | "ComputedMemberExpression"
-        | "PrivateFieldExpression"
-        | "CallExpression"
-        | "NullLiteral" => true,
-        _ => false,
-    };
-    if is_value_atom {
-        atoms.value_atoms.insert(node.label.clone());
-    }
-    match node.value.as_str() {
-        "ForOfStatement" | "ForInStatement" | "ForStatement" | "WhileStatement"
-        | "DoWhileStatement" | "BreakStatement" | "ContinueStatement" => {
-            atoms.control_atoms.insert(node.label.clone());
-        }
-        _ => {}
-    }
-    collect_boundary_call_atoms(node, atoms);
-    collect_fold_direction_atoms(node, atoms, string_literal_locals);
-    let skip_pattern_key = node.value == "BindingProperty";
-    for (index, child) in node.children.iter().enumerate() {
-        if skip_pattern_key && index == 0 {
-            continue;
-        }
-        collect_behavioral_atoms_inner(child, atoms, string_literal_locals);
-    }
-}
-
-/// Positional/slicing builtins whose numeric arguments and arity are
-/// boundary semantics, not parameterizable data. `.at(-1)` reads the
-/// newest entry while `.at(0)` reads the oldest, and `.slice(0, n)` keeps
-/// exactly the head that `.slice(n)` drops — twins one index literal (or
-/// one argument) apart do different work, unlike data-literal twins (a
-/// table name, a status code) which stay reportable as parameterizable
-/// duplicates.
-///
-/// Three semantic wrinkles are folded in so equivalent spellings emit
-/// equal atoms:
-///
-/// * the zero-argument form of every member except `splice` is the same
-///   operation as an explicit leading `0` (`xs.slice()` ⇔ `xs.slice(0)`,
-///   `s.charAt()` ⇔ `s.charAt(0)` — omitted arguments coerce to index
-///   0), so it normalizes to the explicit form; `splice()` removes
-///   nothing while `splice(0)` removes everything, so its arity stays
-///   literal.
-/// * `substring` swaps its arguments after clamping (`s.substring(0, n)`
-///   ⇔ `s.substring(n, 0)`), so its index literals are recorded
-///   position-insensitively.
-/// * atoms are occurrence-COUNTED (see `AtomSets::synthetic_atoms`): a
-///   second call site reading a different boundary must register as a
-///   substitution, not vanish into set semantics.
-fn collect_boundary_call_atoms(node: &crate::tree::TreeNode, atoms: &mut AtomSets) {
-    if node.value != "CallExpression" {
-        return;
-    }
-    let Some(callee) = node.children.first() else {
-        return;
-    };
-    if callee.children.len() != 2 {
-        return;
-    }
-    let property = &callee.children[1];
-    let name = match callee.value.as_str() {
-        // `xs.slice(…)`
-        "StaticMemberExpression" if property.value == "Identifier" => property.label.as_str(),
-        // `xs["slice"](…)` — the same property access spelled with
-        // bracket notation (StringLiteral labels carry their quotes).
-        "ComputedMemberExpression" if property.value == "StringLiteral" => {
-            property.label.trim_start_matches('"').trim_end_matches('"')
-        }
-        _ => return,
-    };
-    if !boundary_builtin(name) {
-        return;
-    }
-    // Explicit trailing `undefined` is the omitted-argument spelling for
-    // these APIs (`xs.slice(0, undefined)` copies to the end exactly like
-    // `xs.slice(0)`), so it is trimmed before arity is recorded, and
-    // arguments beyond the API's meaningful parameter count are ignored
-    // by JavaScript (`xs.at(0, traceId)` reads the same element as
-    // `xs.at(0)`), so the recorded arity clamps to that count. `splice`
-    // is excluded from both: `splice(0, undefined)` coerces deleteCount
-    // to 0 and removes nothing, and its trailing arguments are inserted
-    // values, not ignored extras.
-    let mut arguments: &[std::rc::Rc<crate::tree::TreeNode>] = &node.children[1..];
-    if name != "splice" {
-        while let Some(last) = arguments.last() {
-            if last.value == "Identifier" && last.label == "undefined" {
-                arguments = &arguments[..arguments.len() - 1];
-            } else {
-                break;
-            }
-        }
-        let meaningful_arity = match name {
-            "at" | "charAt" | "charCodeAt" | "codePointAt" => 1,
-            _ => 2, // slice | substring | substr
-        };
-        if arguments.len() > meaningful_arity {
-            arguments = &arguments[..meaningful_arity];
-        }
-    }
-    let arity = arguments.len();
-    if arity == 0 && name != "splice" {
-        // Omitted-argument form: same operation as an explicit index 0.
-        atoms.add_synthetic(format!("boundary:{name}/1"));
-        atoms.add_synthetic(boundary_literal_atom(name, 0, "0"));
-        return;
-    }
-    atoms.add_synthetic(format!("boundary:{name}/{arity}"));
-    // `splice` is the one member of the family whose trailing arguments
-    // are inserted VALUES, not positions: only `start` and `deleteCount`
-    // (positions 0 and 1) are boundaries, and twins differing in an
-    // inserted value are ordinary data-literal duplicates.
-    let boundary_positions = if name == "splice" { 2 } else { usize::MAX };
-    for (position, argument) in arguments.iter().enumerate() {
-        if position >= boundary_positions {
-            break;
-        }
-        if let Some(index_literal) = static_index_literal(argument) {
-            atoms.add_synthetic(boundary_literal_atom(name, position, &index_literal));
-        }
-    }
-}
-
-/// Atom key for one boundary index literal. `substring` drops the
-/// argument position from the key because JavaScript reorders its
-/// arguments after clamping — `(0, n)` and `(n, 0)` select the same
-/// range — and clamps negatives to 0 first, so `substring(-1, n)` is
-/// `substring(0, n)`; only the clamped multiset of literals is
-/// behavioral. `slice`/`at` keep negatives distinct (they index from the
-/// end) and stay position-keyed.
-fn boundary_literal_atom(name: &str, position: usize, literal: &str) -> String {
-    if name == "substring" {
-        let clamped = if literal.starts_with('-') { "0" } else { literal };
-        format!("boundary:{name}[]={clamped}")
-    } else {
-        format!("boundary:{name}[{position}]={literal}")
-    }
-}
-
-/// `0`, `1`, `-1`, … — a literal (possibly negated) numeric index.
-fn static_index_literal(node: &crate::tree::TreeNode) -> Option<String> {
-    if node.value == "NumericLiteral" {
-        return Some(node.label.clone());
-    }
-    if node.value == "UnaryExpression" && node.label == "UnaryNegation" && node.children.len() == 1
-    {
-        let inner = &node.children[0];
-        if inner.value == "NumericLiteral" {
-            return Some(format!("-{}", inner.label));
-        }
-    }
-    None
-}
-
-/// Fold-direction atoms: an assignment that rebuilds its own target from a
-/// `+` chain is order-sensitive because string `+` is not commutative —
-/// `trail = trail + seg + "/"` appends while `trail = seg + "/" + trail`
-/// prepends, and the two loops produce reversed outputs. The accumulator's
-/// position in the chain (head / mid / tail) is therefore a behavioral
-/// atom. Two deliberate scope limits:
-///
-/// * the atom only fires when a chain operand is a string LITERAL —
-///   that's the one case where the concatenation (and hence its
-///   direction) is provable from syntax. Numeric folds (`sum += n` vs
-///   `sum = n + sum`) are commutative and must not be penalized, and an
-///   untyped identifier chain could be either, so it gets no atom.
-/// * the target may be a local (`trail`) or a member slot
-///   (`this.trail`, `state.trail`) — member accumulators compare
-///   structurally via the same node hash the statement-permutation
-///   check uses.
-///
-/// The canonicalizer already contracts `x = x + y` onto the `+=` shape
-/// (an `AssignmentExpression` labeled `Addition`), which is by
-/// construction a head fold; non-`+` operators are left alone — their
-/// swapped-operand twins already diverge structurally through the
-/// compound-contraction asymmetry.
-fn collect_fold_direction_atoms(
-    node: &crate::tree::TreeNode,
-    atoms: &mut AtomSets,
-    string_literal_locals: &std::collections::HashSet<String>,
-) {
-    if node.value != "AssignmentExpression" || node.children.len() != 2 {
-        return;
-    }
-    let target = &node.children[0];
-    if !matches!(
-        target.value.as_str(),
-        "Identifier"
-            | "BindingIdentifier"
-            | "StaticMemberExpression"
-            | "PrivateFieldExpression"
-            | "ComputedMemberExpression"
-    ) {
-        return;
-    }
-    // String evidence: a literal operand in the chain proves the
-    // concatenation from the expression itself; a target declared with a
-    // string-literal initializer (`let trail = "";`) proves it from the
-    // declaration. Either way the fold direction is behavioral.
-    let target_is_string_local =
-        matches!(target.value.as_str(), "Identifier" | "BindingIdentifier")
-            && string_literal_locals.contains(&target.label);
-    let chain = &node.children[1];
-    let mut leaves = Vec::new();
-    if node.label == "Addition" {
-        // Contracted `x += y` / `x = x + y`: the accumulator is the chain
-        // head; the flattened RHS supplies the in-chain string evidence.
-        flatten_addition_chain(chain, &mut leaves);
-        if target_is_string_local || leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
-            atoms.add_synthetic("fold:head".to_string());
-        }
-        return;
-    }
-    if node.label != "Assign" {
-        return;
-    }
-    if chain.value != "BinaryExpression" || chain.label != "Addition" {
-        return;
-    }
-    flatten_addition_chain(chain, &mut leaves);
-    if !target_is_string_local && !leaves.iter().any(|leaf| leaf.value == "StringLiteral") {
-        return;
-    }
-    let target_hash = structural_node_hash(target);
-    for (position, leaf) in leaves.iter().enumerate() {
-        if leaf.value == target.value && structural_node_hash(leaf) == target_hash {
-            let marker = if position == 0 {
-                "fold:head"
-            } else if position == leaves.len() - 1 {
-                "fold:tail"
-            } else {
-                "fold:mid"
-            };
-            atoms.add_synthetic(marker.to_string());
-        }
-    }
-}
-
-/// Collect the operand leaves of a left/right-nested `+` chain in source
-/// order.
-fn flatten_addition_chain<'a>(
-    node: &'a crate::tree::TreeNode,
-    leaves: &mut Vec<&'a crate::tree::TreeNode>,
-) {
-    if node.value == "BinaryExpression" && node.label == "Addition" {
-        for child in &node.children {
-            flatten_addition_chain(child, leaves);
-        }
-    } else {
-        leaves.push(node);
-    }
-}
-
-fn behavioral_atom_difference(
-    tree1: &std::rc::Rc<crate::tree::TreeNode>,
-    tree2: &std::rc::Rc<crate::tree::TreeNode>,
-) -> AtomDifference {
-    let mut atoms1 = AtomSets::default();
-    let mut atoms2 = AtomSets::default();
-    collect_behavioral_atoms(tree1, &mut atoms1);
-    collect_behavioral_atoms(tree2, &mut atoms2);
-    AtomDifference {
-        missing_in_right: atoms1.value_atoms.difference(&atoms2.value_atoms).count()
-            + synthetic_missing(&atoms1.synthetic_atoms, &atoms2.synthetic_atoms),
-        missing_in_left: atoms2.value_atoms.difference(&atoms1.value_atoms).count()
-            + synthetic_missing(&atoms2.synthetic_atoms, &atoms1.synthetic_atoms),
-        control: atoms1.control_atoms.symmetric_difference(&atoms2.control_atoms).count(),
-    }
-}
-
-fn structural_node_hash(node: &crate::tree::TreeNode) -> u64 {
-    use std::hash::{Hash, Hasher};
-    fn walk(node: &crate::tree::TreeNode, hasher: &mut impl Hasher) {
-        node.label.hash(hasher);
-        node.value.hash(hasher);
-        node.children.len().hash(hasher);
-        for child in &node.children {
-            walk(child, hasher);
-        }
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    walk(node, &mut hasher);
-    hasher.finish()
-}
-
-/// Whether the two fragments' top-level body statements are the same
-/// multiset in a different order, AND at least one out-of-order pair
-/// touches a shared identifier (a data dependency — reordering those is
-/// behavioral; reordering independent statements is style).
-fn dependent_statements_permuted(
-    tree1: &std::rc::Rc<crate::tree::TreeNode>,
-    tree2: &std::rc::Rc<crate::tree::TreeNode>,
-) -> bool {
-    fn body_statements(
-        tree: &crate::tree::TreeNode,
-    ) -> Option<&Vec<std::rc::Rc<crate::tree::TreeNode>>> {
-        let function = tree.children.iter().find(|child| {
-            child.value == "FunctionDeclaration" || child.value == "ClassDeclaration"
-        })?;
-        let block = function.children.iter().find(|child| child.value == "BlockStatement")?;
-        Some(&block.children)
-    }
-    fn identifier_labels(
-        node: &crate::tree::TreeNode,
-        labels: &mut std::collections::HashSet<String>,
-    ) {
-        if matches!(node.value.as_str(), "Identifier" | "BindingIdentifier") {
-            labels.insert(node.label.clone());
-        }
-        for child in &node.children {
-            identifier_labels(child, labels);
-        }
-    }
-
-    let (Some(statements1), Some(statements2)) = (body_statements(tree1), body_statements(tree2))
-    else {
-        return false;
-    };
-    if statements1.len() < 2 || statements1.len() != statements2.len() {
-        return false;
-    }
-    let hashes1: Vec<u64> = statements1.iter().map(|s| structural_node_hash(s)).collect();
-    let hashes2: Vec<u64> = statements2.iter().map(|s| structural_node_hash(s)).collect();
-    if hashes1 == hashes2 {
-        return false;
-    }
-    let mut sorted1 = hashes1.clone();
-    let mut sorted2 = hashes2.clone();
-    sorted1.sort_unstable();
-    sorted2.sort_unstable();
-    if sorted1 != sorted2 {
-        return false;
-    }
-
-    // Same multiset, different order: find statement pairs whose relative
-    // order flipped and check whether any such pair shares an identifier.
-    let position_in_2: std::collections::HashMap<u64, Vec<usize>> = {
-        let mut map: std::collections::HashMap<u64, Vec<usize>> = Default::default();
-        for (position, hash) in hashes2.iter().enumerate() {
-            map.entry(*hash).or_default().push(position);
-        }
-        map
-    };
-    // Map each statement of side 1 to a position on side 2 (first unused
-    // occurrence for duplicate hashes).
-    let mut used: std::collections::HashMap<u64, usize> = Default::default();
-    let mapped: Vec<usize> = hashes1
-        .iter()
-        .map(|hash| {
-            let index = used.entry(*hash).or_insert(0);
-            let positions = &position_in_2[hash];
-            let position = positions[(*index).min(positions.len() - 1)];
-            *index += 1;
-            position
-        })
-        .collect();
-
-    let mut labels: Vec<std::collections::HashSet<String>> = Vec::with_capacity(statements1.len());
-    for statement in statements1 {
-        let mut set = std::collections::HashSet::new();
-        identifier_labels(statement, &mut set);
-        labels.push(set);
-    }
-
-    for a in 0..mapped.len() {
-        for b in (a + 1)..mapped.len() {
-            if mapped[a] > mapped[b] && !labels[a].is_disjoint(&labels[b]) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn extract_body_text(func: &FunctionDefinition, source: &str) -> String {
-    let start = func.body_span.start as usize;
-    let end = func.body_span.end as usize;
-    source[start..end].to_string()
-}
-
-/// The comparison fragment of a function and the top-level binding it
-/// declares, which is what a self-alias resolves to.
-struct NormalizedFragment {
-    text: String,
-    binding: String,
-}
-
-/// Build a normalization-friendly fragment for a function. The goal is that
-/// two functions whose bodies and parameter lists agree end up producing
-/// identical fragments regardless of whether they were declared as
-/// `function foo() {...}`, `const foo = () => {...}`, or
-/// `const foo = (x) => x + 1`. Without this layer the wrapping shape
-/// (FunctionDeclaration vs ExpressionStatement→ArrowFunctionExpression)
-/// dominated the structural distance on short bodies.
-fn build_normalized_fragment(func: &FunctionDefinition, source: &str) -> NormalizedFragment {
-    let safe_slice = |start: u32, end: u32| -> &str {
-        let s = start as usize;
-        let e = end as usize;
-        if s < e && e <= source.len() {
-            &source[s..e]
-        } else {
-            ""
-        }
-    };
-
-    let params_text = {
-        let raw = safe_slice(func.params_span.start, func.params_span.end).trim();
-        if raw.starts_with('(') && raw.ends_with(')') {
-            raw.to_string()
-        } else if raw.is_empty() {
-            "()".to_string()
-        } else {
-            // Single un-parenthesised arrow parameter, e.g. `x => ...`.
-            format!("({raw})")
-        }
-    };
-
-    let raw_body_text = safe_slice(func.body_block_span.start, func.body_block_span.end);
-    // Wrap a single-expression arrow body in an explicit `return` so it
-    // ends up shaped like a block-bodied function. Without this an
-    // `(x) => x + 1` would parse as a top-level `ExpressionStatement →
-    // ArrowFunctionExpression`, adding a structural wrapper that an
-    // equivalent `function f(x) { return x + 1; }` would not have. Arrow
-    // class fields (`handle = (event) => event.id`) take the same wrapping
-    // on the method path below.
-    let body_text: String = if func.is_arrow_expression {
-        format!("{{ return {raw_body_text}; }}")
-    } else {
-        raw_body_text.to_string()
-    };
-    // Every source text the fragment splices in; a synthetic name must not
-    // occur in any of it (see `unused_synthetic_name`).
-    let spliced = format!("{params_text} {body_text} {}", func.display_name);
-
-    match func.function_type {
-        FunctionType::Method | FunctionType::Constructor => {
-            // Plain instance methods normalize to a standalone `function`
-            // fragment so "extract method to function" refactors (and the
-            // reverse) compare by body instead of by declaration shape —
-            // the class wrapper used to dominate the structural distance
-            // for method-vs-function pairs. The fragment is declared under
-            // a placeholder, not the key, which binds nothing inside the
-            // body (see `METHOD_FRAGMENT_NAME`). Static methods, accessors,
-            // constructors and non-identifier keys keep the class wrapper:
-            // their runtime contracts are tied to the class shape and the
-            // existing relative scoring for those forms is calibrated
-            // against it.
-            if method_normalizes_to_function(func) {
-                let name_text = unused_synthetic_name(METHOD_FRAGMENT_NAME, &spliced);
-                let mut prefix = String::new();
-                if func.is_async {
-                    prefix.push_str("async ");
-                }
-                prefix.push_str("function");
-                if func.is_generator {
-                    prefix.push('*');
-                }
-                return NormalizedFragment {
-                    text: format!("{prefix} {name_text}{params_text} {body_text}"),
-                    binding: name_text,
-                };
-            }
-            // Remaining method shapes can't be parsed in isolation, so keep
-            // the synthetic class wrapper. Preserve `static`, getter/setter,
-            // `async` and generator modifiers — runtime-distinct methods
-            // like `static foo` vs `foo` or `get foo` vs `foo` must not
-            // collapse onto the same tree even when their bodies agree.
-            let mut prefix = String::new();
-            if func.is_static {
-                prefix.push_str("static ");
-            }
-            match func.method_kind {
-                MethodKind::Getter => prefix.push_str("get "),
-                MethodKind::Setter => prefix.push_str("set "),
-                MethodKind::Normal => {
-                    if func.is_async {
-                        prefix.push_str("async ");
-                    }
-                    if func.is_generator {
-                        prefix.push('*');
-                    }
-                }
-            }
-            // Methods use `display_name` directly: it already carries the
-            // exact source text of the key (`"alpha"`, `#load`,
-            // `[Symbol.iterator]`, …), all of which are syntactically valid
-            // inside a class body, so no sanitization is needed. The
-            // sanitizer used for top-level functions would otherwise reject
-            // these forms and collapse distinct methods onto `__sim__`.
-            let method_name_text = if func.display_name.is_empty() {
-                "__sim__".to_string()
-            } else {
-                func.display_name.clone()
-            };
-            let wrapper = unused_synthetic_name(CLASS_WRAPPER_NAME, &spliced);
-            NormalizedFragment {
-                text: format!(
-                    "class {wrapper} {{ {}{}{} {} }}",
-                    prefix, method_name_text, params_text, body_text
-                ),
-                binding: wrapper,
-            }
-        }
-        FunctionType::Function | FunctionType::Arrow => {
-            // Carry async / generator flags through the wrapper so two
-            // functions that differ only in `async`-ness (different
-            // runtime return type) don't compare as identical. Arrows
-            // can be async but never generators, so the generator marker
-            // is only meaningful for the Function path.
-            let mut prefix = String::new();
-            if func.is_async {
-                prefix.push_str("async ");
-            }
-            prefix.push_str("function");
-            if func.is_generator {
-                prefix.push('*');
-            }
-
-            // Top-level functions and arrow declarations always bind to
-            // an ordinary identifier, so the sanitizer is enough — there
-            // is no private-method / string-literal-key path here.
-            // `display_name` is the name the body is bound under: the
-            // declaration name, or a named function expression's own
-            // name, which its recursive calls refer to. A name the
-            // sanitizer made up binds nothing in the source and is kept out
-            // of its references like the other synthetic names.
-            let mut name_text = sanitize_function_name(&func.display_name);
-            if name_text != func.display_name {
-                name_text = unused_synthetic_name(&name_text, &spliced);
-            }
-            NormalizedFragment {
-                text: format!("{} {}{} {}", prefix, name_text, params_text, body_text),
-                binding: name_text,
-            }
-        }
-    }
-}
-
-/// `base`, or `base` with the smallest numeric suffix, whichever `text`
-/// does not contain. Fragments declare synthetic names (the method
-/// placeholder, the class wrapper, a sanitized function name) around
-/// source text, and a source reference spelled like one of them would
-/// resolve to the synthetic declaration: a call to an outer `__m__`
-/// would read as recursion. A name the source never spells captures
-/// nothing, and any spelling works because the declaration alpha-renames
-/// like every other binding.
-fn unused_synthetic_name(base: &str, text: &str) -> String {
-    let mut name = base.to_string();
-    let mut suffix = 0u32;
-    while text.contains(name.as_str()) {
-        suffix += 1;
-        name = format!("{base}{suffix}");
-    }
-    name
-}
-
-/// Name of the synthetic class that wraps method fragments which cannot be
-/// parsed on their own (see [`build_normalized_fragment`]).
-const CLASS_WRAPPER_NAME: &str = "__C__";
-
-/// Name the standalone `function` fragment of a method is declared under
-/// (or, when the method's source spells it, the same name with a suffix;
-/// see [`unused_synthetic_name`]). A member key is not a binding inside the
-/// member's body: in `visit(node) { return visit(node.left); }` the call
-/// goes to an outer `visit`, and recursion goes through `this.visit`.
-/// Under the key, such calls would resolve to the fragment's own
-/// declaration, and a method delegating to a same-named helper would
-/// compare as identical to a recursive function. Under a placeholder, a
-/// reference spelled like the key stays a free identifier, as in the
-/// class-wrapped shapes, in arrow-valued object members and in class
-/// mode's method fingerprints. The declaration name alpha-renames like any
-/// other binding, so the comparison does not depend on it. A method's key
-/// is a binding in neither fragment shape, so only the own name of a
-/// function expression held by the member (`visit: function walk(node)
-/// {…}`) resolves to the function.
-const METHOD_FRAGMENT_NAME: &str = "__m__";
-
-/// Whether a method normalizes to a standalone `function` fragment: plain
-/// instance methods with an identifier key. The other shapes keep the
-/// synthetic class wrapper — static methods, accessors, constructors, and
-/// non-identifier keys (string literals, computed keys, `#private` names),
-/// whose key shape stays visible to the comparison.
-fn method_normalizes_to_function(func: &FunctionDefinition) -> bool {
-    matches!(func.function_type, FunctionType::Method)
-        && matches!(func.method_kind, MethodKind::Normal)
-        && !func.is_static
-        && is_plain_identifier(&func.display_name)
-}
-
-fn is_plain_identifier(name: &str) -> bool {
+pub(crate) fn is_plain_identifier(name: &str) -> bool {
     !name.is_empty()
         && name.chars().enumerate().all(|(idx, ch)| {
             if idx == 0 {
@@ -1692,1761 +756,4 @@ fn is_plain_identifier(name: &str) -> bool {
                 ch.is_alphanumeric() || ch == '_' || ch == '$'
             }
         })
-}
-
-fn sanitize_function_name(name: &str) -> String {
-    if !is_plain_identifier(name) {
-        "__sim__".to_string()
-    } else if is_reserved_function_name(name) {
-        // `export default function () {…}` is recorded as `default`,
-        // which cannot head a `function` declaration.
-        format!("__f_{name}")
-    } else {
-        name.to_string()
-    }
-}
-
-/// Words that cannot appear as a `function <name>` in a strict-mode
-/// module even though they are perfectly valid method keys (`delete(key)`
-/// on a cache class being the canonical example).
-fn is_reserved_function_name(name: &str) -> bool {
-    matches!(
-        name,
-        "await"
-            | "break"
-            | "case"
-            | "catch"
-            | "class"
-            | "const"
-            | "continue"
-            | "debugger"
-            | "default"
-            | "delete"
-            | "do"
-            | "else"
-            | "enum"
-            | "export"
-            | "extends"
-            | "false"
-            | "finally"
-            | "for"
-            | "function"
-            | "if"
-            | "implements"
-            | "import"
-            | "in"
-            | "instanceof"
-            | "interface"
-            | "let"
-            | "new"
-            | "null"
-            | "package"
-            | "private"
-            | "protected"
-            | "public"
-            | "return"
-            | "static"
-            | "super"
-            | "switch"
-            | "this"
-            | "throw"
-            | "true"
-            | "try"
-            | "typeof"
-            | "var"
-            | "void"
-            | "while"
-            | "with"
-            | "yield"
-    )
-}
-
-/// Parse a function body snippet into a tree, wrapping method-shorthand
-/// fragments in a synthetic class so that standalone class methods and
-/// constructors (which are not valid top-level TypeScript) can still be
-/// structurally compared.
-fn parse_function_fragment(
-    filename: &str,
-    body_text: &str,
-    function_type: &FunctionType,
-) -> Result<std::rc::Rc<crate::tree::TreeNode>, String> {
-    let class_wrapped = || {
-        let wrapper = unused_synthetic_name(CLASS_WRAPPER_NAME, body_text);
-        parse_and_convert_to_tree_canonical(filename, &format!("class {wrapper} {{ {body_text} }}"))
-    };
-    match function_type {
-        FunctionType::Method | FunctionType::Constructor => class_wrapped(),
-        FunctionType::Function | FunctionType::Arrow => {
-            // Try direct parse first; fall back to class-wrapping for method-like
-            // snippets that snuck through (e.g. rare extractor edge cases).
-            parse_and_convert_to_tree_canonical(filename, body_text).or_else(|_| class_wrapped())
-        }
-    }
-}
-
-/// Parse a function for structural comparison, using `build_normalized_fragment`
-/// so arrow vs regular vs method declarations all end up shape-equivalent
-/// when their bodies agree, and the canonical parse so style-only rewrites
-/// (template literals, `.then` vs `await`, `forEach` vs `for-of`, …)
-/// compare as equal trees.
-fn parse_function_for_comparison(
-    filename: &str,
-    func: &FunctionDefinition,
-    source: &str,
-) -> Result<std::rc::Rc<crate::tree::TreeNode>, String> {
-    let fragment = build_normalized_fragment(func, source);
-    let parsed = match &func.self_alias {
-        // The fragment declares the function under one binding; the other
-        // name it is reachable under resolves to the same declaration.
-        Some(alias) => crate::parser::parse_and_convert_to_tree_canonical_with_aliases(
-            filename,
-            &fragment.text,
-            vec![(alias.clone(), fragment.binding)],
-        ),
-        None => parse_and_convert_to_tree_canonical(filename, &fragment.text),
-    };
-    match parsed {
-        Ok(tree) => Ok(tree),
-        Err(_) => {
-            // Fallback to the legacy whole-function parse path so we don't
-            // regress on edge cases the normalizer happens to break.
-            let body_text = extract_body_text(func, source);
-            parse_function_fragment(filename, &body_text, &func.function_type)
-        }
-    }
-}
-
-/// Pair-generation scope for [`find_similar_function_pairs`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PairScope {
-    All,
-    SameFileOnly,
-    CrossFileOnly,
-}
-
-/// A file the unified scan had to skip, with the parse error that caused
-/// it.
-pub type SkippedFile = (String, String);
-
-/// Unified similar-function scan across a set of files.
-///
-/// Extracts and pre-parses every function exactly once, then runs a
-/// single O(N²) pairwise loop restricted to `scope`. This replaces the
-/// previous split into a cross-file pass and a per-file pass, which
-/// extracted and parsed every function twice when both scopes were in
-/// play (the default).
-///
-/// Returns the similar pairs (ordered by impact desc, then similarity
-/// desc) plus the files that failed to parse and were skipped.
-pub fn find_similar_function_pairs(
-    files: &[(String, String)],
-    threshold: f64,
-    options: &TSEDOptions,
-    scope: PairScope,
-) -> (CrossFileSimilarityResult, Vec<SkippedFile>) {
-    struct Candidate {
-        file_index: usize,
-        func: FunctionDefinition,
-        tree: Option<std::rc::Rc<crate::tree::TreeNode>>,
-        tree_size: u32,
-    }
-
-    let mut skipped = Vec::new();
-    let mut candidates: Vec<Candidate> = Vec::new();
-    for (file_index, (filename, source)) in files.iter().enumerate() {
-        let functions = match extract_functions(filename, source) {
-            Ok(functions) => functions,
-            Err(error) => {
-                skipped.push((filename.clone(), error));
-                continue;
-            }
-        };
-        for func in functions {
-            if func.has_ignore_directive {
-                continue;
-            }
-            // Pre-parse once per function: parsing dominates the per-pair
-            // cost, and the tree also supplies the node count used by the
-            // `min_tokens` gate (measured on the same tree that gets
-            // compared, so the gate and the score agree).
-            let tree = parse_function_for_comparison(filename, &func, source).ok();
-            let tree_size = tree
-                .as_ref()
-                .map_or(0, |tree| u32::try_from(tree.get_subtree_size()).unwrap_or(u32::MAX));
-            candidates.push(Candidate { file_index, func, tree, tree_size });
-        }
-    }
-
-    let mut similar_pairs = Vec::new();
-    for i in 0..candidates.len() {
-        for j in (i + 1)..candidates.len() {
-            let (left, right) = (&candidates[i], &candidates[j]);
-            let same_file = left.file_index == right.file_index;
-            match scope {
-                PairScope::SameFileOnly if !same_file => continue,
-                PairScope::CrossFileOnly if same_file => continue,
-                _ => {}
-            }
-
-            if let Some(min_tokens) = options.min_tokens {
-                if left.tree_size < min_tokens || right.tree_size < min_tokens {
-                    continue;
-                }
-            } else if left.func.line_count() < options.min_lines
-                || right.func.line_count() < options.min_lines
-            {
-                continue;
-            }
-
-            // Nested-function containment is only meaningful within one
-            // file — across files the span/line comparison is between
-            // unrelated coordinate spaces and used to spuriously drop
-            // pairs whose ranges happened to nest.
-            if same_file && left.func.is_parent_child_relationship(&right.func) {
-                continue;
-            }
-
-            let (Some(left_tree), Some(right_tree)) = (&left.tree, &right.tree) else {
-                continue;
-            };
-
-            let Ok(similarity) = compare_function_trees(
-                left_tree,
-                right_tree,
-                &left.func,
-                &right.func,
-                options,
-                threshold,
-            ) else {
-                continue;
-            };
-
-            if similarity >= threshold {
-                similar_pairs.push((
-                    files[left.file_index].0.clone(),
-                    SimilarityResult::new(left.func.clone(), right.func.clone(), similarity),
-                    files[right.file_index].0.clone(),
-                ));
-            }
-        }
-    }
-
-    // Sort by impact (descending), then by similarity (descending).
-    similar_pairs.sort_by(|a, b| {
-        b.1.impact.cmp(&a.1.impact).then(b.1.similarity.total_cmp(&a.1.similarity))
-    });
-
-    (similar_pairs, skipped)
-}
-
-/// Find similar functions within the same file.
-///
-/// # Errors
-///
-/// Returns an error when the file fails to parse.
-pub fn find_similar_functions_in_file(
-    filename: &str,
-    source_text: &str,
-    threshold: f64,
-    options: &TSEDOptions,
-) -> Result<Vec<SimilarityResult>, String> {
-    let files = [(filename.to_string(), source_text.to_string())];
-    let (pairs, skipped) =
-        find_similar_function_pairs(&files, threshold, options, PairScope::SameFileOnly);
-    if let Some((_, error)) = skipped.into_iter().next() {
-        return Err(error);
-    }
-    Ok(pairs.into_iter().map(|(_, result, _)| result).collect())
-}
-
-/// Find similar functions across multiple files (cross-file pairs only;
-/// same-file pairs are the domain of [`find_similar_functions_in_file`]).
-///
-/// # Errors
-///
-/// Currently infallible — files that fail to parse are skipped — but the
-/// signature keeps `Result` for backwards compatibility.
-pub fn find_similar_functions_across_files(
-    files: &[(String, String)], // (filename, source_text)
-    threshold: f64,
-    options: &TSEDOptions,
-) -> Result<CrossFileSimilarityResult, String> {
-    let (pairs, _skipped) =
-        find_similar_function_pairs(files, threshold, options, PairScope::CrossFileOnly);
-    Ok(pairs)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_functions() {
-        let code = r"
-            function add(a: number, b: number): number {
-                return a + b;
-            }
-            
-            const multiply = (x: number, y: number) => x * y;
-            
-            class Calculator {
-                constructor(private initial: number) {}
-                
-                add(value: number): number {
-                    return this.initial + value;
-                }
-                
-                subtract(value: number): number {
-                    return this.initial - value;
-                }
-            }
-            
-            export function divide(a: number, b: number): number {
-                return a / b;
-            }
-        ";
-
-        let functions = extract_functions("test.ts", code).unwrap();
-
-        assert_eq!(functions.len(), 6);
-
-        // Check function names
-        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-        assert!(names.contains(&"add"));
-        assert!(names.contains(&"multiply"));
-        assert!(names.contains(&"constructor"));
-        assert!(names.contains(&"subtract"));
-        assert!(names.contains(&"divide"));
-
-        // Check function types
-        let add_func =
-            functions.iter().find(|f| f.name == "add" && f.class_name.is_none()).unwrap();
-        assert_eq!(add_func.function_type, FunctionType::Function);
-        assert_eq!(add_func.parameters, vec!["a", "b"]);
-
-        let multiply_func = functions.iter().find(|f| f.name == "multiply").unwrap();
-        assert_eq!(multiply_func.function_type, FunctionType::Arrow);
-
-        let constructor = functions.iter().find(|f| f.name == "constructor").unwrap();
-        assert_eq!(constructor.function_type, FunctionType::Constructor);
-        assert_eq!(constructor.class_name, Some("Calculator".to_string()));
-    }
-
-    #[test]
-    fn min_tokens_gate_uses_comparison_tree_size() {
-        let code = r"
-            function tinyA() {
-                return 42;
-            }
-
-            function tinyB() {
-                return 42;
-            }
-        ";
-        let mut options = TSEDOptions { min_lines: 1, size_penalty: false, ..Default::default() };
-
-        // Without a token gate the identical pair is reported…
-        let (pairs, _) = find_similar_function_pairs(
-            &[("test.ts".to_string(), code.to_string())],
-            0.9,
-            &options,
-            PairScope::SameFileOnly,
-        );
-        assert_eq!(pairs.len(), 1);
-
-        // …and a high min_tokens threshold filters it out.
-        options.min_tokens = Some(500);
-        let (pairs, _) = find_similar_function_pairs(
-            &[("test.ts".to_string(), code.to_string())],
-            0.9,
-            &options,
-            PairScope::SameFileOnly,
-        );
-        assert!(pairs.is_empty());
-    }
-
-    #[test]
-    fn test_find_similar_functions_in_file() {
-        let code = r"
-            function calculateSum(a: number, b: number): number {
-                return a + b;
-            }
-            
-            function addNumbers(x: number, y: number): number {
-                return x + y;
-            }
-            
-            function multiply(a: number, b: number): number {
-                return a * b;
-            }
-            
-            function computeSum(first: number, second: number): number {
-                return first + second;
-            }
-        ";
-
-        let mut options = TSEDOptions::default();
-        options.apted_options.rename_cost = 0.3; // Lower rename cost for better similarity detection
-        options.size_penalty = false; // Disable for test with small functions
-        options.min_lines = 1; // Allow small functions in test
-
-        let similar_pairs = find_similar_functions_in_file("test.ts", code, 0.7, &options).unwrap();
-
-        // Should find that calculateSum, addNumbers, and computeSum are similar
-        assert!(
-            similar_pairs.len() >= 2,
-            "Expected at least 2 similar pairs, found {}",
-            similar_pairs.len()
-        );
-
-        // Note: multiply IS similar to others because they all have the same structure
-        // (two parameters, single return statement). This is expected behavior.
-        // Let's check that we found the expected similar pairs
-        let sum_pairs = similar_pairs
-            .iter()
-            .filter(|result| {
-                (result.func1.name.contains("Sum") || result.func2.name.contains("Sum"))
-                    || (result.func1.name == "addNumbers" || result.func2.name == "addNumbers")
-            })
-            .count();
-        assert!(sum_pairs >= 3, "Expected at least 3 pairs involving sum functions");
-    }
-
-    #[test]
-    fn test_find_similar_functions_across_files() {
-        let file1 = (
-            "file1.ts".to_string(),
-            r#"
-            export function processUser(user: User): void {
-                validateUser(user);
-                saveUser(user);
-                notifyUser(user);
-            }
-            
-            function validateUser(user: User): boolean {
-                return user.name.length > 0 && user.email.includes('@');
-            }
-        "#
-            .to_string(),
-        );
-
-        let file2 = (
-            "file2.ts".to_string(),
-            r#"
-            export function handleUser(u: User): void {
-                checkUser(u);
-                storeUser(u);
-                alertUser(u);
-            }
-            
-            function checkUser(u: User): boolean {
-                return u.name.length > 0 && u.email.includes('@');
-            }
-        "#
-            .to_string(),
-        );
-
-        let mut options = TSEDOptions::default();
-        options.apted_options.rename_cost = 0.3;
-        options.size_penalty = false; // Disable for test with small functions
-        options.min_lines = 1; // Allow small functions in test
-
-        let similar_pairs =
-            find_similar_functions_across_files(&[file1, file2], 0.7, &options).unwrap();
-
-        // validateUser/checkUser are genuine rename duplicates (same free
-        // atoms, renamed locals) and must be reported.
-        let validate_check = similar_pairs.iter().find(|(_, result, _)| {
-            (result.func1.name == "validateUser" && result.func2.name == "checkUser")
-                || (result.func1.name == "checkUser" && result.func2.name == "validateUser")
-        });
-        assert!(validate_check.is_some());
-
-        // processUser/handleUser share only the three-call skeleton — the
-        // callees are entirely different sets, which the behavioral-atom
-        // cap treats as different work (mirroring the corpus's skeleton
-        // negatives), so the pair stays below the 0.7 threshold.
-        let process_handle = similar_pairs.iter().find(|(_, result, _)| {
-            (result.func1.name == "processUser" && result.func2.name == "handleUser")
-                || (result.func1.name == "handleUser" && result.func2.name == "processUser")
-        });
-        assert!(process_handle.is_none());
-    }
-
-    #[test]
-    fn boundary_index_twins_stay_distinct() {
-        // XF-N15 shape: `.at(-1)` picks the newest entry, `.at(0)` the
-        // oldest — one literal apart, but reading different elements.
-        let code = r#"
-export function newestSnapshot(snapshots: string[]): string {
-  const picked = snapshots.at(-1);
-  if (picked === undefined) {
-    return "none";
-  }
-  return picked;
-}
-
-export function oldestSnapshot(snapshots: string[]): string {
-  const picked = snapshots.at(0);
-  if (picked === undefined) {
-    return "none";
-  }
-  return picked;
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert!(
-            pairs.is_empty(),
-            "boundary-index twins must stay below threshold, got {:?}",
-            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn slice_arity_twins_stay_distinct() {
-        // XF-N17 shape: `slice(0, cut)` keeps the head that `slice(cut)`
-        // drops — complementary halves from the same call shape.
-        let code = r"
-export function takeTopJobs(jobs: string[], cut: number): string[] {
-  if (jobs.length === 0) {
-    return [];
-  }
-  return jobs.slice(0, cut);
-}
-
-export function dropTopJobs(jobs: string[], cut: number): string[] {
-  if (jobs.length === 0) {
-    return [];
-  }
-  return jobs.slice(cut);
-}
-";
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert!(
-            pairs.is_empty(),
-            "slice head/tail twins must stay below threshold, got {:?}",
-            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn fold_direction_twins_stay_distinct() {
-        // XF-N40 shape: appending builds a/b/c/ while prepending builds
-        // c/b/a/ — string + is not commutative.
-        let code = r#"
-export function buildTrailForward(segments: string[]): string {
-  let trail = "";
-  for (const segment of segments) {
-    trail = trail + segment + "/";
-  }
-  return trail;
-}
-
-export function buildTrailReversed(segments: string[]): string {
-  let trail = "";
-  for (const segment of segments) {
-    trail = segment + "/" + trail;
-  }
-  return trail;
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert!(
-            pairs.is_empty(),
-            "append vs prepend folds must stay below threshold, got {:?}",
-            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn splice_inserted_value_twins_stay_duplicates() {
-        // Only `start` and `deleteCount` are boundary positions on
-        // `splice`; arguments from position 2 onward are inserted VALUES,
-        // and twins differing only there are parameterizable data-literal
-        // duplicates.
-        let code = r"
-export function resetLeadingFlag(flags: number[], cursor: number): number[] {
-  if (flags.length === 0) {
-    return flags;
-  }
-  flags.splice(cursor, 1, 0);
-  return flags;
-}
-
-export function raiseLeadingFlag(flags: number[], cursor: number): number[] {
-  if (flags.length === 0) {
-    return flags;
-  }
-  flags.splice(cursor, 1, 1);
-  return flags;
-}
-";
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(
-            pairs.len(),
-            1,
-            "splice twins differing only in the inserted value must stay reportable"
-        );
-    }
-
-    #[test]
-    fn member_target_fold_direction_twins_stay_distinct() {
-        // `this.trail` / `state.trail` accumulators carry the same
-        // append-vs-prepend behavioral difference as local ones.
-        let code = r#"
-export function extendAuditTrail(state: { trail: string }, segments: string[]): void {
-  for (const segment of segments) {
-    state.trail = state.trail + segment + "/";
-  }
-}
-
-export function rewindAuditTrail(state: { trail: string }, segments: string[]): void {
-  for (const segment of segments) {
-    state.trail = segment + "/" + state.trail;
-  }
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert!(
-            pairs.is_empty(),
-            "member-target append vs prepend folds must stay below threshold, got {:?}",
-            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn boundary_atoms_count_occurrences() {
-        // One of TWO `.at()` reads changes boundary: `at[0]=0` survives on
-        // both sides through the other call site, so set semantics would
-        // misread the change as a one-sided addition. Occurrence counting
-        // must flag it as a substitution and keep the pair distinct.
-        let code = r#"
-export function firstOfBoth(alpha: string[], beta: string[]): string {
-  const left = alpha.at(0) ?? "none";
-  const right = beta.at(0) ?? "none";
-  return left + ":" + right;
-}
-
-export function firstAndLast(alpha: string[], beta: string[]): string {
-  const left = alpha.at(0) ?? "none";
-  const right = beta.at(-1) ?? "none";
-  return left + ":" + right;
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert!(
-            pairs.is_empty(),
-            "a substituted boundary among repeated calls must stay below threshold, got {:?}",
-            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn bracket_notation_boundary_twins_stay_distinct() {
-        // `xs["at"](…)` is the same property access as `xs.at(…)` spelled
-        // with brackets — boundary atoms must fire for it too.
-        let code = r#"
-export function newestEntry(entries: string[]): string {
-  const picked = entries["at"](-1);
-  if (picked === undefined) {
-    return "none";
-  }
-  return picked;
-}
-
-export function oldestEntry(entries: string[]): string {
-  const picked = entries["at"](0);
-  if (picked === undefined) {
-    return "none";
-  }
-  return picked;
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert!(
-            pairs.is_empty(),
-            "bracket-notation boundary twins must stay below threshold, got {:?}",
-            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn fold_atoms_count_occurrences() {
-        // Two accumulators: both append on one side; append + prepend on
-        // the other. The shared `fold:head` must not mask the flipped
-        // second accumulator.
-        let code = r#"
-export function buildBothForward(items: string[]): [string, string] {
-  let names = "";
-  let codes = "";
-  for (const item of items) {
-    names = names + item + ",";
-    codes = codes + item + ";";
-  }
-  return [names, codes];
-}
-
-export function buildSecondReversed(items: string[]): [string, string] {
-  let names = "";
-  let codes = "";
-  for (const item of items) {
-    names = names + item + ",";
-    codes = item + ";" + codes;
-  }
-  return [names, codes];
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert!(
-            pairs.is_empty(),
-            "a flipped second accumulator must stay below threshold, got {:?}",
-            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn omitted_zero_defaults_are_not_boundary_twins() {
-        // `xs.slice()` and `xs.slice(0)` copy the same array — one side
-        // spelling the default argument must not trip the boundary cap.
-        let code = r"
-export function cloneQueue(jobs: string[]): string[] {
-  if (jobs.length === 0) {
-    return [];
-  }
-  return jobs.slice();
-}
-
-export function copyQueue(tasks: string[]): string[] {
-  if (tasks.length === 0) {
-    return [];
-  }
-  return tasks.slice(0);
-}
-";
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(pairs.len(), 1, "slice() vs slice(0) twins must stay reportable duplicates");
-    }
-
-    #[test]
-    fn substring_boundary_literals_are_position_insensitive() {
-        // JavaScript swaps substring's arguments after clamping, so
-        // `s.substring(0, cut)` and `s.substring(cut, 0)` select the same
-        // range and must not be capped apart.
-        let code = r#"
-export function headOfLabel(label: string, cut: number): string {
-  if (label.length === 0) {
-    return "";
-  }
-  return label.substring(0, cut);
-}
-
-export function labelPrefix(title: string, cut: number): string {
-  if (title.length === 0) {
-    return "";
-  }
-  return title.substring(cut, 0);
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(
-            pairs.len(),
-            1,
-            "substring(0, cut) vs substring(cut, 0) must stay reportable duplicates"
-        );
-    }
-
-    #[test]
-    fn extra_boundary_arguments_are_ignored_like_javascript() {
-        // `xs.at(0, traceId)` reads the same element as `xs.at(0)` — the
-        // ignored extra argument must not change the recorded arity.
-        let code = r#"
-export function firstJob(jobs: string[], traceId: string): string {
-  const picked = jobs.at(0, traceId);
-  if (picked === undefined) {
-    return "none";
-  }
-  return picked;
-}
-
-export function headJob(tasks: string[], traceId: string): string {
-  const picked = tasks.at(0);
-  if (picked === undefined) {
-    return "none";
-  }
-  return picked;
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(pairs.len(), 1, "at(0) vs at(0, ignored) twins must stay reportable duplicates");
-    }
-
-    #[test]
-    fn string_initialized_locals_prove_fold_direction() {
-        // No literal in the chain, but `let trail = ""` proves the
-        // accumulator is a string — append vs prepend must stay distinct.
-        let code = r#"
-export function joinForward(segments: string[]): string {
-  let trail = "";
-  for (const segment of segments) {
-    trail = trail + segment;
-  }
-  return trail;
-}
-
-export function joinReversed(segments: string[]): string {
-  let trail = "";
-  for (const segment of segments) {
-    trail = segment + trail;
-  }
-  return trail;
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert!(
-            pairs.is_empty(),
-            "string-initialized fold reversals must stay below threshold, got {:?}",
-            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn trailing_undefined_boundary_defaults_are_omitted_args() {
-        // `xs.slice(0, undefined)` copies to the end exactly like
-        // `xs.slice(0)` — the explicit default must not trip the cap.
-        let code = r"
-export function copyBatch(jobs: string[]): string[] {
-  if (jobs.length === 0) {
-    return [];
-  }
-  return jobs.slice(0);
-}
-
-export function cloneBatch(tasks: string[]): string[] {
-  if (tasks.length === 0) {
-    return [];
-  }
-  return tasks.slice(0, undefined);
-}
-";
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(
-            pairs.len(),
-            1,
-            "slice(0) vs slice(0, undefined) twins must stay reportable duplicates"
-        );
-    }
-
-    #[test]
-    fn negative_substring_literals_clamp_to_zero() {
-        // JavaScript clamps substring's negative arguments to 0, so
-        // `substring(-1, cut)` selects the same text as `substring(0, cut)`.
-        let code = r#"
-export function frontOfCode(code: string, cut: number): string {
-  if (code.length === 0) {
-    return "";
-  }
-  return code.substring(-1, cut);
-}
-
-export function codePrefix(text: string, cut: number): string {
-  if (text.length === 0) {
-    return "";
-  }
-  return text.substring(0, cut);
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(
-            pairs.len(),
-            1,
-            "substring(-1, cut) vs substring(0, cut) twins must stay reportable duplicates"
-        );
-    }
-
-    #[test]
-    fn folds_without_string_evidence_get_no_direction_atoms() {
-        // `+` over numbers is commutative: `sum += n` vs `sum = n + sum`
-        // is not a directional rewrite the analyzer can prove, so without
-        // a string literal in the chain the fold-direction atoms must
-        // stay silent (the pair keeps whatever score the tree distance
-        // gives it, uncapped). With a string literal in the chain the
-        // direction IS provable and the atoms fire.
-        use crate::parser::parse_and_convert_to_tree_canonical;
-
-        let fold_atoms = |source: &str| -> Vec<String> {
-            let tree = parse_and_convert_to_tree_canonical("probe.ts", source).unwrap();
-            let mut atoms = AtomSets::default();
-            collect_behavioral_atoms(&tree, &mut atoms);
-            let mut folds: Vec<String> = atoms
-                .synthetic_atoms
-                .into_keys()
-                .filter(|atom| atom.starts_with("fold:"))
-                .collect();
-            folds.sort();
-            folds
-        };
-
-        let numeric_append =
-            "function f(xs: number[]) { let sum = 0; for (const x of xs) { sum += x; } return sum; }";
-        let numeric_prepend =
-            "function f(xs: number[]) { let sum = 0; for (const x of xs) { sum = x + sum; } return sum; }";
-        assert!(fold_atoms(numeric_append).is_empty(), "numeric append must not emit fold atoms");
-        assert!(fold_atoms(numeric_prepend).is_empty(), "numeric prepend must not emit fold atoms");
-
-        let string_append = r#"function f(xs: string[]) { let out = ""; for (const x of xs) { out = out + x + "/"; } return out; }"#;
-        let string_prepend = r#"function f(xs: string[]) { let out = ""; for (const x of xs) { out = x + "/" + out; } return out; }"#;
-        assert_eq!(fold_atoms(string_append), vec!["fold:head".to_string()]);
-        assert_eq!(fold_atoms(string_prepend), vec!["fold:tail".to_string()]);
-    }
-
-    #[test]
-    fn same_direction_folds_still_match() {
-        // Control for the fold-direction atom: two append folds with
-        // renamed identifiers mark the same accumulator position, so the
-        // new atoms must not push a true rename-duplicate below
-        // threshold.
-        let code = r#"
-export function joinSegments(pieces: string[]): string {
-  let joined = "";
-  for (const piece of pieces) {
-    joined += piece + "/";
-  }
-  return joined;
-}
-
-export function gluePath(parts: string[]): string {
-  let glued = "";
-  for (const part of parts) {
-    glued += part + "/";
-  }
-  return glued;
-}
-"#;
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(pairs.len(), 1, "same-direction folds must still report as duplicates");
-    }
-
-    #[test]
-    fn test_extract_functions_marks_similarity_ignore_directives() {
-        let code = r#"
-function keepMe() {
-    return 1;
-}
-
-// similarity-ignore
-function ignoreMe() {
-    return 2;
-}
-
-/**
- * Keep this duplicated export local for now.
- */
-// similarity-ignore
-export function ignoredExport() {
-    return 3;
-}
-"#;
-
-        let functions = extract_functions("test.ts", code).unwrap();
-
-        let keep = functions.iter().find(|f| f.name == "keepMe").unwrap();
-        assert!(!keep.has_ignore_directive);
-
-        let ignored = functions.iter().find(|f| f.name == "ignoreMe").unwrap();
-        assert!(ignored.has_ignore_directive);
-
-        let ignored_export = functions.iter().find(|f| f.name == "ignoredExport").unwrap();
-        assert!(ignored_export.has_ignore_directive);
-    }
-
-    #[test]
-    fn bodiless_declarations_are_not_extracted() {
-        let code = r"
-export function visit(node: Node | undefined, test: (node: Node) => boolean): Node;
-export function visit(node: Node | undefined, test?: (node: Node) => boolean): Node | undefined;
-export function visit(node: Node | undefined, test?: (node: Node) => boolean): Node | undefined {
-    return node;
-}
-declare function readBuffer(path: string): string;
-export abstract class Store {
-    abstract find(id: string): Promise<string>;
-    remove(id: string): Promise<string> {
-        return Promise.resolve(id);
-    }
-}
-";
-        let functions = extract_functions("test.ts", code).unwrap();
-        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["visit", "remove"]);
-    }
-
-    #[test]
-    fn function_expressions_namespaces_and_arrow_fields_are_extracted() {
-        let code = r"
-export const parse = function (line: string): string {
-    return line.trim();
-};
-export namespace Legacy {
-    export function normalize(raw: string): string {
-        return raw.trim();
-    }
-    export namespace Inner {
-        export function deep(raw: string): string {
-            return raw.trim();
-        }
-    }
-}
-export class Relay {
-    handle = (event: string): void => {
-        console.log(event);
-    };
-    static tick = (): number => 1;
-}
-";
-        let functions = extract_functions("test.ts", code).unwrap();
-        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["parse", "normalize", "deep", "handle", "tick"]);
-        assert_eq!(functions[0].function_type, FunctionType::Function);
-        let handle = functions.iter().find(|f| f.name == "handle").unwrap();
-        assert_eq!(handle.function_type, FunctionType::Method);
-        assert_eq!(handle.class_name.as_deref(), Some("Relay"));
-        assert!(!handle.is_arrow_expression);
-        let tick = functions.iter().find(|f| f.name == "tick").unwrap();
-        assert!(tick.is_static);
-        assert!(tick.is_arrow_expression);
-    }
-
-    #[test]
-    fn arrow_field_and_method_twins_are_reported() {
-        // XF-P45 shape.
-        let code = r"
-export class ClickRelay {
-    handle = (event: string): void => {
-        if (!event) {
-            return;
-        }
-        this.sink(event.trim());
-    };
-}
-export class TapRelay {
-    handle(event: string): void {
-        if (!event) {
-            return;
-        }
-        this.sink(event.trim());
-    }
-}
-";
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(pairs.len(), 1, "arrow field vs method must report one pair");
-        assert!((pairs[0].similarity - 1.0).abs() < 1e-9, "got {}", pairs[0].similarity);
-    }
-
-    #[test]
-    fn named_function_expressions_keep_their_self_binding() {
-        // `const factorial = function recur(n) { … recur(n - 1) … }`: the
-        // fragment used to be rebuilt as `function factorial`, leaving
-        // `recur` a free identifier that differed from the twin's `go`.
-        let code = r"
-export const factorial = function recur(n: number): number {
-    if (n <= 1) {
-        return 1;
-    }
-    return n * recur(n - 1);
-};
-export const fact = function go(n: number): number {
-    if (n <= 1) {
-        return 1;
-    }
-    return n * go(n - 1);
-};
-";
-        let functions = extract_functions("test.ts", code).unwrap();
-        assert_eq!(functions[0].name, "factorial");
-        assert_eq!(functions[0].display_name, "recur");
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(pairs.len(), 1, "recursive twins must pair");
-        assert!((pairs[0].similarity - 1.0).abs() < 1e-9, "got {}", pairs[0].similarity);
-    }
-
-    #[test]
-    fn default_exports_take_part() {
-        let code = r"
-export default class Relay {
-    handle(event: string): void {
-        if (!event) {
-            return;
-        }
-        this.sink(event.trim());
-    }
-}
-export class TapRelay {
-    handle(event: string): void {
-        if (!event) {
-            return;
-        }
-        this.sink(event.trim());
-    }
-}
-";
-        let functions = extract_functions("test.ts", code).unwrap();
-        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["handle", "handle"]);
-        assert_eq!(functions[0].class_name.as_deref(), Some("Relay"));
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(pairs.len(), 1, "default-exported class methods must pair");
-
-        let expressions = extract_functions(
-            "test.ts",
-            "export default function (line: string): string {\n    return line.trim();\n}\n",
-        )
-        .unwrap();
-        assert_eq!(expressions[0].name, "default");
-        assert_eq!(
-            build_normalized_fragment(
-                &expressions[0],
-                "export default function (line: string): string {\n    return line.trim();\n}\n"
-            )
-            .text,
-            "function __f_default(line: string) {\n    return line.trim();\n}"
-        );
-        let arrows =
-            extract_functions("test.ts", "export default (line: string) => line.trim();\n")
-                .unwrap();
-        assert_eq!(arrows[0].name, "default");
-        assert!(arrows[0].is_arrow_expression);
-    }
-
-    #[test]
-    fn non_identifier_member_keys_are_named_by_source() {
-        let code = r#"
-export class Mapper {
-    "alpha"(value: number): number { return value + 1; }
-    [Symbol.iterator]() { return this; }
-    0() { return 0; }
-    #hidden() { return 1; }
-    ["dyn" + "amic"] = (): void => {};
-}
-"#;
-        let functions = extract_functions("test.ts", code).unwrap();
-        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["alpha", "[Symbol.iterator]", "0", "#hidden", "[\"dyn\" + \"amic\"]"]
-        );
-        let display: Vec<&str> = functions.iter().map(|f| f.display_name.as_str()).collect();
-        assert_eq!(
-            display,
-            vec!["\"alpha\"", "[Symbol.iterator]", "0", "#hidden", "[\"dyn\" + \"amic\"]"]
-        );
-    }
-
-    #[test]
-    fn overload_signatures_never_pair() {
-        // XF-N41 shape: identical (type-less) parameter lists across
-        // overload signatures used to score 1.0 against each other.
-        let code = r"
-export function visitNode<TIn extends Node | undefined, TOut extends Node>(
-    node: TIn,
-    visitor: Visitor,
-    test: (node: Node) => node is TOut,
-): TOut | (TIn & undefined);
-export function visitNode<TIn extends Node | undefined>(
-    node: TIn,
-    visitor: Visitor,
-    test?: (node: Node) => boolean,
-): Node | (TIn & undefined);
-export function visitNode(node: Node | undefined, visitor: Visitor, test?: (node: Node) => boolean): Node | undefined {
-    if (node === undefined) {
-        return node;
-    }
-    return visitor(node);
-}
-";
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert!(
-            pairs.is_empty(),
-            "overload signatures must not pair, got {:?}",
-            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn named_function_expressions_recurse_through_either_binding() {
-        // `const factorial = function recur(n) { … factorial(n - 1) … }`
-        // recurses through the VARIABLE binding: rebuilding the fragment
-        // under `recur` left `factorial` a free identifier that differed
-        // from the twin's `fact`, so the pair scored 0.75.
-        let code = r"
-export const factorial = function recur(n: number): number {
-    if (n <= 1) {
-        return 1;
-    }
-    const rest = factorial(n - 1);
-    return n * rest;
-};
-export const fact = function go(n: number): number {
-    if (n <= 1) {
-        return 1;
-    }
-    const rest = fact(n - 1);
-    return n * rest;
-};
-export function product(n: number): number {
-    if (n <= 1) {
-        return 1;
-    }
-    const rest = product(n - 1);
-    return n * rest;
-}
-";
-        let functions = extract_functions("test.ts", code).unwrap();
-        assert_eq!(functions[0].self_alias.as_deref(), Some("factorial"));
-        assert_eq!(functions[2].self_alias, None);
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
-        assert_eq!(pairs.len(), 3, "all three recursive twins must pair");
-        assert!(pairs.iter().all(|p| (p.similarity - 1.0).abs() < 1e-9));
-
-        // A local that shadows the alias is the local, not the function.
-        let shadowed = r"
-export const walk = function step(n: number): number {
-    const walk = (k: number) => k * 2;
-    if (n <= 1) {
-        return 1;
-    }
-    return walk(n - 1);
-};
-export const visit = function hop(n: number): number {
-    const visit = (k: number) => k * 2;
-    if (n <= 1) {
-        return 1;
-    }
-    return visit(n - 1);
-};
-";
-        let pairs = find_similar_functions_in_file("test.ts", shadowed, 0.8, &options).unwrap();
-        assert_eq!(pairs.len(), 1);
-    }
-
-    #[test]
-    fn transparent_wrappers_do_not_hide_function_initializers() {
-        let code = r"
-export const parse = (function (line: string): string[] {
-    return line.trim().split(',');
-});
-export const handle = ((line: string): string[] => line.trim().split(',')) satisfies Splitter;
-export const cast = ((line: string) => line.trim().split(',')) as Splitter;
-export const asserted = <Splitter>((line: string) => line.trim().split(','));
-export const forced = ((line: string) => line.trim().split(','))!;
-export default ((line: string) => line.trim().split(','));
-";
-        let functions = extract_functions("test.ts", code).unwrap();
-        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["parse", "handle", "cast", "asserted", "forced", "default"]);
-    }
-
-    #[test]
-    fn object_literal_members_are_extracted() {
-        let code = r#"
-export const handlers = {
-    onSave(doc: Doc): void {
-        if (!doc.dirty) return;
-        store.write(doc.id, doc.body);
-    },
-    onClose: (doc: Doc): void => {
-        store.release(doc.id);
-    },
-    get size(): number {
-        return store.count();
-    },
-    "on-reset": function (doc: Doc): void {
-        doc.body = "";
-    },
-    [Kind.Block]: (data: Data) => visit(data.statements),
-    nested: { flush(): void { store.flush(); } },
-    plain: 42,
-    shorthand,
-};
-export default {
-    transform(code: string): string {
-        return code.trim();
-    },
-};
-function factory() {
-    return { inner(): void { work(); } };
-}
-"#;
-        let functions = extract_functions("test.ts", code).unwrap();
-        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "handlers.onSave",
-                "handlers.onClose",
-                "handlers.size",
-                "handlers.on-reset",
-                "handlers[Kind.Block]",
-                "handlers.nested.flush",
-                "default.transform",
-                "factory",
-            ],
-            "objects bound to a name are scanned; a returned object stays part of its builder"
-        );
-        assert_eq!(functions[0].function_type, FunctionType::Method);
-        assert_eq!(functions[1].function_type, FunctionType::Arrow);
-        assert_eq!(functions[2].method_kind, MethodKind::Getter);
-
-        // An object method and its standalone twin compare as equal.
-        let twins = r"
-export const handlers = {
-    onSave(doc: Doc): void {
-        if (!doc.dirty) return;
-        doc.validate();
-        store.write(doc.id, doc.body);
-    },
-};
-export function persist(document: Doc): void {
-    if (!document.dirty) return;
-    document.validate();
-    store.write(document.id, document.body);
-}
-";
-        let options = TSEDOptions::default();
-        let pairs = find_similar_functions_in_file("test.ts", twins, 0.8, &options).unwrap();
-        assert_eq!(pairs.len(), 1);
-        assert!((pairs[0].similarity - 1.0).abs() < 1e-9, "got {}", pairs[0].similarity);
-    }
-
-    #[test]
-    fn object_members_recurse_through_their_own_name() {
-        // `visit: function walk(node) {… walk(node.left) …}` recurses
-        // through the function expression's own name, which the property
-        // key does not bind. Identifier keys (function-shaped fragment),
-        // reserved-word keys and computed keys (class-wrapped fragment) all
-        // resolve it.
-        let options = TSEDOptions::default();
-        for (left_key, right_key) in
-            [("visit", "visit"), ("delete", "delete"), ("[Kind.Sum]", "[Kind.Sum]")]
-        {
-            let code = format!(
-                r"
-export const visitorA = {{
-    {left_key}: function walk(node: TreeNode): number {{
-        if (node.leaf) {{
-            return node.value;
-        }}
-        const left = walk(node.left);
-        const right = walk(node.right);
-        return left + right;
-    }},
-}};
-export const visitorB = {{
-    {right_key}: function traverse(node: TreeNode): number {{
-        if (node.leaf) {{
-            return node.value;
-        }}
-        const left = traverse(node.left);
-        const right = traverse(node.right);
-        return left + right;
-    }},
-}};
-"
-            );
-            let functions = extract_functions("test.ts", &code).unwrap();
-            assert_eq!(functions[0].self_alias.as_deref(), Some("walk"));
-            let pairs = find_similar_functions_in_file("test.ts", &code, 0.8, &options).unwrap();
-            assert_eq!(pairs.len(), 1, "{left_key}: recursive object members must pair");
-            assert!(
-                (pairs[0].similarity - 1.0).abs() < 1e-9,
-                "{left_key}: got {}",
-                pairs[0].similarity
-            );
-        }
-
-        // The own name resolves to the function only where it is the own
-        // name: a twin calling an outer `walk` helper is not recursion, so
-        // the two bodies are not the same tree.
-        let outer = r"
-export const visitorA = {
-    visit: function walk(node: TreeNode): number {
-        if (node.leaf) {
-            return node.value;
-        }
-        const left = walk(node.left);
-        const right = walk(node.right);
-        return left + right;
-    },
-};
-export const visitorB = {
-    visit: function traverse(node: TreeNode): number {
-        if (node.leaf) {
-            return node.value;
-        }
-        const left = walk(node.left);
-        const right = walk(node.right);
-        return left + right;
-    },
-};
-";
-        let functions = extract_functions("test.ts", outer).unwrap();
-        let similarity =
-            compare_functions(&functions[0], &functions[1], outer, outer, &options).unwrap();
-        assert!(similarity < 1.0 - 1e-9, "recursion vs an outer helper, got {similarity}");
-
-        // Nor is a call spelled like the KEY: the key binds nothing in the
-        // body, so `visit(…)` reaches an outer `visit` and must not resolve
-        // to the function along with the own name.
-        let template = r"
-export const visitorA = {
-    visit: function walk(node: TreeNode): number {
-        if (node.leaf) {
-            return node.value;
-        }
-        const left = walk(node.left);
-        const right = LEFT_RIGHT(node.right);
-        return left + right;
-    },
-};
-export const visitorB = {
-    visit: function traverse(node: TreeNode): number {
-        if (node.leaf) {
-            return node.value;
-        }
-        const left = RIGHT_LEFT(node.left);
-        const right = traverse(node.right);
-        return left + right;
-    },
-};
-";
-        for (left_call, right_call, case) in [
-            // Recursion on the left, an outer `visit` on the right.
-            ("walk", "visit", "own name vs key"),
-            // One body calls itself and the outer `visit`, the other
-            // calls itself twice.
-            ("visit", "traverse", "key and own name vs own name twice"),
-        ] {
-            let code = template.replace("LEFT_RIGHT", left_call).replace("RIGHT_LEFT", right_call);
-            let functions = extract_functions("test.ts", &code).unwrap();
-            let similarity =
-                compare_functions(&functions[0], &functions[1], &code, &code, &options).unwrap();
-            assert!(similarity < 1.0 - 1e-9, "{case}: got {similarity}");
-        }
-    }
-
-    #[test]
-    fn member_keys_bind_nothing_inside_the_body() {
-        let options = TSEDOptions::default();
-
-        // Methods delegating to a helper named like themselves call
-        // different helpers: a facade over two sinks is not one function
-        // twice.
-        let facade = r"
-export const logger = {
-    debug(message: string, ...args: unknown[]): void {
-        if (!settings.enabled) {
-            return;
-        }
-        const line = format(message, args);
-        debug(`${settings.prefix} ${line}`);
-    },
-    info(message: string, ...args: unknown[]): void {
-        if (!settings.enabled) {
-            return;
-        }
-        const line = format(message, args);
-        info(`${settings.prefix} ${line}`);
-    },
-};
-";
-        let pairs = find_similar_functions_in_file("test.ts", facade, 0.8, &options).unwrap();
-        assert!(
-            pairs.is_empty(),
-            "different sinks must not pair, got {:?}",
-            pairs.iter().map(|p| p.similarity).collect::<Vec<_>>()
-        );
-
-        // Every member spelling delegating to the outer `visit` is the same
-        // code: shorthand, named function expression, arrow value, class
-        // method. A recursive `function visit` is different code.
-        let delegating = r"
-export const shorthand = {
-    visit(node: TreeNode): number {
-        if (node.leaf) {
-            return node.value;
-        }
-        const left = visit(node.left);
-        return left + node.value;
-    },
-};
-export const named = {
-    visit: function walk(node: TreeNode): number {
-        if (node.leaf) {
-            return node.value;
-        }
-        const left = visit(node.left);
-        return left + node.value;
-    },
-};
-export const arrow = {
-    visit: (node: TreeNode): number => {
-        if (node.leaf) {
-            return node.value;
-        }
-        const left = visit(node.left);
-        return left + node.value;
-    },
-};
-export class Visitor {
-    visit(node: TreeNode): number {
-        if (node.leaf) {
-            return node.value;
-        }
-        const left = visit(node.left);
-        return left + node.value;
-    }
-}
-export function visit(node: TreeNode): number {
-    if (node.leaf) {
-        return node.value;
-    }
-    const left = visit(node.left);
-    return left + node.value;
-}
-";
-        let functions = extract_functions("test.ts", delegating).unwrap();
-        assert_eq!(functions.len(), 5);
-        let (members, recursive) = functions.split_at(4);
-        for (i, left) in members.iter().enumerate() {
-            for right in &members[i + 1..] {
-                let similarity =
-                    compare_functions(left, right, delegating, delegating, &options).unwrap();
-                assert!(
-                    (similarity - 1.0).abs() < 1e-9,
-                    "{} vs {}: got {similarity}",
-                    left.name,
-                    right.name
-                );
-            }
-            let similarity =
-                compare_functions(left, &recursive[0], delegating, delegating, &options).unwrap();
-            assert!(similarity < 1.0 - 1e-9, "{} vs recursion: got {similarity}", left.name);
-        }
-    }
-
-    #[test]
-    fn synthetic_fragment_names_never_capture_source_references() {
-        let options = TSEDOptions::default();
-        let similarity_of_first_and_last = |code: &str| {
-            let functions = extract_functions("test.ts", code).unwrap();
-            let last = functions.last().unwrap();
-            compare_functions(&functions[0], last, code, code, &options).unwrap()
-        };
-        let body = |callee: &str| {
-            format!(
-                "(n: number): number {{
-        if (n <= 0) {{
-            return 0;
-        }}
-        const rest = {callee}(n - 1);
-        return rest + 1;
-    }}"
-            )
-        };
-        let recursive = format!("export function countdown{}\n", body("countdown"));
-
-        // A call to an outer function spelled like the synthetic name the
-        // fragment is declared under (the method placeholder, the name an
-        // arrow-valued member gets) is not recursion.
-        let method =
-            format!("export const a = {{\n    countdown{},\n}};\n{recursive}", body("__m__"));
-        let similarity = similarity_of_first_and_last(&method);
-        assert!(similarity < 1.0 - 1e-9, "method calling __m__: got {similarity}");
-
-        let arrow = format!(
-            "export const a = {{\n    countdown: (n: number): number => {{
-        if (n <= 0) {{
-            return 0;
-        }}
-        const rest = __sim__(n - 1);
-        return rest + 1;
-    }},\n}};\n{recursive}"
-        );
-        let similarity = similarity_of_first_and_last(&arrow);
-        assert!(similarity < 1.0 - 1e-9, "arrow member calling __sim__: got {similarity}");
-
-        // Class-wrapped: a member calling an outer `__C__` is not the twin
-        // that recurses through its own name.
-        let wrapped = format!(
-            "export const a = {{\n    [Kind.Sum]: function walk{},\n}};
-export const b = {{\n    [Kind.Sum]: function step{},\n}};\n",
-            body("walk"),
-            body("__C__")
-        );
-        let similarity = similarity_of_first_and_last(&wrapped);
-        assert!(similarity < 1.0 - 1e-9, "member calling __C__: got {similarity}");
-
-        // When the source spells the placeholder, the fragment takes
-        // another name, and the own name still resolves to it.
-        let spelled = r#"
-export const a = {
-    visit: function walk(n: number): string {
-        if (n <= 0) {
-            return "__m__";
-        }
-        const rest = walk(n - 1);
-        return rest + "!";
-    },
-};
-export const b = {
-    visit: function step(n: number): string {
-        if (n <= 0) {
-            return "__m__";
-        }
-        const rest = step(n - 1);
-        return rest + "!";
-    },
-};
-"#;
-        let functions = extract_functions("test.ts", spelled).unwrap();
-        let fragment = build_normalized_fragment(&functions[0], spelled);
-        assert_eq!(fragment.binding, "__m__1");
-        assert!(fragment.text.starts_with("function __m__1("), "{}", fragment.text);
-        let similarity = similarity_of_first_and_last(spelled);
-        assert!((similarity - 1.0).abs() < 1e-9, "own-name recursion: got {similarity}");
-    }
-
-    #[test]
-    fn async_and_generator_contracts_cap_identical_bodies() {
-        let options = TSEDOptions::default();
-        let compare = |code: &str| {
-            let functions = extract_functions("test.ts", code).unwrap();
-            compare_functions(&functions[0], &functions[1], code, code, &options).unwrap()
-        };
-        // The sync and async API siblings: same body, different contract.
-        let async_vs_sync = compare(
-            r#"
-export async function getSymbol(declaration: Declaration): Promise<Symbol> {
-    const api = getNodeAPI(declaration);
-    if (!api) throw new Error("Source file not found for declaration");
-    return api.getSymbol(declaration);
-}
-export function getSymbolSync(declaration: Declaration): Symbol {
-    const api = getNodeAPI(declaration);
-    if (!api) throw new Error("Source file not found for declaration");
-    return api.getSymbol(declaration);
-}
-"#,
-        );
-        assert!(async_vs_sync < 0.8, "got {async_vs_sync}");
-
-        // Static methods and accessors keep the class wrapper, whose
-        // method label never carried `async` at all.
-        let static_methods = compare(
-            r#"
-export class Loader {
-    static async load(path: string): Promise<string> {
-        const text = readFileSync(path, "utf8");
-        if (text.length === 0) throw new Error("empty");
-        return text.trim();
-    }
-    static loadSync(path: string): string {
-        const text = readFileSync(path, "utf8");
-        if (text.length === 0) throw new Error("empty");
-        return text.trim();
-    }
-}
-"#,
-        );
-        assert!(static_methods < 0.8, "got {static_methods}");
-
-        // A sync function chaining the same promise is the async twin.
-        let then_chain = compare(
-            r#"
-export function loadOrder(id: string): Promise<unknown> {
-    return fetch("/api/orders/" + id).then((response) => {
-        if (!response.ok) throw new Error("HTTP " + response.status);
-        return response.json();
-    });
-}
-export async function readOrder(id: string): Promise<unknown> {
-    const response = await fetch("/api/orders/" + id);
-    if (!response.ok) throw new Error("HTTP " + response.status);
-    return response.json();
-}
-"#,
-        );
-        assert!(then_chain >= 0.8, "got {then_chain}");
-
-        // A sync function that declares a promise, or returns one it
-        // builds, has the async twin's contract.
-        let declared = compare(
-            r#"
-export function loadUser(id: string): Promise<User> {
-    const url = "/api/users/" + id;
-    log("load", url);
-    return fetch(url).json();
-}
-export async function loadUserAsync(id: string): Promise<User> {
-    const url = "/api/users/" + id;
-    log("load", url);
-    return fetch(url).json();
-}
-"#,
-        );
-        assert!(declared >= 0.8, "got {declared}");
-        let built = compare(
-            r#"
-export function settle(result: Result) {
-    const value = normalize(result);
-    record(value);
-    return Promise.resolve(value);
-}
-export async function settleAsync(result: Result) {
-    const value = normalize(result);
-    record(value);
-    return Promise.resolve(value);
-}
-"#,
-        );
-        assert!(built >= 0.8, "got {built}");
-
-        // An await inside a nested callback is the callback's own.
-        let nested = compare(
-            r#"
-export function startAll(jobs: Job[]): Promise<void>[] {
-    const started = jobs.filter((job) => job.ready);
-    return started.map(async (job) => {
-        await job.run();
-    });
-}
-export async function startAllAsync(jobs: Job[]): Promise<Promise<void>[]> {
-    const started = jobs.filter((job) => job.ready);
-    return started.map(async (job) => {
-        await job.run();
-    });
-}
-"#,
-        );
-        assert!(nested < 0.8, "got {nested}");
-    }
 }

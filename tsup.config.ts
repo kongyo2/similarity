@@ -7,7 +7,11 @@ export default defineConfig([
     target: "node20",
     dts: true,
     sourcemap: true,
-    clean: true,
+    // Everything in `dist` but the WebAssembly engine, which
+    // `npm run build:wasm` puts there and this build does not produce: a
+    // plain `clean: true` left a working tree without an engine after
+    // every `npm run build`.
+    clean: ["!wasm/**"],
     splitting: false,
     outDir: "dist",
   },

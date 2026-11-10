@@ -34,8 +34,11 @@ on TypeScript files and turns its clusters and pairs into a refactoring plan.
 
 Three or more copies of one declaration are reported once, as a **cluster**,
 instead of as every pair among them: five identical `dispose()` methods are
-one block listing five locations, not ten table rows. The JSON report keeps
-every pair in `results`/`byMode` and adds the groups as `clusters`.
+one block listing five locations, not ten table rows. Overlap mode groups
+the same way: a guard clause pasted into five functions is one cluster of
+five fragments, with the fragment's size and syntactic kind. The JSON
+report keeps every pair in `results`/`byMode` and adds the groups as
+`clusters`.
 
 ## What it detects
 
@@ -95,11 +98,14 @@ through either of its names), the methods and function-valued properties of
 an object literal bound to a name or default-exported (`handlers.onSave`,
 nested objects included; a named function expression there recurses
 through its own name), `export default` classes and functions, class
-methods and arrow-function class fields, constructors, and declarations
-inside `namespace`/`module` blocks, which are reported under their
-qualified name (`Legacy.Options`). Bodiless declarations — overload
-signatures, `declare function`, `abstract` methods — are never reported:
-there is no code behind them.
+methods and arrow-function class fields, constructors, classes written as
+an expression bound to a name (`const Store = class { … }`), and
+declarations inside `namespace`/`module` blocks. Each is reported under
+the path that leads to it: a member under its class or object
+(`Repo.save`, `Repo.constructor`, `handlers.onSave`), a declaration in a
+namespace under the namespace (`Legacy.Options`, `Legacy.Repo.save`).
+Bodiless declarations — overload signatures, `declare function`,
+`abstract` methods — are never reported: there is no code behind them.
 
 Rewrites that change behavior keep their distinct shapes on purpose:
 swapped builtins (`.map` vs `.filter`, `Math.max` vs `Math.min`), a
@@ -140,11 +146,22 @@ difference, and a single shared field is not a duplicate class. Twins that
 differ **only in data literals** (a table name, a status code, a locale
 string) are reported — parameterizing them is the refactor.
 
+JSX is compared as structure: elements, attributes and children are nodes
+like any other, so two components pair when their markup does, not when
+the statements around it happen to match.
+
+**Overlap mode** looks inside functions that differ as a whole. A fragment
+of 8 to 30 syntax nodes (`--overlap-min-window`, `--overlap-max-window`)
+that two functions share — a guard clause, a lookup, a block — is reported
+at its own lines, with its size and syntactic kind. Fragments are compared
+as written, without renaming: this mode finds pasted code, the other
+three find rewritten code.
+
 ## Accuracy
 
 Accuracy is tracked by a labeled benchmark (`bench/cases.ts` plus the
 extended corpora in `bench/cases/`) that mirrors the refactoring flow
-above: **337 ground-truth pairs** across functions, types, and classes —
+above: **366 ground-truth pairs** across functions, types, and classes —
 semantic duplicates a refactoring plan must see, and similarly-shaped
 lookalikes it must not flag — evaluated at the default threshold. The
 corpus covers whole-function renames, guard/negation/ternary spellings,
@@ -165,7 +182,11 @@ wrapped initializers — and, since 0.8.1, string literals that contain
 quotes or use single quotes, object members that recurse through their own
 name, methods that delegate to a helper named like themselves, class type
 parameters declared in another order, and constructors that narrow a
-parameter before storing it.
+parameter before storing it — and, since 0.9.0, the syntax the engine used
+to drop or flatten: JSX, call and construct signatures, overloads,
+accessor signatures, members keyed by a number or a symbol, rest
+parameters, destructuring assignments, and classes written as
+expressions.
 
 | Engine | Corpus | Wrong labels | Error rate | Accuracy |
 | --- | --- | ---: | ---: | ---: |
@@ -179,7 +200,9 @@ parameter before storing it.
 | v0.7.0 | 325 pairs | 22 / 325 | 6.77% | 93.23% |
 | v0.8.0 | 325 pairs | 0 / 325 | 0.00% | 100.00% |
 | v0.8.0 | 337 pairs | 12 / 337 | 3.56% | 96.44% |
-| **v0.8.1** | **337 pairs** | **0 / 337** | **0.00%** | **100.00%** |
+| v0.8.1 | 337 pairs | 0 / 337 | 0.00% | 100.00% |
+| v0.8.1 | 366 pairs | 18 / 366 | 4.92% | 95.08% |
+| **v0.9.0** | **366 pairs** | **0 / 366** | **0.00%** | **100.00%** |
 
 v0.7.0 was audited against real code: run over the TypeScript compiler's
 API package, its VS Code extension, and 1,482 conformance test files, the
@@ -213,9 +236,26 @@ different report on each run of the same input and took over five minutes
 on the 59-file TypeScript API package; it is deterministic now, and a
 default run there takes 56 s instead of 314 s.
 
+v0.9.0 was checked against hono, zustand, zod, tRPC, vitest and the
+fixtures of mizchi/similarity, pair for pair against v0.8.1. What the
+v0.8.1 engine did not look at, it could not tell apart: JSX was a single
+leaf, so 1,631 pairs of React components in tRPC's examples were the same
+tree whatever they rendered; an interface that is all call signature was
+an empty shape, so hono's `CssType` paired with `CxType`; an overloaded
+member was its last overload; the left side of a destructuring assignment
+was one leaf; a class bound to a `const` was no class. v0.9.0 compares
+each of them, adds the families to the corpus, and reports the other
+function and class pairs of those codebases as before, but for one pair
+of four-line constructors that a default value now tells apart. Overlap
+mode sees methods and object members and reports a fragment at its own
+lines, a fragment repeated in three or more functions is one cluster, and
+a function is named by the path that leads to it (`ZodOptional.unwrap`,
+not `unwrap`). The scans are indexed: the seven targets take 10 s of
+engine time instead of 132 s.
+
 Run it yourself with `npm run bench:accuracy`; the suite in
 `tests/accuracy-benchmark.test.ts` fails CI if **any** labeled pair is
-mislabeled.
+mislabeled, or if a label names something the report does not.
 
 ## CLI options
 
@@ -228,17 +268,105 @@ mislabeled.
 | `--no-size-penalty` | off | Disable the short-function score penalty |
 | `--same-file-only` / `--cross-file-only` | off | Restrict pair scope |
 | `--extensions <list>` | `ts,tsx,mts,cts` | File extensions to scan |
-| `--exclude <pattern>` | — | Exclude glob (repeatable) |
+| `--exclude <pattern>` | — | Leave out what a gitignore-style pattern matches (repeatable) |
 | `--types-only <kind>` | `all` | Restrict type mode to `interface` or `type` |
 | `--no-allow-cross-kind` | off | Disable interface ⇔ type alias matching |
 | `--type-literals` | off | Include anonymous type literals in type mode |
+| `--overlap-min-window <number>` | `8` | Smallest overlap fragment, in syntax nodes |
+| `--overlap-max-window <number>` | `30` | Largest overlap fragment, in syntax nodes (at most 1000) |
+| `--overlap-size-tolerance <number>` | `0.2` | How far the sizes of two overlapping fragments may differ (0–1) |
 | `--format <pretty\|json>` | `pretty` | Output format |
 | `--output <path>` | — | Write the report to a file (parent directories are created) |
 | `--fail-on-warnings` | off | Non-zero exit on analyzer warnings |
 | `--fail-on-duplicates` | off | Non-zero exit when any pair is reported (CI gate) |
 
 Annotate a declaration with a `// similarity-ignore` comment on the
-preceding line to exclude it from the report.
+preceding line to exclude it from the report. The comment also covers
+what the declaration holds: the members of a class or object literal, the
+functions declared inside a function or namespace.
+
+**What is scanned.** Directories are walked for files with the given
+extensions. Left out are what `--exclude` matches, what the `.gitignore`
+files from the repository root down to the file ignore (with git's
+precedence), `node_modules`, `dist` and `coverage` at any depth, and
+entries whose name starts with a dot; symbolic links are not followed. A
+path named on the command line is scanned whatever it is called
+(`similarity-ts dist`), but not against `.gitignore` or `--exclude`. A
+file that cannot be parsed or read, or is nested too deeply to analyze, is
+skipped with a warning and listed in `skippedFiles`.
+
+## Library
+
+The package is also a library (ESM, Node 20 or later):
+
+```ts
+import { analyzeProject, formatPrettyReport } from "@kongyo2/similarity-ts";
+
+const report = await analyzeProject({
+  paths: ["src"],
+  cwd: process.cwd(),
+  modes: ["functions", "types"],
+  threshold: 0.85,
+  exclude: ["**/*.generated.ts"],
+});
+
+for (const cluster of report.clusters) {
+  console.log(cluster.mode, cluster.members.map((member) => member.symbolName));
+}
+console.log(formatPrettyReport(report, process.cwd(), ["functions", "types"]));
+```
+
+`analyzeProject` takes the options of the command line in camel case
+(`minLines`, `minTokens`, `noSizePenalty`, `sameFileOnly`, `crossFileOnly`,
+`extensions`, `exclude`, `typesOnly`, `allowCrossKind`,
+`includeTypeLiterals`, `overlapMinWindow`, `overlapMaxWindow`,
+`overlapSizeTolerance`) and resolves to the report `--format json` prints:
+
+| Field | Content |
+| --- | --- |
+| `results`, `byMode` | Every pair: `mode`, `similarity`, `left` and `right` (`filePath`, `startLine`, `endLine`, `symbolName`, `kind`), and `details` |
+| `clusters` | Groups of three or more members connected by pairs: `mode`, `members`, `pairCount`, `minSimilarity`, `maxSimilarity`, `averageSimilarity`, and for overlap clusters `fragment` (`nodeCount`, `nodeType`) |
+| `analyzedFiles`, `skippedFiles`, `warnings` | What was read, what was left out, and why |
+| `stats` | `fileCount`, `pairCount`, `clusterCount`, `elapsedMs` |
+
+`formatPrettyReport(report, cwd, modes, { color })` and
+`formatJsonReport(report)` render it the way the command does;
+`resolveAnalyzeOptions` validates options and fills in the defaults, which
+are exported too (`DEFAULT_THRESHOLD`, `DEFAULT_EXCLUDES`, …).
+
+## Development
+
+The package runs on Node 20 and later. Working on it needs Node 22.18 or
+later, Rust (stable) with the `wasm32-unknown-unknown` target, and
+[wasm-pack](https://rustwasm.github.io/wasm-pack/).
+
+```bash
+npm ci
+```
+
+```bash
+npm run build:wasm
+```
+
+```bash
+npm test
+```
+
+`npm run build:wasm` compiles the engine into `dist/wasm`, where the tests
+and `npm run dev -- <paths>` load it from; `npm test` includes the accuracy
+gate. `npm run lint`, `npm run typecheck` and
+`cargo test --manifest-path native/Cargo.toml --workspace` are what CI
+runs besides, and `npm pack` followed by
+`npm run test:package -- <tarball>` installs and uses the package the way
+a user gets it.
+
+| Path | Content |
+| --- | --- |
+| `native/similarity-core-fork` | The engine: parsing (oxc), canonicalization, and the function, type, class and overlap comparisons |
+| `native/similarity-core-ts`, `native/similarity-wasm` | The JSON boundary and its WebAssembly exports |
+| `src` | The command line, the library, file discovery, clusters and report formatting |
+| `bench` | The labeled accuracy corpus |
+| `tests` | The test suite; `tests/accuracy-benchmark.test.ts` is the accuracy gate |
 
 ## References
 
@@ -252,11 +380,11 @@ size-penalty layers documented above are this project's additions on top
 of that metric; the operation-weight sensitivity they exploit is the
 paper's RQ3 finding that TSED's penalty weights are influential and
 language-dependent. Following that finding, the weights are re-validated
-against the labeled corpus on every accuracy release: for 0.8.1 every
-setting in rename 0.2–0.5 × delete/insert 0.8–1.0 classifies all 337 pairs
+against the labeled corpus on every accuracy release: for 0.9.0 every
+setting in rename 0.2–0.5 × delete/insert 0.8–1.0 classifies all 366 pairs
 correctly (the closest call is XF-N36 at rename 0.2, 0.797 against the 0.8
-threshold, the same as on v0.7.0 and v0.8.0), so the calibrated defaults
-stand.
+threshold, the same as on every release since v0.7.0), so the calibrated
+defaults stand.
 
 - Yewei Song, Cedric Lothritz, Daniel Tang, Tegawendé F. Bissyandé, and
   Jacques Klein. 2024. *Revisiting Code Similarity Evaluation with

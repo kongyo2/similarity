@@ -1,19 +1,45 @@
+//! Class comparison: member-by-member structural similarity of two class
+//! shapes, and the pairwise scan.
+
+use std::collections::{HashMap, HashSet};
+
 use crate::class_extractor::{ClassDefinition, ClassMethod, ClassProperty};
 use crate::module_scope::unqualified_name;
-use std::collections::HashMap;
+use crate::text::levenshtein_similarity;
+use crate::type_normalizer::split_top_level;
 
+/// A class prepared for comparison: its members keyed for lookup, with the
+/// spellings the matching passes compare computed once.
 #[derive(Debug, Clone)]
 pub struct NormalizedClass {
     pub name: String,
     /// Members keyed by [`member_key`]: a static member and an instance
     /// member may share a name, and keying by the bare name let one
     /// silently overwrite the other.
-    pub properties: HashMap<String, ClassProperty>,
-    pub methods: HashMap<String, ClassMethod>,
+    pub properties: HashMap<String, NormalizedProperty>,
+    pub methods: HashMap<String, NormalizedMethod>,
     pub constructor_signature: String,
     pub constructor_wiring: Vec<(String, String)>,
     pub extends: Option<String>,
     pub implements: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizedProperty {
+    pub property: ClassProperty,
+    /// The annotation with class-shaped names replaced by a placeholder
+    /// (see [`replace_camelcase_identifiers`]).
+    rename_tolerant_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizedMethod {
+    pub method: ClassMethod,
+    /// `(params) => return type`, as written.
+    signature: String,
+    /// The signature without parameter names and class-shaped names (see
+    /// [`rename_tolerant_signature`]).
+    rename_tolerant_signature: String,
 }
 
 #[derive(Debug, Clone)]
@@ -73,18 +99,42 @@ fn opposite_surface_key(key: &str) -> String {
     }
 }
 
+#[must_use]
 pub fn normalize_class(class: &ClassDefinition) -> NormalizedClass {
-    let mut properties = HashMap::new();
-    for prop in &class.properties {
-        properties.insert(member_key(&prop.name, prop.is_static), prop.clone());
-    }
+    // Member annotations arrive normalized by the extractor (type mode's
+    // renderer plus `normalize_type_name`).
+    let properties = class
+        .properties
+        .iter()
+        .map(|property| {
+            (
+                member_key(&property.name, property.is_static),
+                NormalizedProperty {
+                    rename_tolerant_type: replace_camelcase_identifiers(&property.type_annotation),
+                    property: property.clone(),
+                },
+            )
+        })
+        .collect();
 
-    let mut methods = HashMap::new();
-    for method in &class.methods {
-        // Member annotations arrive normalized by the extractor (type
-        // mode's renderer plus `normalize_type_name`).
-        methods.insert(member_key(&method.name, method.is_static), method.clone());
-    }
+    let methods = class
+        .methods
+        .iter()
+        .map(|method| {
+            (
+                member_key(&method.name, method.is_static),
+                NormalizedMethod {
+                    signature: format!(
+                        "({}) => {}",
+                        method.parameters.join(", "),
+                        method.return_type
+                    ),
+                    rename_tolerant_signature: rename_tolerant_signature(method),
+                    method: method.clone(),
+                },
+            )
+        })
+        .collect();
 
     let constructor_signature = if class.constructor_params.is_empty() {
         "()".to_string()
@@ -110,35 +160,35 @@ pub fn normalize_class(class: &ClassDefinition) -> NormalizedClass {
 
 /// Strip parameter names and class-shaped tokens so two methods that have
 /// the same structural signature but sit in renamed classes can still be
-/// recognised as matching. Used only by the fuzzy method-pairing pass.
+/// recognised as matching.
 ///
 /// `ClassMethod.parameters` is populated by the class extractor as a
 /// one-element `Vec<String>` containing the whole comma-separated
 /// parameter list (e.g. `["a: A, b: B"]`). Splitting it requires
 /// brackets-aware handling because parameter types legitimately contain
 /// commas (`Map<string, number>`, tuples `[a, b]`, object literals,
-/// function types `(a, b) => c`); a naive `split(',')` would otherwise
-/// shred those types and break the rename-detection fast path.
+/// function types `(a, b) => c`).
 ///
 /// Class-shaped tokens (CamelCase identifiers) get a placeholder both in
 /// parameter types AND in the return type — a method whose body
 /// references the surrounding class also exposes that class in its
 /// parameter signature, and we want renamed-class methods to match on
 /// either side.
-fn normalize_signature_for_fuzzy(method: &ClassMethod) -> String {
+fn rename_tolerant_signature(method: &ClassMethod) -> String {
     let joined = method.parameters.join(", ");
     let stripped_params: Vec<String> = if joined.trim().is_empty() {
         Vec::new()
     } else {
-        split_parameter_list(&joined)
-            .into_iter()
+        split_top_level(&joined, ',')
+            .iter()
+            .filter(|piece| !piece.is_empty())
             .map(|piece| {
                 // Drop the parameter NAME but keep what it said about the
                 // parameter: `x?: T` is optional and `...xs: T[]` is the
                 // rest parameter, both part of the call contract.
                 let (head, without_name) = match piece.find(':') {
                     Some(idx) => (piece[..idx].trim(), piece[idx + 1..].trim()),
-                    None => ("", piece),
+                    None => ("", piece.as_str()),
                 };
                 let marker = if head.starts_with("...") {
                     "..."
@@ -155,33 +205,9 @@ fn normalize_signature_for_fuzzy(method: &ClassMethod) -> String {
     format!("({}) => {}", stripped_params.join(", "), normalized_return)
 }
 
-/// Split a parameter list on top-level commas, ignoring commas that sit
-/// inside `<>`, `()`, `[]` or `{}`. Returned slices are trimmed.
-fn split_parameter_list(input: &str) -> Vec<&str> {
-    let mut parts: Vec<&str> = Vec::new();
-    let mut depth: i32 = 0;
-    let mut start = 0;
-    for (idx, ch) in input.char_indices() {
-        match ch {
-            '<' | '(' | '[' | '{' => depth += 1,
-            '>' | ')' | ']' | '}' => depth = (depth - 1).max(0),
-            ',' if depth == 0 => {
-                let piece = input[start..idx].trim();
-                if !piece.is_empty() {
-                    parts.push(piece);
-                }
-                start = idx + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    let tail = input[start..].trim();
-    if !tail.is_empty() {
-        parts.push(tail);
-    }
-    parts
-}
-
+/// Replace every class-shaped (CamelCase) identifier with one placeholder,
+/// so `repo: InvoiceRepo` and `repo: ReceiptRepo` — the same dependency
+/// slot in two renamed class families — spell the same.
 fn replace_camelcase_identifiers(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let is_token_char = |ch: char| ch.is_ascii_alphabetic() || ch == '_' || ch.is_ascii_digit();
@@ -210,39 +236,32 @@ fn replace_camelcase_identifiers(input: &str) -> String {
         // not a class renamed along with its family, and placeholdering
         // every segment made all qualified references compare equal.
         let qualified = (start > 0 && is_qualifier_dot(start - 1)) || is_qualifier_dot(index);
-        if qualified {
-            out.push_str(&token);
+        // Primitive type names (string, number, boolean, void, …) are
+        // lowercase and stay intact.
+        let is_camel_class = token.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && token.chars().any(|c| c.is_ascii_lowercase());
+        if is_camel_class && !qualified {
+            out.push_str("#T");
         } else {
-            push_identifier_token(&token, &mut out);
+            out.push_str(&token);
         }
     }
     out
 }
 
-fn push_identifier_token(token: &str, out: &mut String) {
-    if token.is_empty() {
-        return;
-    }
-    let is_camel_class = token.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && token.chars().any(|c| c.is_ascii_lowercase());
-    if is_camel_class {
-        // Substitute a fixed placeholder so two class names of the same
-        // shape collapse together. Primitive type names (string, number,
-        // boolean, void, etc.) stay intact since they're lowercase.
-        out.push_str("#T");
-    } else {
-        out.push_str(token);
-    }
-}
-
+/// Rough Jaccard on alphabetic tokens. Good enough to give a small bonus
+/// when two normalised signatures share a few tokens but aren't identical
+/// (e.g. partially overlapping parameter types).
+#[allow(clippy::cast_precision_loss)]
 fn normalized_signature_overlap(sig1: &str, sig2: &str) -> f64 {
-    // Rough Jaccard on alphabetic tokens. Good enough to give a small
-    // bonus when two normalised signatures share a few tokens but aren't
-    // identical (e.g. partially overlapping parameter types).
-    let tokens1: std::collections::HashSet<&str> =
-        sig1.split(|c: char| !c.is_ascii_alphabetic()).filter(|s| !s.is_empty()).collect();
-    let tokens2: std::collections::HashSet<&str> =
-        sig2.split(|c: char| !c.is_ascii_alphabetic()).filter(|s| !s.is_empty()).collect();
+    let tokens = |signature: &'_ str| -> HashSet<String> {
+        signature
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (tokens1, tokens2) = (tokens(sig1), tokens(sig2));
     if tokens1.is_empty() && tokens2.is_empty() {
         return 1.0;
     }
@@ -255,22 +274,29 @@ fn normalized_signature_overlap(sig1: &str, sig2: &str) -> f64 {
     }
 }
 
+#[must_use]
 pub fn compare_classes(
     class1: &ClassDefinition,
     class2: &ClassDefinition,
 ) -> ClassComparisonResult {
-    let norm1 = normalize_class(class1);
-    let norm2 = normalize_class(class2);
+    compare_normalized_classes(&normalize_class(class1), &normalize_class(class2))
+}
 
-    // Calculate naming similarity. Namespace qualifiers stay out of it:
-    // `Legacy.Pager` vs `Pager` is the same name, and two unrelated
-    // classes in the same namespace must not read as lexically related
-    // because they share its prefix.
+/// [`compare_classes`] for classes that are already normalized — a scan
+/// normalizes each class once, not once per pair it takes part in.
+#[must_use]
+pub fn compare_normalized_classes(
+    class1: &NormalizedClass,
+    class2: &NormalizedClass,
+) -> ClassComparisonResult {
+    // Namespace qualifiers stay out of name similarity: `Legacy.Pager` vs
+    // `Pager` is the same name, and two unrelated classes in the same
+    // namespace must not read as lexically related because they share its
+    // prefix.
     let naming_similarity =
         calculate_name_similarity(unqualified_name(&class1.name), unqualified_name(&class2.name));
 
-    // Calculate structural similarity
-    let (structural_similarity, differences) = calculate_structural_similarity(&norm1, &norm2);
+    let (structural_similarity, differences) = calculate_structural_similarity(class1, class2);
 
     // Combined similarity (weighted average). Structural evidence
     // dominates, mirroring the type comparator's 0.85/0.15 rebalance: a
@@ -288,16 +314,7 @@ fn calculate_name_similarity(name1: &str, name2: &str) -> f64 {
     if name1 == name2 {
         return 1.0;
     }
-
-    // Calculate Levenshtein distance (char-based, like the distance).
-    let distance = levenshtein_distance(name1, name2);
-    let max_len = name1.chars().count().max(name2.chars().count()) as f64;
-
-    if max_len > 0.0 {
-        1.0 - (distance as f64 / max_len)
-    } else {
-        1.0
-    }
+    levenshtein_similarity(name1, name2)
 }
 
 /// Multiplier applied to a matched method pair's credit reflecting how
@@ -353,7 +370,7 @@ fn match_member_keys<'a, T>(
 ) -> Vec<(&'a str, &'a str)> {
     let mut keys1: Vec<&String> = members1.keys().collect();
     keys1.sort();
-    let mut matched2: std::collections::HashSet<&str> = Default::default();
+    let mut matched2: HashSet<&str> = HashSet::new();
     let mut pairs = Vec::new();
     let mut leftovers = Vec::new();
     for key in keys1 {
@@ -373,6 +390,19 @@ fn match_member_keys<'a, T>(
         }
     }
     pairs
+}
+
+/// The keys of `members` that are not in `matched`, sorted. Sorting makes
+/// the greedy fuzzy passes produce the same pairings on every run (hash
+/// map iteration order is randomised).
+fn sorted_leftovers<'a, T>(
+    members: &'a HashMap<String, T>,
+    matched: &HashSet<&str>,
+) -> Vec<&'a str> {
+    let mut leftovers: Vec<&str> =
+        members.keys().map(String::as_str).filter(|key| !matched.contains(key)).collect();
+    leftovers.sort_unstable();
+    leftovers
 }
 
 /// Constructor-wiring positions on which the two classes disagree: the
@@ -399,22 +429,16 @@ fn wiring_mismatches(
     };
     let targets1 = targets(wiring1);
     let targets2 = targets(wiring2);
-    let mut parameters: Vec<&String> = targets1.keys().chain(targets2.keys()).collect();
-    parameters.sort();
-    parameters.dedup();
-    parameters
-        .into_iter()
-        .filter(|parameter| {
-            let empty = Vec::new();
-            let list1 = targets1.get(*parameter).unwrap_or(&empty);
-            let list2 = targets2.get(*parameter).unwrap_or(&empty);
+    targets1
+        .iter()
+        .filter(|(parameter, list1)| {
             // A parameter only one constructor wires is an extra (or
             // missing) parameter or field, which the member tally already
             // counts; only a parameter both sides store somewhere
             // DIFFERENT is miswired.
-            if list1.is_empty() || list2.is_empty() {
+            let Some(list2) = targets2.get(*parameter) else {
                 return false;
-            }
+            };
             let mut translated: Vec<String> = list1
                 .iter()
                 .map(|target| {
@@ -431,6 +455,7 @@ fn wiring_mismatches(
         .count()
 }
 
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn calculate_structural_similarity(
     class1: &NormalizedClass,
     class2: &NormalizedClass,
@@ -457,12 +482,13 @@ fn calculate_structural_similarity(
     // unrelated types.
     let mut property_score = 0.0;
     let property_total_count = (class1.properties.len() + class2.properties.len()) as f64;
-    let mut matched_in_class1: std::collections::HashSet<&str> = Default::default();
-    let mut matched_in_class2: std::collections::HashSet<&str> = Default::default();
+    let mut matched_in_class1: HashSet<&str> = HashSet::new();
+    let mut matched_in_class2: HashSet<&str> = HashSet::new();
 
     for (key1, key2) in match_member_keys(&class1.properties, &class2.properties) {
-        let prop1 = &class1.properties[key1];
-        let prop2 = &class2.properties[key2];
+        let normalized1 = &class1.properties[key1];
+        let normalized2 = &class2.properties[key2];
+        let (prop1, prop2) = (&normalized1.property, &normalized2.property);
         let modifier_factor = property_modifier_factor(prop1, prop2);
         // Class-reference types tolerate renames: `repo: InvoiceRepo`
         // and `repo: ReceiptRepo` are the same dependency slot in two
@@ -471,8 +497,7 @@ fn calculate_structural_similarity(
         // untouched — `count: number` vs `count: string` stays a
         // genuine mismatch.
         if prop1.type_annotation == prop2.type_annotation
-            || replace_camelcase_identifiers(&prop1.type_annotation)
-                == replace_camelcase_identifiers(&prop2.type_annotation)
+            || normalized1.rename_tolerant_type == normalized2.rename_tolerant_type
         {
             // Strict match — credit both class1 and class2 sides.
             property_score += 2.0 * modifier_factor;
@@ -492,35 +517,20 @@ fn calculate_structural_similarity(
         matched_in_class2.insert(key2);
     }
 
-    // Sorting both leftover lists makes the greedy match below produce
-    // the same pairings on every run for a given input (the HashMap
-    // iteration order is randomised in Rust).
-    let mut leftovers_class1: Vec<&str> = class1
-        .properties
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !matched_in_class1.contains(key))
-        .collect();
-    leftovers_class1.sort();
-    let mut leftovers_class2: Vec<&str> = class2
-        .properties
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !matched_in_class2.contains(key))
-        .collect();
-    leftovers_class2.sort();
+    let leftovers_class1 = sorted_leftovers(&class1.properties, &matched_in_class1);
+    let leftovers_class2 = sorted_leftovers(&class2.properties, &matched_in_class2);
 
     // Greedy best-match by type for the leftovers. This is N×M but class
     // properties are typically a handful so the quadratic factor is fine.
-    let mut leftover_consumed_class2: std::collections::HashSet<String> = Default::default();
+    let mut leftover_consumed_class2: HashSet<&str> = HashSet::new();
     for name1 in &leftovers_class1 {
-        let prop1 = &class1.properties[*name1];
+        let prop1 = &class1.properties[*name1].property;
         let mut best_match: Option<(&str, f64)> = None;
         for name2 in &leftovers_class2 {
-            if leftover_consumed_class2.contains(*name2) {
+            if leftover_consumed_class2.contains(name2) {
                 continue;
             }
-            let prop2 = &class2.properties[*name2];
+            let prop2 = &class2.properties[*name2].property;
             // Score: type match dominates, name similarity tie-breaks.
             let type_match = if prop1.type_annotation == prop2.type_annotation {
                 1.0
@@ -534,8 +544,12 @@ fn calculate_structural_similarity(
                     .zip(prop2.type_annotation.chars())
                     .take_while(|(a, b)| a == b)
                     .count();
-                let max_len =
-                    prop1.type_annotation.len().max(prop2.type_annotation.len()).max(1) as f64;
+                let max_len = prop1
+                    .type_annotation
+                    .chars()
+                    .count()
+                    .max(prop2.type_annotation.chars().count())
+                    .max(1) as f64;
                 (shared_prefix as f64 / max_len).min(0.6)
             } else {
                 0.4
@@ -553,8 +567,8 @@ fn calculate_structural_similarity(
             if score >= 0.7 {
                 // Credit it as a rename match — both sides count.
                 property_score += 2.0 * score;
-                leftover_consumed_class2.insert(name2.to_string());
-                let prop2 = &class2.properties[name2];
+                leftover_consumed_class2.insert(name2);
+                let prop2 = &class2.properties[name2].property;
                 if !prop1.is_static && !prop2.is_static {
                     field_pairing.insert(prop1.name.clone(), prop2.name.clone());
                 }
@@ -564,7 +578,7 @@ fn calculate_structural_similarity(
         missing_properties.push((*name1).to_string());
     }
     for name2 in &leftovers_class2 {
-        if !leftover_consumed_class2.contains(*name2) {
+        if !leftover_consumed_class2.contains(name2) {
             extra_properties.push((*name2).to_string());
         }
     }
@@ -577,82 +591,62 @@ fn calculate_structural_similarity(
 
     let method_total_count = (class1.methods.len() + class2.methods.len()) as f64;
     let mut method_score = 0.0;
-    let mut method_matched_in_class1: std::collections::HashSet<&str> = Default::default();
-    let mut method_matched_in_class2: std::collections::HashSet<&str> = Default::default();
+    let mut method_matched_in_class1: HashSet<&str> = HashSet::new();
+    let mut method_matched_in_class2: HashSet<&str> = HashSet::new();
 
     for (key1, key2) in match_member_keys(&class1.methods, &class2.methods) {
-        let method1 = &class1.methods[key1];
-        let method2 = &class2.methods[key2];
-        let sig1 = format!("({}) => {}", method1.parameters.join(", "), method1.return_type);
-        let sig2 = format!("({}) => {}", method2.parameters.join(", "), method2.return_type);
+        let normalized1 = &class1.methods[key1];
+        let normalized2 = &class2.methods[key2];
         // Parameter renames (`findById(id)` vs `findById(key)`) are
         // neutral refactors — when the name matches and the
         // name-stripped signatures agree, credit a full match instead
         // of the partial-mismatch rate.
-        let agreement = method_agreement_factor(method1, method2);
-        if sig1 == sig2
-            || normalize_signature_for_fuzzy(method1) == normalize_signature_for_fuzzy(method2)
-        {
-            method_score += 2.0 * agreement;
-            if agreement < 1.0 {
-                method_signature_mismatches.push(MethodMismatch {
-                    name: method1.name.clone(),
-                    signature1: sig1,
-                    signature2: sig2,
-                });
-            }
-        } else {
-            method_score += 1.4 * agreement;
+        let agreement = method_agreement_factor(&normalized1.method, &normalized2.method);
+        let signatures_agree = normalized1.signature == normalized2.signature
+            || normalized1.rename_tolerant_signature == normalized2.rename_tolerant_signature;
+        let credit = if signatures_agree { 2.0 } else { 1.4 };
+        method_score += credit * agreement;
+        if !signatures_agree || agreement < 1.0 {
             method_signature_mismatches.push(MethodMismatch {
-                name: method1.name.clone(),
-                signature1: sig1,
-                signature2: sig2,
+                name: normalized1.method.name.clone(),
+                signature1: normalized1.signature.clone(),
+                signature2: normalized2.signature.clone(),
             });
         }
         method_matched_in_class1.insert(key1);
         method_matched_in_class2.insert(key2);
     }
 
-    let mut method_leftovers_class1: Vec<&str> = class1
-        .methods
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !method_matched_in_class1.contains(key))
-        .collect();
-    method_leftovers_class1.sort();
-    let mut method_leftovers_class2: Vec<&str> = class2
-        .methods
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !method_matched_in_class2.contains(key))
-        .collect();
-    method_leftovers_class2.sort();
+    let method_leftovers_class1 = sorted_leftovers(&class1.methods, &method_matched_in_class1);
+    let method_leftovers_class2 = sorted_leftovers(&class2.methods, &method_matched_in_class2);
 
-    let mut method_leftover_consumed: std::collections::HashSet<String> = Default::default();
+    let mut method_leftover_consumed: HashSet<&str> = HashSet::new();
     for name1 in &method_leftovers_class1 {
-        let method1 = &class1.methods[*name1];
-        let sig1 = format!("({}) => {}", method1.parameters.join(", "), method1.return_type);
-        let normalized_sig1 = normalize_signature_for_fuzzy(method1);
+        let normalized1 = &class1.methods[*name1];
+        let method1 = &normalized1.method;
         let mut best_match: Option<(&str, f64)> = None;
         for name2 in &method_leftovers_class2 {
-            if method_leftover_consumed.contains(*name2) {
+            if method_leftover_consumed.contains(name2) {
                 continue;
             }
-            let method2 = &class2.methods[*name2];
-            let sig2 = format!("({}) => {}", method2.parameters.join(", "), method2.return_type);
-            let normalized_sig2 = normalize_signature_for_fuzzy(method2);
+            let normalized2 = &class2.methods[*name2];
+            let method2 = &normalized2.method;
             // Tiered signature match: exact > param-shape-only > nothing.
             // The "param-shape" tier strips identifier names from
             // parameters and the surrounding-class name from the return
             // type, so methods that genuinely have the same shape but
             // sit in renamed classes (UserBuilder.withName vs
             // CustomerBuilder.withLabel) still register as similar.
-            let sig_match = if sig1 == sig2 {
+            let sig_match = if normalized1.signature == normalized2.signature {
                 1.0
-            } else if normalized_sig1 == normalized_sig2 {
+            } else if normalized1.rename_tolerant_signature == normalized2.rename_tolerant_signature
+            {
                 0.85
             } else {
-                let name_overlap = normalized_signature_overlap(&normalized_sig1, &normalized_sig2);
+                let name_overlap = normalized_signature_overlap(
+                    &normalized1.rename_tolerant_signature,
+                    &normalized2.rename_tolerant_signature,
+                );
                 0.4 + 0.4 * name_overlap
             };
             let name_sim = calculate_name_similarity(&method1.name, &method2.name);
@@ -686,16 +680,16 @@ fn calculate_structural_similarity(
             // structurally different method with a tangentially similar
             // name does not.
             if score >= 0.65 {
-                let method2 = &class2.methods[name2];
+                let method2 = &class2.methods[name2].method;
                 method_score += 2.0 * score * method_agreement_factor(method1, method2);
-                method_leftover_consumed.insert(name2.to_string());
+                method_leftover_consumed.insert(name2);
                 continue;
             }
         }
         missing_methods.push((*name1).to_string());
     }
     for name2 in &method_leftovers_class2 {
-        if !method_leftover_consumed.contains(*name2) {
+        if !method_leftover_consumed.contains(name2) {
             extra_methods.push((*name2).to_string());
         }
     }
@@ -770,90 +764,33 @@ fn calculate_structural_similarity(
     (structural_similarity, differences)
 }
 
-fn levenshtein_distance(s1: &str, s2: &str) -> usize {
-    // Operate on CHAR counts throughout. Sizing the matrix by byte length
-    // while filling it by char iteration used to leave the bottom-right
-    // cell untouched for multibyte names, so any two non-ASCII class
-    // names compared as distance 0 (similarity 1.0).
-    let chars1: Vec<char> = s1.chars().collect();
-    let chars2: Vec<char> = s2.chars().collect();
-    let len1 = chars1.len();
-    let len2 = chars2.len();
-
-    if len1 == 0 {
-        return len2;
-    }
-    if len2 == 0 {
-        return len1;
-    }
-
-    let mut matrix = vec![vec![0usize; len2 + 1]; len1 + 1];
-    for (i, row) in matrix.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, cell) in matrix[0].iter_mut().enumerate() {
-        *cell = j;
-    }
-
-    for i in 1..=len1 {
-        for j in 1..=len2 {
-            let cost = usize::from(chars1[i - 1] != chars2[j - 1]);
-            matrix[i][j] =
-                (matrix[i - 1][j] + 1).min(matrix[i][j - 1] + 1).min(matrix[i - 1][j - 1] + cost);
-        }
-    }
-
-    matrix[len1][len2]
-}
-
+/// Compare every pair of classes and return those at or above `threshold`,
+/// most similar first. Classes under a `// similarity-ignore` directive
+/// take no part.
+#[must_use]
 pub fn find_similar_classes(classes: &[ClassDefinition], threshold: f64) -> Vec<SimilarClassPair> {
+    let candidates: Vec<(&ClassDefinition, NormalizedClass)> = classes
+        .iter()
+        .filter(|class| !class.has_ignore_directive)
+        .map(|class| (class, normalize_class(class)))
+        .collect();
+
     let mut similar_pairs = Vec::new();
-
-    for i in 0..classes.len() {
-        // `// similarity-ignore` excludes a class from the report the same
-        // way it excludes functions and types; the extractor recorded the
-        // directive but nothing consulted it, so ignored classes kept
-        // pairing.
-        if classes[i].has_ignore_directive {
-            continue;
-        }
-        for j in i + 1..classes.len() {
-            if classes[j].has_ignore_directive {
-                continue;
-            }
-            let result = compare_classes(&classes[i], &classes[j]);
-
+    for (i, (class1, normalized1)) in candidates.iter().enumerate() {
+        for (class2, normalized2) in &candidates[i + 1..] {
+            let result = compare_normalized_classes(normalized1, normalized2);
             if result.similarity >= threshold {
                 similar_pairs.push(SimilarClassPair {
-                    class1: classes[i].clone(),
-                    class2: classes[j].clone(),
+                    class1: (*class1).clone(),
+                    class2: (*class2).clone(),
                     result,
                 });
             }
         }
     }
 
-    // Sort by similarity (highest first)
-    similar_pairs.sort_by(|a, b| {
-        b.result.similarity.partial_cmp(&a.result.similarity).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
+    similar_pairs.sort_by(|a, b| b.result.similarity.total_cmp(&a.result.similarity));
     similar_pairs
-}
-
-pub fn find_similar_classes_across_files(
-    files: &[(String, String)],
-    threshold: f64,
-) -> Vec<SimilarClassPair> {
-    let mut all_classes = Vec::new();
-
-    for (file_path, content) in files {
-        if let Ok(classes) = crate::class_extractor::extract_classes_from_code(content, file_path) {
-            all_classes.extend(classes);
-        }
-    }
-
-    find_similar_classes(&all_classes, threshold)
 }
 
 #[cfg(test)]

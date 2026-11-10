@@ -1,4 +1,8 @@
-export type AnalyzerMode = "functions" | "types" | "classes" | "overlap";
+import type { ANALYZER_MODES, TYPE_FILTERS } from "./defaults.js";
+
+export type AnalyzerMode = (typeof ANALYZER_MODES)[number];
+/** Which declarations type mode compares. */
+export type TypeFilter = (typeof TYPE_FILTERS)[number];
 
 export interface AnalyzerLocation {
   filePath: string;
@@ -17,14 +21,26 @@ export interface SimilarityPair {
 }
 
 /**
- * A group of three or more declarations connected by reported pairs of
- * one mode (functions, types or classes): the copies a refactor would
- * consolidate into one.
+ * What the members of an overlap cluster are copies of: a fragment of
+ * `nodeCount` syntax nodes under a `nodeType` node (`IfStatement`,
+ * `VariableDeclaration`, …).
+ */
+export interface SimilarityFragment {
+  nodeCount: number;
+  nodeType: string;
+}
+
+/**
+ * A group of three or more declarations — in overlap mode, fragments of
+ * functions — connected by reported pairs of one mode: the copies a
+ * refactor would consolidate into one.
  */
 export interface SimilarityCluster {
   mode: AnalyzerMode;
-  /** Every declaration in the group, in path/line order. */
+  /** Every member of the group, in path/line order. */
   members: AnalyzerLocation[];
+  /** In overlap mode, the fragment the members are copies of. */
+  fragment?: SimilarityFragment;
   /** Reported pairs between members. */
   pairCount: number;
   maxSimilarity: number;
@@ -54,7 +70,7 @@ export interface AnalyzeProjectOptions {
   crossFileOnly?: boolean;
   extensions?: string[];
   exclude?: string[];
-  typesOnly?: "interface" | "type" | "all";
+  typesOnly?: TypeFilter;
   /**
    * When true (the default), an `interface` and a structurally identical
    * `type` alias are eligible to match. Set to `false` to restrict the
@@ -79,8 +95,8 @@ export interface AnalyzeReport {
   results: SimilarityPair[];
   byMode: Record<AnalyzerMode, SimilarityPair[]>;
   /**
-   * Duplicate clusters of the functions, types and classes modes (see
-   * {@link SimilarityCluster}); their pairs stay listed in `byMode`.
+   * Duplicate clusters of every mode (see {@link SimilarityCluster}), in
+   * mode order; their pairs stay listed in `byMode`.
    */
   clusters: SimilarityCluster[];
   stats: {

@@ -9,6 +9,16 @@
  *   Missing one is a false negative.
  * - `forbidPairs` are similarly-shaped but semantically different symbols.
  *   Reporting one is a false positive that pollutes the plan.
+ * - `unscoredPairs` are symbols the mode does not compare at all: too
+ *   short for the line gate, or declared without a body. Reporting one is
+ *   a false positive like any other.
+ *
+ * Pairs are labeled by the names the report gives them: a member under
+ * its class or object (`Repo.save`, `handlers.onSave`), a declaration in
+ * a namespace under the namespace (`Legacy.parse`). A label that names
+ * nothing would pass as "not reported" forever, so the benchmark checks
+ * that every label resolves: an expected or forbidden pair has a score,
+ * an unscored pair has none.
  *
  * All cases are evaluated with the CLI defaults from the README invocation
  * (threshold 0.8, minLines 3) in the mode the case targets.
@@ -17,6 +27,7 @@
 import { classAndScenarioCases } from "./cases/classes-and-scenarios.js";
 import { functionNegativeCases } from "./cases/functions-negative.js";
 import { functionPositiveCases } from "./cases/functions-positive.js";
+import { syntaxCoverageCases } from "./cases/syntax-coverage.js";
 import { typeCases } from "./cases/types.js";
 
 export type BenchMode = "functions" | "types" | "classes";
@@ -29,6 +40,7 @@ export interface BenchCase {
   files: Record<string, string>;
   expectPairs?: [string, string][];
   forbidPairs?: [string, string][];
+  unscoredPairs?: [string, string][];
 }
 
 /**
@@ -154,7 +166,7 @@ export function formatCost(amount: number, currency: string): string {
 }
 `,
     },
-    expectPairs: [["formatPrice", "formatCost"]],
+    expectPairs: [["PriceFormatter.formatPrice", "formatCost"]],
   },
   {
     id: "F-P05",
@@ -567,7 +579,7 @@ export class CustomerRepository {
 }
 `,
     },
-    expectPairs: [["findById", "findById"]],
+    expectPairs: [["UserRepository.findById", "CustomerRepository.findById"]],
   },
   {
     id: "F-P19",
@@ -645,7 +657,7 @@ export class SessionStore {
 }
 `,
     },
-    expectPairs: [["#readEntry", "#loadEntry"]],
+    expectPairs: [["ProfileStore.#readEntry", "SessionStore.#loadEntry"]],
   },
   {
     id: "F-P22",
@@ -765,7 +777,7 @@ export async function fetchReportBody(reportId: string): Promise<string> {
 }
 `,
     },
-    expectPairs: [["downloadReport", "fetchReportBody"]],
+    expectPairs: [["ReportClient.downloadReport", "fetchReportBody"]],
   },
   {
     id: "F-P26",
@@ -871,7 +883,7 @@ export const mul = (a: number, b: number) => a * b;
 export const div = (a: number, b: number) => a / b;
 `,
     },
-    forbidPairs: [
+    unscoredPairs: [
       ["add", "sub"],
       ["mul", "div"],
       ["add", "div"],
@@ -981,7 +993,7 @@ export class Person {
 }
 `,
     },
-    forbidPairs: [["getName", "getAge"]],
+    forbidPairs: [["Person.getName", "Person.getAge"]],
   },
   {
     id: "F-N06",
@@ -1764,4 +1776,5 @@ export const benchCases: BenchCase[] = [
   ...functionNegativeCases,
   ...typeCases,
   ...classAndScenarioCases,
+  ...syntaxCoverageCases,
 ];

@@ -1,17 +1,9 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { analyzeProject, resolveAnalyzeOptions } from "../src/index.js";
-
-async function withTempProject(run: (projectDir: string) => Promise<void>) {
-  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "similarity-ts-"));
-  try {
-    await run(tempRoot);
-  } finally {
-    await fs.rm(tempRoot, { recursive: true, force: true });
-  }
-}
+import type { AnalyzeProjectOptions, AnalyzeReport } from "../src/index.js";
+import { withTempProject } from "./helpers.js";
 
 async function createFixtureProject(projectDir: string) {
   await fs.mkdir(path.join(projectDir, "src"), { recursive: true });
@@ -122,6 +114,10 @@ export const x = 1;
 }
 
 describe("analyzeProject", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("detects similarities across all modes", async () => {
     await withTempProject(async (projectDir) => {
       await createFixtureProject(projectDir);
@@ -138,6 +134,69 @@ describe("analyzeProject", () => {
       expect(report.byMode.types.length).toBeGreaterThan(0);
       expect(report.byMode.classes.length).toBeGreaterThan(0);
       expect(report.byMode.overlap.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("groups a fragment pasted into three functions into one cluster", async () => {
+    await withTempProject(async (projectDir) => {
+      const cacheGuard = [
+        "  if (cached !== undefined && cached.expires > Date.now()) {",
+        '    metrics.increment("cache.hit", { kind: "lookup" });',
+        "    return cached;",
+        "  }",
+      ];
+      await fs.writeFile(
+        path.join(projectDir, "load.ts"),
+        [
+          "export function loadUser(id: string, cache: Map<string, User>) {",
+          "  const cached = cache.get(id);",
+          ...cacheGuard,
+          "  return fetchUser(id);",
+          "}",
+          "",
+          "export function loadOrder(id: string, cache: Map<string, Order>, audit: Audit) {",
+          '  audit.record("order.load", id);',
+          "  const cached = cache.get(id);",
+          ...cacheGuard,
+          "  const order = fetchOrder(id);",
+          '  audit.record("order.loaded", order.total);',
+          "  return order;",
+          "}",
+          "",
+          "export function loadInvoice(key: string, cache: Map<string, Invoice>) {",
+          "  if (key.length === 0) {",
+          '    throw new Error("empty key");',
+          "  }",
+          "  const cached = cache.get(key);",
+          ...cacheGuard,
+          "  return fetchInvoice(key, { retries: 3, timeout: 1000 });",
+          "}",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const report = await analyzeProject({ cwd: projectDir, paths: ["."], modes: ["overlap"] });
+
+      // The guard in each pair of the three functions, and the lookup
+      // before it where it reads the same parameter.
+      expect(report.byMode.overlap).toHaveLength(4);
+      expect(report.stats.clusterCount).toBe(1);
+      expect(report.clusters).toEqual([
+        {
+          mode: "overlap",
+          members: [
+            expect.objectContaining({ symbolName: "loadUser", startLine: 3, endLine: 6 }),
+            expect.objectContaining({ symbolName: "loadOrder", startLine: 13, endLine: 16 }),
+            expect.objectContaining({ symbolName: "loadInvoice", startLine: 27, endLine: 30 }),
+          ],
+          fragment: { nodeCount: 26, nodeType: "IfStatement" },
+          pairCount: 3,
+          maxSimilarity: 1,
+          minSimilarity: 1,
+          averageSimilarity: 1,
+        },
+      ]);
     });
   });
 
@@ -210,6 +269,96 @@ describe("analyzeProject", () => {
         overlapMaxWindow: 5,
       }),
     ).toThrow("overlapMinWindow must be less than or equal to overlapMaxWindow");
+  });
+
+  it("rejects an overlap window larger than the engine takes", () => {
+    expect(() => resolveAnalyzeOptions({ paths: ["."], overlapMaxWindow: 1001 })).toThrow(
+      "overlapMaxWindow must be less than or equal to 1000",
+    );
+    expect(resolveAnalyzeOptions({ paths: ["."], overlapMaxWindow: 1000 }).overlapMaxWindow).toBe(
+      1000,
+    );
+  });
+
+  it("rejects modes and type filters it does not know", () => {
+    // Values that reach the library untyped — from a configuration file,
+    // say — used to travel to the engine and come back as a parse error.
+    const untyped = (options: Record<string, unknown>) =>
+      resolveAnalyzeOptions({ paths: ["."], ...options } as AnalyzeProjectOptions);
+    expect(() => untyped({ modes: ["functions", "everything"] })).toThrow(
+      'Unknown mode "everything" (expected one of: functions, types, classes, overlap)',
+    );
+    expect(() => untyped({ typesOnly: "enum" })).toThrow(
+      "typesOnly must be one of: all, interface, type",
+    );
+  });
+
+  it("fills in every default", () => {
+    expect(resolveAnalyzeOptions({ paths: ["src"], cwd: "/project" })).toEqual({
+      cwd: "/project",
+      paths: ["src"],
+      modes: ["functions", "types", "classes", "overlap"],
+      threshold: 0.8,
+      minLines: 3,
+      minTokens: undefined,
+      sizePenalty: true,
+      sameFileOnly: false,
+      crossFileOnly: false,
+      extensions: ["ts", "tsx", "mts", "cts"],
+      exclude: [],
+      typesOnly: "all",
+      allowCrossKind: true,
+      includeTypeLiterals: false,
+      overlapMinWindow: 8,
+      overlapMaxWindow: 30,
+      overlapSizeTolerance: 0.2,
+    });
+    // Repeats are dropped, an empty list means every mode, and extensions
+    // lose their dot and their case.
+    const resolved = resolveAnalyzeOptions({
+      paths: ["."],
+      modes: ["types", "functions", "types"],
+      extensions: [".TS", "tsx"],
+    });
+    expect(resolved.modes).toEqual(["types", "functions"]);
+    expect(resolved.extensions).toEqual(["ts", "tsx"]);
+    expect(resolveAnalyzeOptions({ paths: ["."], modes: [], extensions: [] })).toMatchObject({
+      modes: ["functions", "types", "classes", "overlap"],
+      extensions: ["ts", "tsx", "mts", "cts"],
+    });
+    // A list that names no extension is no list, and a repeat is one entry.
+    expect(resolveAnalyzeOptions({ paths: ["."], extensions: ["", "."] }).extensions).toEqual([
+      "ts",
+      "tsx",
+      "mts",
+      "cts",
+    ]);
+    expect(resolveAnalyzeOptions({ paths: ["."], extensions: ["ts", ".TS"] }).extensions).toEqual([
+      "ts",
+    ]);
+    expect(resolveAnalyzeOptions({ paths: ["."] }).cwd).toBe(process.cwd());
+  });
+
+  it("reports the same pairs however the targets are listed", async () => {
+    await withTempProject(async (projectDir) => {
+      await createFixtureProject(projectDir);
+      const files = (await fs.readdir(path.join(projectDir, "src")))
+        .filter((file) => file.endsWith(".ts"))
+        .map((file) => path.join("src", file));
+      const comparable = (report: AnalyzeReport) => ({
+        analyzedFiles: report.analyzedFiles,
+        results: report.results,
+        byMode: report.byMode,
+        clusters: report.clusters,
+      });
+
+      const options = { cwd: projectDir, threshold: 0.6 };
+      const reference = comparable(await analyzeProject({ ...options, paths: ["src"] }));
+      expect(reference.results.length).toBeGreaterThan(3);
+      for (const paths of [files, [...files].reverse(), ["src", ...files]]) {
+        expect(comparable(await analyzeProject({ ...options, paths }))).toEqual(reference);
+      }
+    });
   });
 
   it("discovers files with a single extension filter", async () => {
@@ -330,30 +479,30 @@ describe("analyzeProject", () => {
     });
   });
 
-  it.skipIf(typeof process.getuid === "function" && process.getuid() === 0)(
-    "reports unreadable discovered files as warnings",
-    async () => {
+  it("reports a file that cannot be read as skipped, with a warning", async () => {
     await withTempProject(async (projectDir) => {
-      await fs.mkdir(path.join(projectDir, "src"), { recursive: true });
-      const unreadablePath = path.join(projectDir, "src", "unreadable.ts");
-      await fs.writeFile(unreadablePath, "export const locked = true;\n", "utf8");
-      await fs.chmod(unreadablePath, 0);
-      try {
-        const report = await analyzeProject({
-          cwd: projectDir,
-          paths: ["src"],
-        });
+      await createFixtureProject(projectDir);
+      const unreadablePath = path.join(projectDir, "src", "types.ts");
+      // Fails for every user, the superuser included, unlike a file mode.
+      const readFile = fs.readFile.bind(fs);
+      vi.spyOn(fs, "readFile").mockImplementation(((file: unknown, ...rest: unknown[]) =>
+        file === unreadablePath
+          ? Promise.reject(new Error("EACCES: permission denied"))
+          : (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest)) as typeof fs.readFile);
 
-        expect(report.stats.fileCount).toBe(0);
-        expect(report.warnings.some((warning) =>
-          warning.message.includes(`Failed to read ${unreadablePath}`),
-        )).toBe(true);
-      } finally {
-        await fs.chmod(unreadablePath, 0o600);
-      }
+      const report = await analyzeProject({ cwd: projectDir, paths: ["src"], modes: ["types"] });
+
+      expect(report.stats.fileCount).toBe(4);
+      expect(report.analyzedFiles).not.toContain(unreadablePath);
+      expect(report.skippedFiles).toEqual([unreadablePath]);
+      expect(report.warnings).toEqual([
+        {
+          filePath: unreadablePath,
+          message: `Failed to read ${unreadablePath}: EACCES: permission denied`,
+        },
+      ]);
     });
-    },
-  );
+  });
 
   it("translates noSizePenalty into sizePenalty=false", () => {
     const withPenalty = resolveAnalyzeOptions({ paths: ["."] });

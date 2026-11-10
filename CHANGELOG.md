@@ -1,5 +1,291 @@
 # Changelog
 
+## 0.9.0 — 2026-11-10
+
+A release about what the engine did not look at, and about how long it
+took. Syntax that was dropped or flattened on the way to the comparison —
+JSX, call signatures, overloads, parameter defaults, destructuring
+assignments, class expressions — is compared now, overlap mode sees every
+function and reports where a fragment really is, the scans are indexed
+instead of quadratic, and code that used to bring the engine down is
+skipped with a warning. 29 new ground-truth pairs pin the fixes (corpus now
+**366 pairs**); the v0.8.1 engine gets 18 of them wrong, v0.9.0 classifies
+all 366 correctly.
+
+Reports change shape in three places, all of them to say more: functions
+are named by the path that leads to them (`Repo.save`, not `save`), a
+fragment repeated in three or more functions is one cluster instead of a
+row per pair, and a location too long for the table wraps instead of being
+cut off.
+
+### Detection accuracy
+
+- **Functions — JSX** (precision): JSX was converted to a single leaf, so
+  two components were the same tree whenever the statements around their
+  markup matched. Components of one outline rendering unrelated markup
+  scored 0.92–1.00. Elements, attributes, children and expression
+  containers are structure now, and those pairs score 0.06–0.15, while
+  renamed copies and the same markup laid out differently still pair at
+  1.000. (XF-N47 – XF-N50, XF-P55 – XF-P57)
+- **Functions — parameters**: a default value and being the rest parameter
+  are part of a signature. `f(limit = 10)`, `f(limit = compute())` and
+  `f(limit)` — or `f(...items)` and `f()` — used to be one signature, and a
+  rest parameter was a free identifier in the body. A default costs what
+  its value holds. (XF-P59)
+- **Functions — destructuring assignments** (precision): the pattern on the
+  left of `({ clientX: x, clientY: y } = event)`, `[a, b] = [b, a]` or
+  `for ([key, value] of entries)` was one leaf, whatever it held, so two
+  functions that assigned different properties or targets scored 1.000.
+  Patterns are converted like the patterns of a declaration; the variables
+  assigned rename with the function, so a renamed twin is still a twin.
+  (XF-N51, XF-P61)
+- **Functions — the rest of the syntax**: each link of an optional chain has
+  its own optionality (`a?.b.c` is not `a.b?.c`), a computed key is not the
+  static key of the same spelling, directives (`"use server"`) and
+  `#field in object` are represented, and a `var` declared twice is one
+  variable. (XF-P58)
+- **Functions and classes — class expressions** (recall): a class written as
+  an expression bound to a name, `export const Store = class { … }`, was
+  invisible to every mode. Its methods take part in function and overlap
+  mode and the class in class mode, under the name it is bound to.
+  (XF-P60, XC-P20, XC-N17)
+- **Types — call and construct signatures** (precision and recall):
+  signatures were not members, so an interface that is all signature was an
+  empty shape. An empty marker interface scored 1.000 against the callable
+  interface of the same name, a getter contract against the setter
+  contract 0.96, a callable shape against a constructible one 0.91 — and
+  the same signature under other parameter names 0.58, because only the
+  names were left to compare. Signatures are members, compared by
+  parameter and return types. (XT-N26 – XT-N29, XT-P26)
+- **Types — numeric and computed keys** (precision): members keyed by a
+  number (`200: {…}` in generated response maps) or by a computed key
+  (`[Symbol.iterator]`) were dropped. They are members under their own
+  key. (XT-N30, XT-N31, XT-P27)
+- **Types — overloads and accessors**: an overloaded member was its last
+  signature, so two factories sharing the last of three overloads scored
+  0.99; each overload is a member now. `get size(): number` in an
+  interface is the readonly property it declares (0.45 before, 0.99 now).
+  (XT-N32, XT-P28, XT-P29)
+- **Types — parameter lists**: rest and optional parameters are part of a
+  function type (`(...parts: string[]) => void` is not `() => void`, 0.98
+  before), and the parameter names of a callback that takes a callback no
+  longer count (0.76 before, 0.98 now). (XT-N33, XT-P30)
+- **Classes — `.tsx`**: method bodies of classes in `.tsx` files were never
+  fingerprinted, because the fragment was parsed as plain TypeScript, so a
+  different `render()` body did not count against two class components
+  with the same members (0.797 before, 0.670 now for the corpus pair).
+  (XC-N16, XC-P19)
+- **`// similarity-ignore`** also applies above the statement that declares
+  a function (`export const handler: Handler = async (event) => {…}`),
+  above a class's decorators, and to everything declared inside an ignored
+  class, object literal, function or namespace.
+- **Order independence**: function and class reports depended on the order
+  in which the files were listed. `similarity-ts a.ts b.ts` and
+  `similarity-ts b.ts a.ts` now give the same report.
+
+### Overlap mode
+
+- Class methods, object-literal members and functions that share a line
+  with other code take part. They were cut out of the file by whole lines
+  and failed to parse on their own.
+- An overlap is reported at the lines of the fragment itself, not at those
+  of the statement or function around it.
+- When a fragment and something inside it both repeat, the enclosing one is
+  kept; a fragment inside a nested function is reported once, for the
+  innermost function; fragments that repeat on both sides pair off in order
+  instead of each with each; and a window no longer "matches" a single leaf
+  at 0.5.
+- `details.nodeType` is the syntactic kind of the fragment's root
+  (`IfStatement`, `VariableDeclaration`, `LogicalExpression`, …) instead
+  of the engine's internal label for it (`ConstDeclaration`, `Or`, `.`, or
+  the name of a function).
+- The scan answers from two indexes over all functions instead of
+  comparing every pair of functions, with the same result as the pairwise
+  comparison (a test holds the two against each other for eleven settings
+  and three scopes).
+
+### Reports
+
+- **Names**: a function is reported under the path that leads to it — the
+  namespaces it is declared in, then the class or object that holds it:
+  `JwtTokenExpired.constructor`, `ZodOptional.unwrap`,
+  `LegacyIds.normalizeId`, `handlers[200]`. Function mode used to print the
+  bare member name, so a report could list four functions called
+  `constructor` in one file. Types and classes were qualified already.
+  **`symbolName` changes for every class member and every function in a
+  namespace**, and for object members under a numeric key (`handlers.0` is
+  `handlers[0]`).
+- **Long locations** wrap after a path separator instead of being cut off.
+  The pair table truncated every location wider than its column
+  (`packages/server/src/unstable-core-do-not-import/strea…`): on a project
+  with deep directories, most rows had no file name and no line numbers.
+  Widths are measured in terminal columns, so paths in full-width
+  characters fit too.
+- **Overlap clusters**: three or more copies of one fragment are a cluster,
+  as copies of a declaration already were, headed by the fragment's kind
+  and size (`Cluster 1: 5 fragments (IfStatement, 26 nodes), …`). In the
+  JSON report such a cluster has `mode: "overlap"` and a `fragment` field
+  (`nodeCount`, `nodeType`), and `stats.clusterCount` counts it. On zod's
+  v3 sources the overlap section goes from 481 rows to 23 clusters and 38
+  rows.
+- A cluster whose pairs all score the same prints the score once.
+- A report written with `--output`, or piped, carries no ANSI escape codes.
+  `formatPrettyReport` takes `{ color }` and is plain by default.
+- Warnings name the file they are about, relative to the working
+  directory, in the report and on stderr alike. Files that cannot be read
+  are listed in `skippedFiles`.
+- Files, pairs, cluster members and clusters are ordered by code unit, not
+  by the host's locale.
+
+### Files
+
+- Directories are walked top-down and an ignored directory is never
+  entered. The scan used to list every file under the target,
+  `node_modules` included, and filter afterwards.
+- `node_modules`, `dist` and `coverage` are excluded at any depth below a
+  scanned directory, not only at its top (workspace packages have their
+  own), and a directory named explicitly as a target is scanned whatever it
+  is called.
+- `.gitignore` files apply with git's precedence, from the repository root
+  down — also when the root is above the working directory: a deeper file
+  overrides a shallower one and `!pattern` re-includes. `--exclude` always
+  wins.
+- `skippedFiles` lists what was named or found and left out: targets that
+  are no source file, files an ignore rule names, files that cannot be
+  parsed or read. The contents of ignored directories are not listed.
+- Entries whose name starts with a dot are skipped and symbolic links are
+  not followed, as before; a directory that cannot be read is a warning
+  instead of silently empty.
+- `--extensions` with nothing usable in it (`""`, `"."`) means the
+  defaults; a lone `.` used to match no file.
+
+### Robustness
+
+- **Deeply nested code** no longer overflows the stack. A file whose
+  brackets nest more than 256 levels, or whose syntax tree is deeper than
+  512, is skipped with a warning. Nesting the parser itself cannot survive
+  (thousands of chained conditionals, arrows or generic arguments) takes
+  the WebAssembly instance down; the wrapper then finds the file, skips it
+  with a warning, and analyzes the rest on a fresh instance. v0.8.1 crashed
+  on 32 of 33 nesting shapes somewhere between 1,000 and 20,000 levels.
+- **Very long lists** — a table of thousands of entries, a generated
+  function of thousands of statements — are aligned along the entries the
+  two sides share instead of through a matrix of every entry against every
+  other. Two functions holding 20,000 elements compare in 0.07–0.3 s
+  within 130 MB; v0.8.1 took 2.4 s and 790 MB for 3,000 object properties
+  and crashed on 3,000 statements.
+- A crash that cannot be pinned on a file is reported as a bug in
+  similarity-ts, with the reason, instead of as a raw `RuntimeError`.
+- `--overlap-max-window` is limited to 1000 nodes; a window of thousands of
+  nodes is a whole function, which function mode compares.
+
+### Performance
+
+Reports are the same as without the optimizations; the corpus below is
+compared pair for pair after every change.
+
+- Function mode numbers labels and kinds once per scan, flattens each
+  function once instead of once per pair, and rules pairs out with a lower
+  bound on the edit distance that prices unmatched nodes by kind; 1 pair of
+  similar size in 60 reaches the alignment, where 3 in 4 did.
+- Type mode rules out pairs that share too few member names and
+  annotations to reach the threshold before normalizing anything, and
+  computes the similarity of two annotations once per scan.
+- Overlap mode is indexed (see above).
+- A file is parsed once for all modes.
+
+### CLI and library
+
+- An unknown `--modes` value is named
+  (`Unknown mode "x" (expected one of: functions, types, classes, overlap)`)
+  instead of dumped as a schema error; `modes` and `typesOnly` are
+  validated for library callers too.
+- The library exports the formatters (`formatPrettyReport`,
+  `formatJsonReport`), `resolveAnalyzeOptions`, the defaults
+  (`DEFAULT_THRESHOLD`, `DEFAULT_EXCLUDES`, `MAX_OVERLAP_WINDOW`, …) and
+  the types `ResolvedAnalyzeOptions`, `PrettyReportOptions`,
+  `SimilarityFragment` and `TypeFilter`.
+- `--help` states each default once.
+
+### Dependencies and tooling
+
+- `zod` and `fast-glob` are gone: the option parser and the file walker no
+  longer need them, and installing the package brings 12 packages instead
+  of 33. `string-width` is a direct dependency at the release `cli-table3`
+  already installs.
+- The package runs on Node 20 and later, as before. Building and testing it
+  needs Node 22.18: TypeScript 6.0, ESLint 10, Vitest 5.1, tsup 9.
+- CI tests on Node 22, 24 and 26 and installs the packed tarball on Node
+  20, 22, 24 and 26 (`npm run test:package -- <tarball>`).
+- `npm run bench:accuracy` checks that every label resolves — a forbidden
+  pair under a name the report no longer uses would pass forever — and
+  exits 1 on a mislabel.
+- `npm run build` no longer deletes the built engine, and
+  `npm run build:wasm` fails when the built module does not load.
+
+### Internals
+
+- The Rust core is restructured: the 4,800-line parser is a module
+  directory whose conversion state travels as an explicit context instead
+  of three thread-locals, the function extractor is split into extraction,
+  fragment building, atoms and comparison, tree nodes carry the span of
+  their source and a static kind, and the JSON boundary is typed and
+  validates its options.
+
+### Weights
+
+- The APTED operation weights (rename 0.3, delete 1.0, insert 1.0) keep
+  366/366 under every setting in rename 0.2–0.5 × delete/insert 0.8–1.0;
+  the closest call is still XF-N36 at rename 0.2 (0.797 against the 0.8
+  threshold).
+
+### Real-world effect
+
+Default settings, pairs reported by v0.8.1 → v0.9.0 and the engine's time,
+on snapshots of 2026-11-06 to 2026-11-09 (the upstream fixtures:
+2026-10-03):
+
+| Target | functions | types | classes | overlap | time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| hono `src` (314 files) | 34 → 34 | 53 → 23 | 0 → 0 | 248 → 261 | 23.5 s → 1.0 s |
+| zustand (35 files) | 0 → 0 | 35 → 35 | 0 → 0 | 1 → 1 | 0.3 s → 0.05 s |
+| zod v4 core and classic, v3 (236 files) | 856 → 856 | 148 → 144 | 1 → 1 | 1,493 → 1,936 | 29.2 s → 1.2 s |
+| tRPC server, client, react-query, next (202 files) | 25 → 25 | 48 → 47 | 4 → 4 | 178 → 235 | 15.0 s → 0.7 s |
+| tRPC `examples` and `www` (490 files) | 1,699 → 71 | 602 → 600 | 1 → 1 | 330 → 390 | 15.6 s → 0.5 s |
+| vitest node, runner, expect, utils (156 files) | 37 → 37 | 10 → 10 | 4 → 4 | 127 → 436 | 36.7 s → 1.4 s |
+| mizchi/similarity `examples` and `test` (84 files) | 84,771 → 84,770 | 315 → 315 | 195 → 195 | 81 → 84,683 | 11.3 s → 5.2 s |
+
+- **tRPC's examples**: 1,631 function pairs are gone, all between React
+  components whose markup differs (`SupportedBy` and `HomePage`,
+  `RootLayout` and `DefaultLayout`), and three are new: the icon components
+  of one file, whose SVG differs in its path data.
+- **hono's types**: the 30 pairs gone are signature-only interfaces —
+  `CssType` returning `Promise<string>` in the server helper and `string`
+  in the DOM one, the empty `ContextRenderer` against its augmentation in
+  the tests — and interfaces of dozens of overloads compared by their
+  last.
+- **zod's types**: three brand types of one member each, keyed by
+  `[BRAND]`, `[core.$brand]` and `[$brand]`, which used to be three empty
+  shapes, and a callable `$ZodErrorMap` against a constructible
+  `$ZodErrorClass`.
+- **Overlap** grows where methods are: vitest's node package is classes.
+  The 84,683 pairs of the upstream fixtures are one generated file of 400
+  identical functions, reported as one cluster of 400 fragments; function
+  mode has always reported them, as a cluster of 400 functions.
+- Every other function and class pair is reported as before, and four
+  scores move: two vitest helpers that differ in a rest parameter score
+  0.89 instead of 0.96, two components whose markup differs slightly 0.97
+  instead of 1.00, one pair in zod moves in the fourth decimal, and two
+  four-line constructors of the upstream fixtures that differ in a default
+  value score 0.72 instead of 0.89 and leave the report.
+
+### Accuracy
+
+| Engine | Corpus | Wrong labels | Error rate | Accuracy |
+| --- | --- | ---: | ---: | ---: |
+| v0.8.1 | 366 pairs | 18 / 366 | 4.92% | 95.08% |
+| v0.9.0 | 366 pairs | 0 / 366 | 0.00% | 100.00% |
+
 ## 0.8.1 — 2026-11-05
 
 Fixes for gaps left in the 0.8.0 extraction and comparison rules, and a

@@ -1,12 +1,20 @@
+//! Type normalization: one spelling per type, and the similarity of two
+//! spellings.
+
+use crate::text::levenshtein_similarity;
 use crate::type_extractor::{TypeDefinition, TypeKind};
 use std::collections::{HashMap, HashSet};
 
+/// A type declaration prepared for comparison.
 #[derive(Debug, Clone)]
 pub struct NormalizedType {
-    pub properties: HashMap<String, String>, // プロパティ名 -> 型
+    /// Property name → normalized type annotation.
+    pub properties: HashMap<String, String>,
     pub optional_properties: HashSet<String>,
     pub readonly_properties: HashSet<String>,
-    pub signature: String, // 正規化された型シグネチャ
+    /// The whole shape as one normalized string.
+    pub signature: String,
+    /// The declaration's name without its namespace qualifier.
     pub original_name: String,
     pub kind: TypeKind,
     /// Sorted, deduplicated `extends` clause (interfaces only; empty for
@@ -111,9 +119,64 @@ pub fn normalize_type(type_def: &TypeDefinition, options: &NormalizationOptions)
         // the same namespace must not read as lexically related because
         // they share its prefix.
         original_name: crate::module_scope::unqualified_name(&type_def.name).to_string(),
-        kind: type_def.kind.clone(),
+        kind: type_def.kind,
         extends,
     }
+}
+
+/// The parts of `input` between top-level occurrences of `separator`,
+/// trimmed, without the empty ones. Nesting inside `<>`, `()`, `[]`, `{}`
+/// and quoted strings (escaped quotes included) is respected.
+fn top_level_parts(input: &str, separator: char) -> impl Iterator<Item = &str> + '_ {
+    let mut depth = 0i32;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+    let mut previous = '\0';
+    let mut part_start = 0usize;
+    let mut characters = input.char_indices();
+    let mut finished = false;
+    std::iter::from_fn(move || {
+        if finished {
+            return None;
+        }
+        loop {
+            let Some((position, ch)) = characters.next() else {
+                finished = true;
+                return Some(&input[part_start..]);
+            };
+            if let Some(quote) = in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    in_string = None;
+                }
+                previous = ch;
+                continue;
+            }
+            match ch {
+                '"' | '\'' | '`' => in_string = Some(ch),
+                '<' | '(' | '[' | '{' => depth += 1,
+                // The `>` of an arrow (`=>`) is an operator, not a bracket —
+                // decrementing on it desynchronized the depth for every
+                // type containing a function arm (`Result<() => string,
+                // Error>`).
+                '>' if previous == '=' => {}
+                '>' | ')' | ']' | '}' => depth -= 1,
+                _ if ch == separator && depth == 0 => {
+                    let part = &input[part_start..position];
+                    part_start = position + ch.len_utf8();
+                    previous = ch;
+                    return Some(part);
+                }
+                _ => {}
+            }
+            previous = ch;
+        }
+    })
+    .map(str::trim)
+    .filter(|part| !part.is_empty())
 }
 
 /// Split `input` at top-level occurrences of `separator`, respecting
@@ -121,58 +184,17 @@ pub fn normalize_type(type_def: &TypeDefinition, options: &NormalizationOptions)
 /// quotes included). Returns one element (the whole input) when the
 /// separator never appears at the top level.
 pub(crate) fn split_top_level(input: &str, separator: char) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut in_string: Option<char> = None;
-    let mut escaped = false;
-    let mut previous = '\0';
-    let mut current = String::new();
-    for ch in input.chars() {
-        if let Some(quote) = in_string {
-            current.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == quote {
-                in_string = None;
-            }
-            previous = ch;
-            continue;
-        }
-        match ch {
-            '"' | '\'' | '`' => {
-                in_string = Some(ch);
-                current.push(ch);
-            }
-            '<' | '(' | '[' | '{' => {
-                depth += 1;
-                current.push(ch);
-            }
-            // The `>` of an arrow (`=>`) is an operator, not a bracket —
-            // decrementing on it desynchronized the depth for every type
-            // containing a function arm (`Result<() => string, Error>`).
-            '>' if previous == '=' => {
-                current.push(ch);
-            }
-            '>' | ')' | ']' | '}' => {
-                depth -= 1;
-                current.push(ch);
-            }
-            _ if ch == separator && depth == 0 => {
-                parts.push(current.trim().to_string());
-                current = String::new();
-            }
-            _ => current.push(ch),
-        }
-        previous = ch;
-    }
-    parts.push(current.trim().to_string());
-    parts.retain(|part| !part.is_empty());
+    let mut parts: Vec<String> = top_level_parts(input, separator).map(str::to_string).collect();
     if parts.is_empty() {
         parts.push(String::new());
     }
     parts
+}
+
+/// Whether `input` has `separator` between two top-level parts: whether
+/// [`split_top_level`] would return more than one.
+fn has_top_level(input: &str, separator: char) -> bool {
+    top_level_parts(input, separator).nth(1).is_some()
 }
 
 /// Normalize a rendered type string for consistent comparison:
@@ -211,27 +233,15 @@ pub fn normalize_type_name(type_name: &str) -> String {
 
     // Function types: strip parameter NAMES (they are local to the
     // signature — `(request: string) => R` and `(url: string) => R` are
-    // the same contract) and normalize parameter/return types.
+    // the same contract) and normalize parameter/return types. What a name
+    // carries besides itself stays: the rest parameter keeps its `...`,
+    // and an optional parameter's type admits `undefined`, the way an
+    // optional property's does.
     if let Some((params, return_type)) = split_function_type(trimmed) {
         let normalized_params: Vec<String> = split_top_level(&params, ',')
             .iter()
             .filter(|piece| !piece.is_empty())
-            .map(|piece| {
-                // `name: T` / `name?: T` → T; a piece without a colon is
-                // already a bare type (or a rest param `...rest: T`).
-                let piece = piece.trim_start_matches("...");
-                match piece.find(':') {
-                    Some(colon)
-                        if piece[..colon]
-                            .trim_end_matches('?')
-                            .chars()
-                            .all(|c| c.is_alphanumeric() || c == '_' || c == '$') =>
-                    {
-                        normalize_type_name(piece[colon + 1..].trim())
-                    }
-                    _ => normalize_type_name(piece),
-                }
-            })
+            .map(|piece| normalize_function_parameter(piece))
             .collect();
         return format!(
             "({}) => {}",
@@ -283,6 +293,32 @@ pub fn normalize_type_name(type_name: &str) -> String {
         "Object" => "object".to_string(),
         _ => trimmed.to_string(),
     }
+}
+
+/// One piece of a function type's parameter list, without its name:
+/// `name: T` → `T`, `name?: T` → `T | undefined`, `...name: T` → `...T`. A
+/// piece without a parameter name is already a bare type.
+fn normalize_function_parameter(piece: &str) -> String {
+    let (rest, piece) = match piece.strip_prefix("...") {
+        Some(remainder) => ("...", remainder),
+        None => ("", piece),
+    };
+    let named = piece.find(':').and_then(|colon| {
+        let name = piece[..colon].trim();
+        let (name, optional) = match name.strip_suffix('?') {
+            Some(name) => (name, true),
+            None => (name, false),
+        };
+        let is_name =
+            !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+        is_name.then(|| (piece[colon + 1..].trim(), optional))
+    });
+    let normalized = match named {
+        Some((annotation, true)) => normalize_type_name(&format!("{annotation} | undefined")),
+        Some((annotation, false)) => normalize_type_name(annotation),
+        None => normalize_type_name(piece),
+    };
+    format!("{rest}{normalized}")
 }
 
 /// Strip parentheses that wrap the ENTIRE type (`(User | Error)` →
@@ -394,41 +430,40 @@ pub fn calculate_property_similarity(prop1: &str, prop2: &str) -> f64 {
         return 0.95;
     }
 
-    let max_length = normalized1.len().max(normalized2.len());
-    if max_length == 0 {
-        return 1.0;
-    }
-
-    let distance = levenshtein_distance(normalized1, normalized2);
-    (1.0 - (distance as f64 / max_length as f64)).max(0.0)
+    levenshtein_similarity(normalized1, normalized2)
 }
 
 /// Calculate similarity between two type strings
 pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
-    let normalized1 = normalize_type_name(type1);
-    let normalized2 = normalize_type_name(type2);
+    // Equal spellings normalize alike; most compared annotations are equal.
+    if type1 == type2 {
+        return 1.0;
+    }
+    similarity_of_normalized(&normalize_type_name(type1), &normalize_type_name(type2))
+}
 
+/// [`calculate_type_similarity`] for two annotations that went through
+/// [`normalize_type_name`].
+fn similarity_of_normalized(normalized1: &str, normalized2: &str) -> f64 {
     if normalized1 == normalized2 {
         return 1.0;
     }
 
     // Handle union types specially
-    if split_top_level(&normalized1, '|').len() > 1 || split_top_level(&normalized2, '|').len() > 1
-    {
-        return calculate_union_type_similarity(&normalized1, &normalized2);
+    if has_top_level(normalized1, '|') || has_top_level(normalized2, '|') {
+        return calculate_union_type_similarity(normalized1, normalized2);
     }
 
     // Handle intersection types specially
-    if split_top_level(&normalized1, '&').len() > 1 || split_top_level(&normalized2, '&').len() > 1
-    {
-        return calculate_intersection_type_similarity(&normalized1, &normalized2);
+    if has_top_level(normalized1, '&') || has_top_level(normalized2, '&') {
+        return calculate_intersection_type_similarity(normalized1, normalized2);
     }
 
     // Function types compare structurally: the return type carries most
     // of the contract, parameters the rest. This keeps `(string) =>
     // Promise<User>` and `(string) => Promise<Order>` far apart where
     // plain edit distance saw a near-match.
-    match (split_function_type(&normalized1), split_function_type(&normalized2)) {
+    match (split_function_type(normalized1), split_function_type(normalized2)) {
         (Some((params1, return1)), Some((params2, return2))) => {
             let params_similarity = if params1 == params2 {
                 1.0
@@ -482,7 +517,7 @@ pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
     // different payloads (`Promise<User>` vs `Promise<Order>`) is a REAL
     // contract difference, not the near-match plain edit distance would
     // report from the shared container name.
-    match (parse_generic_reference(&normalized1), parse_generic_reference(&normalized2)) {
+    match (parse_generic_reference(normalized1), parse_generic_reference(normalized2)) {
         (Some((base1, args1)), Some((base2, args2))) => {
             if base1 == base2 && args1.len() == args2.len() {
                 // Same container, same argument multiset, different
@@ -516,12 +551,12 @@ pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
     // `typeof x` queries and `x is T` predicates compare by what they
     // name / narrow to, not by the shared keyword text around it.
     if let (Some(query1), Some(query2)) =
-        (typeof_query_operand(&normalized1), typeof_query_operand(&normalized2))
+        (typeof_query_operand(normalized1), typeof_query_operand(normalized2))
     {
         return calculate_type_similarity(query1, query2);
     }
     if let (Some(target1), Some(target2)) =
-        (type_predicate_target(&normalized1), type_predicate_target(&normalized2))
+        (type_predicate_target(normalized1), type_predicate_target(normalized2))
     {
         return calculate_type_similarity(target1, target2);
     }
@@ -534,14 +569,14 @@ pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
     // of the SPELLINGS manufacture type similarity. (Discriminated-union
     // members and enum-keyed `kind` fields used to score ~0.9 on exactly
     // that closeness.)
-    if is_nominal_atom(&normalized1) && is_nominal_atom(&normalized2) {
+    if is_nominal_atom(normalized1) && is_nominal_atom(normalized2) {
         if normalized1 == normalized2 {
             return 1.0;
         }
         // Two different literal types are disjoint singletons — nothing in
         // common at all — whereas two different references may still be
         // structurally related underneath, hence the small floor.
-        return if is_literal_type(&normalized1) && is_literal_type(&normalized2) {
+        return if is_literal_type(normalized1) && is_literal_type(normalized2) {
             0.0
         } else {
             0.2
@@ -549,13 +584,31 @@ pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
     }
 
     // For other (structured) types, use string similarity
-    let max_length = normalized1.len().max(normalized2.len());
-    if max_length == 0 {
-        return 1.0;
-    }
+    levenshtein_similarity(normalized1, normalized2)
+}
 
-    let distance = levenshtein_distance(&normalized1, &normalized2);
-    (1.0 - (distance as f64 / max_length as f64)).max(0.0)
+/// The length in characters of an annotation that
+/// [`calculate_type_similarity`] compares by edit distance when the other
+/// annotation is one too — a tuple, a mapped or conditional type, an
+/// indexed access: none of the shapes it has a rule for. `None` for the
+/// shapes it has.
+///
+/// Two such annotations of different lengths are at most as similar as
+/// the shorter is long compared with the longer, which a scan can tell
+/// without measuring the distance.
+pub(crate) fn edit_distance_length(annotation: &str) -> Option<usize> {
+    let normalized = normalize_type_name(annotation);
+    let is_array =
+        normalized.strip_suffix("[]").is_some_and(|inner| !inner.is_empty() && is_balanced(inner));
+    let has_a_rule = has_top_level(&normalized, '|')
+        || has_top_level(&normalized, '&')
+        || split_function_type(&normalized).is_some()
+        || is_array
+        || parse_generic_reference(&normalized).is_some()
+        || typeof_query_operand(&normalized).is_some()
+        || type_predicate_target(&normalized).is_some()
+        || is_nominal_atom(&normalized);
+    (!has_a_rule).then(|| normalized.chars().count())
 }
 
 /// Split a top-level `(params) => return` function type. Returns `None`
@@ -566,10 +619,16 @@ fn split_function_type(type_name: &str) -> Option<(String, String)> {
         return None;
     }
     let mut depth = 0i32;
+    let mut previous = '\0';
     let mut params_end = None;
     for (index, ch) in type_name.char_indices() {
         match ch {
             '(' | '<' | '[' | '{' => depth += 1,
+            // The `>` of an arrow is an operator, not a bracket: a
+            // parameter that is itself a function type (`(done: (error:
+            // Error) => void) => void`) used to end the scan below zero,
+            // and the type was not recognized as a function type at all.
+            '>' if previous == '=' => {}
             ')' | '>' | ']' | '}' => {
                 depth -= 1;
                 if depth == 0 && ch == ')' {
@@ -579,6 +638,7 @@ fn split_function_type(type_name: &str) -> Option<(String, String)> {
             }
             _ => {}
         }
+        previous = ch;
     }
     let params_end = params_end?;
     let rest = type_name[params_end + 1..].trim_start();
@@ -760,6 +820,70 @@ fn calculate_intersection_type_similarity(type1: &str, type2: &str) -> f64 {
     }
 }
 
+/// Where a comparison gets the similarity of two annotations and of two
+/// property names.
+///
+/// One pair of types asks a handful of such questions; a scan asks the
+/// same ones again for thousands of pairs — `string` against `number`,
+/// `id` against `uuid` — and every answer normalizes, splits and measures
+/// the two strings anew. A scan remembers them (see [`Remembered`]).
+pub(crate) trait Similarities<'a> {
+    /// [`calculate_type_similarity`].
+    fn of_types(&mut self, type1: &'a str, type2: &'a str) -> f64;
+    /// [`calculate_property_similarity`].
+    fn of_names(&mut self, name1: &'a str, name2: &'a str) -> f64;
+}
+
+/// Computes every similarity when asked.
+pub(crate) struct Computed;
+
+impl<'a> Similarities<'a> for Computed {
+    fn of_types(&mut self, type1: &'a str, type2: &'a str) -> f64 {
+        calculate_type_similarity(type1, type2)
+    }
+
+    fn of_names(&mut self, name1: &'a str, name2: &'a str) -> f64 {
+        calculate_property_similarity(name1, name2)
+    }
+}
+
+/// Computes a similarity the first time it is asked for and remembers it,
+/// along with the normalized spelling of every annotation it meets.
+#[derive(Default)]
+pub(crate) struct Remembered<'a> {
+    types: HashMap<(&'a str, &'a str), f64>,
+    names: HashMap<(&'a str, &'a str), f64>,
+    normalized: HashMap<&'a str, String>,
+}
+
+impl<'a> Similarities<'a> for Remembered<'a> {
+    fn of_types(&mut self, type1: &'a str, type2: &'a str) -> f64 {
+        // Most compared annotations are equal; no need to look those up.
+        if type1 == type2 {
+            return 1.0;
+        }
+        if let Some(&similarity) = self.types.get(&(type1, type2)) {
+            return similarity;
+        }
+        for annotation in [type1, type2] {
+            self.normalized.entry(annotation).or_insert_with(|| normalize_type_name(annotation));
+        }
+        let similarity = similarity_of_normalized(&self.normalized[type1], &self.normalized[type2]);
+        self.types.insert((type1, type2), similarity);
+        similarity
+    }
+
+    fn of_names(&mut self, name1: &'a str, name2: &'a str) -> f64 {
+        if name1 == name2 {
+            return 1.0;
+        }
+        *self
+            .names
+            .entry((name1, name2))
+            .or_insert_with(|| calculate_property_similarity(name1, name2))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PropertyMatch {
     pub prop1: String,
@@ -780,10 +904,16 @@ pub struct PropertyMatch {
 ///
 /// Optionality disagreement discounts a match's quality: `x: T` and
 /// `x?: T` are different contracts.
-pub fn find_property_matches(
-    type1: &NormalizedType,
-    type2: &NormalizedType,
-    _threshold: f64, // Keep for API compatibility but not used
+pub fn find_property_matches(type1: &NormalizedType, type2: &NormalizedType) -> Vec<PropertyMatch> {
+    find_property_matches_with(type1, type2, &mut Computed)
+}
+
+/// [`find_property_matches`] with the similarities of annotations and
+/// names taken from `similarities`.
+pub(crate) fn find_property_matches_with<'a>(
+    type1: &'a NormalizedType,
+    type2: &'a NormalizedType,
+    similarities: &mut dyn Similarities<'a>,
 ) -> Vec<PropertyMatch> {
     let mut matches = Vec::new();
 
@@ -806,7 +936,7 @@ pub fn find_property_matches(
     for prop1 in names1 {
         let type1_annotation = &type1.properties[prop1];
         if let Some(type2_annotation) = type2.properties.get(prop1) {
-            let type_similarity = calculate_type_similarity(type1_annotation, type2_annotation);
+            let type_similarity = similarities.of_types(type1_annotation, type2_annotation);
             let overall_similarity = type_similarity * optionality_factor(prop1, prop1);
             matched1.insert(prop1);
             matched2.insert(prop1);
@@ -872,7 +1002,7 @@ pub fn find_property_matches(
             }
             let type2_annotation = &type2.properties[*prop2];
             if type1_annotation == type2_annotation {
-                let name_similarity = calculate_property_similarity(prop1, prop2);
+                let name_similarity = similarities.of_names(prop1, prop2);
                 if best.is_none_or(|(_, current)| name_similarity > current) {
                     best = Some((prop2, name_similarity));
                 }
@@ -897,44 +1027,6 @@ pub fn find_property_matches(
     });
 
     matches
-}
-
-/// Calculate Levenshtein distance between two strings
-fn levenshtein_distance(s1: &str, s2: &str) -> usize {
-    let len1 = s1.chars().count();
-    let len2 = s2.chars().count();
-
-    if len1 == 0 {
-        return len2;
-    }
-    if len2 == 0 {
-        return len1;
-    }
-
-    let mut matrix = vec![vec![0; len2 + 1]; len1 + 1];
-
-    // Initialize first row and column
-    for (i, row) in matrix.iter_mut().enumerate().take(len1 + 1) {
-        row[0] = i;
-    }
-    for (j, cell) in matrix[0].iter_mut().enumerate().take(len2 + 1) {
-        *cell = j;
-    }
-
-    let chars1: Vec<char> = s1.chars().collect();
-    let chars2: Vec<char> = s2.chars().collect();
-
-    for i in 1..=len1 {
-        for j in 1..=len2 {
-            let cost = if chars1[i - 1] == chars2[j - 1] { 0 } else { 1 };
-
-            matrix[i][j] = (matrix[i - 1][j] + 1) // deletion
-                .min(matrix[i][j - 1] + 1) // insertion
-                .min(matrix[i - 1][j - 1] + cost); // substitution
-        }
-    }
-
-    matrix[len1][len2]
 }
 
 #[cfg(test)]
@@ -1017,14 +1109,6 @@ mod tests {
     }
 
     #[test]
-    fn test_levenshtein_distance() {
-        assert_eq!(levenshtein_distance("", ""), 0);
-        assert_eq!(levenshtein_distance("abc", "abc"), 0);
-        assert_eq!(levenshtein_distance("abc", "ab"), 1);
-        assert_eq!(levenshtein_distance("abc", "def"), 3);
-    }
-
-    #[test]
     fn array_types_compare_by_element() {
         // `ShopUser[]` vs `ShopOrder[]` is the nominal payload contrast,
         // not a Levenshtein near-match of the bracketed spellings.
@@ -1069,7 +1153,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&flags, &options),
             &normalize_type(&toggle, &options),
-            0.7,
         );
         assert!(matches.is_empty(), "index signature must not match a concrete property");
 
@@ -1079,7 +1162,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&flags, &options),
             &normalize_type(&toggles, &options),
-            0.7,
         );
         assert_eq!(matches.len(), 1);
 
@@ -1092,7 +1174,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&flags, &options),
             &normalize_type(&numeric_keys, &options),
-            0.7,
         );
         assert!(matches.is_empty(), "string-keyed and number-keyed index signatures must not pair");
     }
@@ -1226,7 +1307,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&start, &options),
             &normalize_type(&error, &options),
-            0.7,
         );
         assert!(matches.is_empty(), "a single renamed property must not pair: {matches:?}");
 
@@ -1242,7 +1322,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&package, &options),
             &normalize_type(&marker, &options),
-            0.7,
         );
         let renamed =
             matches.iter().find(|m| m.prop1 == "version").expect("version pairs with value");
@@ -1272,7 +1351,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&address, &options),
             &normalize_type(&location, &options),
-            0.7,
         );
         assert_eq!(matches.len(), 3);
         assert!(matches.iter().all(|m| (m.overall_similarity - 0.95).abs() < 1e-9));
@@ -1301,8 +1379,56 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&expression, &options),
             &normalize_type(&statement, &options),
-            0.7,
         );
         assert_eq!(matches.len(), 2, "only the exact-name members pair: {matches:?}");
+    }
+
+    #[test]
+    fn function_parameters_keep_what_their_names_carry() {
+        // Names are local to a signature and go; a rest parameter stays a
+        // rest parameter, and an optional parameter admits `undefined`.
+        assert_eq!(
+            normalize_type_name("(message: string, level?: Level, ...details: unknown[]) => void"),
+            "(string, Level | undefined, ...unknown[]) => void"
+        );
+        assert_eq!(normalize_type_name("(request: Request) => void"), "(Request) => void");
+        // One list of strings is not any number of strings.
+        assert_ne!(
+            normalize_type_name("(...parts: string[]) => string"),
+            normalize_type_name("(parts: string[]) => string")
+        );
+        assert_eq!(
+            normalize_type_name("(level?: Level) => void"),
+            normalize_type_name("(level: Level | undefined) => void")
+        );
+        assert_ne!(
+            normalize_type_name("(level?: Level) => void"),
+            normalize_type_name("(level: Level) => void")
+        );
+    }
+
+    #[test]
+    fn a_function_typed_parameter_does_not_end_the_parameter_list() {
+        // The `>` of the inner arrow used to count as a closing bracket,
+        // so the type was not recognized as a function type and kept its
+        // parameter names.
+        assert_eq!(
+            normalize_type_name("(done: (error: Error) => void) => void"),
+            "((Error) => void) => void"
+        );
+        assert_eq!(
+            normalize_type_name(
+                "(next: (value: Map<string, number>) => Promise<void>, label: string) => boolean"
+            ),
+            "((Map<string, number>) => Promise<void>, string) => boolean"
+        );
+        assert!(
+            (calculate_type_similarity(
+                "(done: (error: Error) => void) => void",
+                "(callback: (failure: Error) => void) => void"
+            ) - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
     }
 }

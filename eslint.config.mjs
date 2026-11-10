@@ -15,14 +15,19 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    // Everything here runs on Node: the sources, the tests, the scripts.
+    languageOptions: {
+      globals: {
+        ...globals.node,
+      },
+    },
+  },
+  {
     files: ["**/*.ts"],
     languageOptions: {
       parserOptions: {
         ecmaVersion: "latest",
         sourceType: "module",
-      },
-      globals: {
-        ...globals.node,
       },
     },
     rules: {
