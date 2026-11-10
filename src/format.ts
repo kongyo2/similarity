@@ -108,8 +108,9 @@ const MODE_WORDING: Record<AnalyzerMode, { heading: string; members: string }> =
  * version does not know: it gets a section under its own name.
  */
 function wordingOf(mode: AnalyzerMode): { heading: string; members: string } {
-  const known: Partial<typeof MODE_WORDING> = MODE_WORDING;
-  return known[mode] ?? { heading: mode, members: "declarations" };
+  return Object.hasOwn(MODE_WORDING, mode)
+    ? MODE_WORDING[mode]
+    : { heading: mode, members: "declarations" };
 }
 
 /**
@@ -237,7 +238,8 @@ export function formatPrettyReport(
   for (const mode of modes) {
     // Guard against engine/report drift: a requested mode missing from
     // `byMode` renders as an empty section instead of crashing.
-    lines.push(renderMode(mode, report.byMode[mode] ?? [], report.clusters, cwd, styles));
+    const pairs = Object.hasOwn(report.byMode, mode) ? report.byMode[mode] : [];
+    lines.push(renderMode(mode, pairs, report.clusters, cwd, styles));
   }
 
   if (report.warnings.length > 0) {

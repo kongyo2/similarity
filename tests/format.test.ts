@@ -273,6 +273,10 @@ describe("formatPrettyReport", () => {
 
     expect(rendered).toContain("=== custom ===");
     expect(rendered).toContain("No similar pairs found.");
+    // Also when the name is one every object answers to.
+    expect(formatPrettyReport(report as AnalyzeReport, "/repo", ["toString" as never])).toContain(
+      "=== toString ===",
+    );
   });
 
   it("lists three or more connected declarations once, as a cluster", () => {

@@ -1,7 +1,14 @@
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import type { AnalyzeReport, AnalyzerMode, AnalyzerWarning, LoadedFile } from "../types.js";
+import { ANALYZER_MODES } from "../defaults.js";
+import type {
+  AnalyzeReport,
+  AnalyzerMode,
+  AnalyzerWarning,
+  LoadedFile,
+  TypeFilter,
+} from "../types.js";
 import { errorMessage } from "../utils/errors.js";
 
 /**
@@ -22,7 +29,7 @@ export interface EngineInput {
   sizePenalty: boolean;
   sameFileOnly: boolean;
   crossFileOnly: boolean;
-  typesOnly: "interface" | "type" | "all";
+  typesOnly: TypeFilter;
   allowCrossKind: boolean;
   includeTypeLiterals: boolean;
   overlapMinWindow: number;
@@ -36,7 +43,6 @@ interface EngineModule {
   check_source(filePath: string, content: string): string | undefined;
 }
 
-const MODES: readonly AnalyzerMode[] = ["functions", "types", "classes", "overlap"];
 const REBUILD_HINT = "rebuild with `npm run build:wasm`";
 
 // The glue module is CommonJS and instantiates the WebAssembly module when
@@ -127,7 +133,7 @@ function assertEngineReport(report: unknown): asserts report is EngineReport {
       }
     }
     const { byMode, stats } = report;
-    if (!isRecord(byMode) || MODES.some((mode) => !Array.isArray(byMode[mode]))) {
+    if (!isRecord(byMode) || ANALYZER_MODES.some((mode) => !Array.isArray(byMode[mode]))) {
       return "`byMode` does not list every mode";
     }
     if (
