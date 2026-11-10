@@ -1,13 +1,12 @@
 import path from 'node:path';
 import process from 'node:process';
 import { performance } from 'node:perf_hooks';
-import { analyzeProject } from '../src/analyze.js';
-
-type Mode = 'functions' | 'types' | 'classes' | 'overlap';
+import { analyzeProject } from '../src/index.js';
+import type { AnalyzerMode } from '../src/index.js';
 
 const fixtureRoot = path.resolve(process.cwd(), 'tests/fixtures');
 
-async function runCase(name: string, target: string, modes: Mode[]) {
+async function runCase(name: string, target: string, modes: AnalyzerMode[]) {
   const abs = path.join(fixtureRoot, target);
   const start = performance.now();
   const report = await analyzeProject({
@@ -44,7 +43,7 @@ function toMarkdown(rows: Awaited<ReturnType<typeof runCase>>[]) {
     );
   }
 
-  lines.push('', '## Notes', '', '- This is a Phase 0 baseline from the current TypeScript engine.', '- `similar/refactoring` is used for recall-oriented spot checks.', '- `dissimilar` is used for false-positive spot checks.');
+  lines.push('', '## Notes', '', '- Pair counts and timings of the bundled fixtures at threshold 0.7.', '- `similar/refactoring` is used for recall-oriented spot checks.', '- `dissimilar` is used for false-positive spot checks.');
   return `${lines.join('\n')}\n`;
 }
 

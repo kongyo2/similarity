@@ -1,4 +1,8 @@
-export type AnalyzerMode = "functions" | "types" | "classes" | "overlap";
+import type { ANALYZER_MODES, TYPE_FILTERS } from "./defaults.js";
+
+export type AnalyzerMode = (typeof ANALYZER_MODES)[number];
+/** Which declarations type mode compares. */
+export type TypeFilter = (typeof TYPE_FILTERS)[number];
 
 export interface AnalyzerLocation {
   filePath: string;
@@ -54,7 +58,7 @@ export interface AnalyzeProjectOptions {
   crossFileOnly?: boolean;
   extensions?: string[];
   exclude?: string[];
-  typesOnly?: "interface" | "type" | "all";
+  typesOnly?: TypeFilter;
   /**
    * When true (the default), an `interface` and a structurally identical
    * `type` alias are eligible to match. Set to `false` to restrict the

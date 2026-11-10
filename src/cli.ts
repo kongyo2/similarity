@@ -4,10 +4,11 @@ import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import chalk from "chalk";
 import { Command, CommanderError, Option } from "commander";
-import { z } from "zod";
-import { analyzeProject } from "./analyze.js";
+import { analyzeProject, resolveModes } from "./analyze.js";
 import {
+  ANALYZER_MODES,
   DEFAULT_EXTENSIONS,
   DEFAULT_MODES,
   DEFAULT_MIN_LINES,
@@ -15,25 +16,32 @@ import {
   DEFAULT_OVERLAP_MIN_WINDOW,
   DEFAULT_OVERLAP_SIZE_TOLERANCE,
   DEFAULT_THRESHOLD,
+  MAX_OVERLAP_WINDOW,
+  TYPE_FILTERS,
 } from "./defaults.js";
 import { formatJsonReport, formatPrettyReport } from "./format.js";
-import type { AnalyzerMode } from "./types.js";
+import type { TypeFilter } from "./types.js";
 
-interface CliIO {
+/** Where the CLI writes: the report and help to `log`, problems to `error`. */
+export interface CliIO {
   log: (message: string) => void;
   error: (message: string) => void;
 }
 
+/**
+ * The options as commander hands them over: every option that takes a
+ * value arrives as the string typed (or the default, itself a string).
+ */
 interface ParsedCliOptions {
   modes: string;
-  threshold: number;
-  minLines: number;
+  threshold: string;
+  minLines: string;
   sizePenalty: boolean;
   sameFileOnly: boolean;
   crossFileOnly: boolean;
   extensions: string;
   exclude: string[];
-  typesOnly: "interface" | "type" | "all";
+  typesOnly: TypeFilter;
   /**
    * Commander's `--no-allow-cross-kind` flag stores its value on this key.
    * It defaults to `true` and flips to `false` when the negative flag is
@@ -44,9 +52,9 @@ interface ParsedCliOptions {
   typeLiterals: boolean;
   minTokens?: string;
   failOnDuplicates: boolean;
-  overlapMinWindow: number;
-  overlapMaxWindow: number;
-  overlapSizeTolerance: number;
+  overlapMinWindow: string;
+  overlapMaxWindow: string;
+  overlapSizeTolerance: string;
   format: "pretty" | "json";
   output?: string;
   failOnWarnings: boolean;
@@ -57,23 +65,11 @@ interface ParsedCliOptions {
 // package manifest from either location.
 const packageJson = createRequire(import.meta.url)("../package.json") as { version: string };
 
-const modeSchema = z.enum(["functions", "types", "classes", "overlap"]);
-
 function parseCommaList(rawValue: string): string[] {
   return rawValue
     .split(",")
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
-}
-
-function parseModes(rawModes: string): AnalyzerMode[] {
-  const parsed = parseCommaList(rawModes);
-  if (parsed.length === 0) {
-    return DEFAULT_MODES;
-  }
-  // De-duplicate so `--modes functions,functions` doesn't render the same
-  // report section twice.
-  return [...new Set(parsed.map((mode) => modeSchema.parse(mode)))];
 }
 
 function parseExtensions(rawExtensions: string): string[] {
@@ -95,7 +91,7 @@ function buildProgram(io: CliIO): Command {
     .argument("<paths...>", "Files and directories to analyze")
     .option(
       "--modes <list>",
-      "Comma-separated modes: functions,types,classes,overlap",
+      `Comma-separated modes: ${ANALYZER_MODES.join(",")}`,
       DEFAULT_MODES.join(","),
     )
     .option("-t, --threshold <number>", "Similarity threshold (0-1)", String(DEFAULT_THRESHOLD))
@@ -116,7 +112,9 @@ function buildProgram(io: CliIO): Command {
       previous.push(value);
       return previous;
     }, [])
-    .addOption(new Option("--types-only <kind>", "Type mode filter").choices(["all", "interface", "type"]).default("all"))
+    .addOption(
+      new Option("--types-only <kind>", "Type mode filter").choices([...TYPE_FILTERS]).default("all"),
+    )
     // Cross-kind comparison is on by default — pass `--no-allow-cross-kind`
     // to restrict matches to interface↔interface and type↔type pairs only.
     // The positive `--allow-cross-kind` flag is kept as a deprecated no-op
@@ -130,8 +128,16 @@ function buildProgram(io: CliIO): Command {
       "Disable cross-kind type comparisons (cross-kind matches are detected by default)",
     )
     .option("--type-literals", "Include anonymous type literals in type mode", false)
-    .option("--overlap-min-window <number>", "Overlap mode minimum token window", String(DEFAULT_OVERLAP_MIN_WINDOW))
-    .option("--overlap-max-window <number>", "Overlap mode maximum token window", String(DEFAULT_OVERLAP_MAX_WINDOW))
+    .option(
+      "--overlap-min-window <number>",
+      "Smallest overlap fragment, in AST nodes",
+      String(DEFAULT_OVERLAP_MIN_WINDOW),
+    )
+    .option(
+      "--overlap-max-window <number>",
+      `Largest overlap fragment, in AST nodes (at most ${MAX_OVERLAP_WINDOW})`,
+      String(DEFAULT_OVERLAP_MAX_WINDOW),
+    )
     .option(
       "--overlap-size-tolerance <number>",
       "Allowed segment-size ratio difference in overlap mode",
@@ -176,8 +182,8 @@ function parseNumber(value: string, field: string): number {
   return Number(raw);
 }
 
-function parseInteger(value: unknown, field: string, minimum = 1): number {
-  const raw = String(value).trim();
+function parseInteger(value: string, field: string, minimum = 1): number {
+  const raw = value.trim();
   if (!DECIMAL_INTEGER.test(raw)) {
     throw new Error(`${field} must be an integer`);
   }
@@ -192,7 +198,7 @@ function parseInteger(value: unknown, field: string, minimum = 1): number {
 }
 
 function normalizeOptions(rawOptions: ParsedCliOptions) {
-  const threshold = parseNumber(String(rawOptions.threshold), "threshold");
+  const threshold = parseNumber(rawOptions.threshold, "threshold");
   const minLines = parseInteger(rawOptions.minLines, "min-lines");
   const minTokens =
     rawOptions.minTokens === undefined
@@ -200,7 +206,10 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
       : parseInteger(rawOptions.minTokens, "min-tokens");
   const overlapMinWindow = parseInteger(rawOptions.overlapMinWindow, "overlap-min-window");
   const overlapMaxWindow = parseInteger(rawOptions.overlapMaxWindow, "overlap-max-window");
-  const overlapSizeTolerance = parseNumber(String(rawOptions.overlapSizeTolerance), "overlap-size-tolerance");
+  const overlapSizeTolerance = parseNumber(
+    rawOptions.overlapSizeTolerance,
+    "overlap-size-tolerance",
+  );
 
   if (threshold < 0 || threshold > 1) {
     throw new Error("threshold must be between 0 and 1");
@@ -213,6 +222,9 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
       "overlap-min-window must be less than or equal to overlap-max-window",
     );
   }
+  if (overlapMaxWindow > MAX_OVERLAP_WINDOW) {
+    throw new Error(`overlap-max-window must be less than or equal to ${MAX_OVERLAP_WINDOW}`);
+  }
   if (rawOptions.sameFileOnly && rawOptions.crossFileOnly) {
     throw new Error("Cannot use both --same-file-only and --cross-file-only");
   }
@@ -223,7 +235,9 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
   // `noSizePenalty` flag.
   const sizePenalty = rawOptions.sizePenalty;
   return {
-    modes: parseModes(rawOptions.modes),
+    // An unknown mode is rejected here, by name; repeats are dropped so a
+    // mode listed twice is not rendered twice.
+    modes: resolveModes(parseCommaList(rawOptions.modes)),
     threshold,
     minLines,
     minTokens,
@@ -274,7 +288,12 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
 
     const rendered = options.format === "json"
       ? formatJsonReport(report)
-      : formatPrettyReport(report, process.cwd(), options.modes);
+      : formatPrettyReport(report, process.cwd(), options.modes, {
+          // Escape codes belong on a terminal that renders them: not in a
+          // report written to a file, and not in piped output (`chalk`
+          // looks at the standard output and at `NO_COLOR`/`FORCE_COLOR`).
+          color: options.output === undefined && chalk.level > 0,
+        });
 
     if (options.output) {
       // The analysis is already done — don't lose it to a missing parent
@@ -288,7 +307,9 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
 
     const warnings = report.warnings;
     for (const warning of warnings) {
-      io.error(warning.filePath ? `${warning.filePath}: ${warning.message}` : warning.message);
+      // "Failed to read <path>: …" already names its file.
+      const namesFile = warning.filePath === undefined || warning.message.includes(warning.filePath);
+      io.error(namesFile ? warning.message : `${warning.filePath}: ${warning.message}`);
     }
     // Zero analyzed files is only an error when something went wrong
     // getting there (missing paths, unreadable files — i.e. a warning

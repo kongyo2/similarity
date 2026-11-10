@@ -191,9 +191,10 @@ export function aggregateAmount(items: number[]): number {
 
       expect(report.stats.fileCount).toBe(1);
       expect(report.analyzedFiles[0]?.endsWith("src/app.ts")).toBe(true);
-      expect(report.skippedFiles.some((file) =>
-        file.endsWith("node_modules/package/ignored.ts"),
-      )).toBe(true);
+      // The directory is never entered, so what it holds is not listed
+      // either: a real `node_modules` would add tens of thousands of
+      // entries to the report.
+      expect(report.skippedFiles).toEqual([]);
     });
   });
 

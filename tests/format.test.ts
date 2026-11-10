@@ -94,6 +94,52 @@ describe("formatPrettyReport", () => {
     expect(rendered).toContain("- Path not found or not accessible: missing.ts");
   });
 
+  it("styles the report only when asked to", () => {
+    const report = createReport({ warnings: [{ message: "Path not found: missing.ts" }] });
+    const escape = "\u001b";
+
+    // Plain by default: the text is as fit for a file or a pipe as for a
+    // terminal, table borders and header included.
+    const plain = formatPrettyReport(report, "/repo", ["functions"]);
+    expect(plain).not.toContain(escape);
+    expect(plain).toContain("│ Similarity │");
+    expect(formatPrettyReport(report, "/repo", ["functions"], { color: false })).toBe(plain);
+
+    const styled = formatPrettyReport(report, "/repo", ["functions"], { color: true });
+    expect(styled).toContain(`${escape}[1mAnalyzing code similarity...${escape}[22m`);
+    expect(styled).toContain(`${escape}[1m=== Function Similarity ===${escape}[22m`);
+    expect(styled).toContain(`${escape}[33mWarnings:${escape}[39m`);
+    // The same text once the styling is taken away.
+    // eslint-disable-next-line no-control-regex
+    expect(styled.replace(/\u001b\[\d+m/g, "")).toBe(plain);
+  });
+
+  it("names the file a warning is about, relative to the working directory", () => {
+    const report = createReport({
+      warnings: [
+        { filePath: "/repo/src/broken.ts", message: "skipped: Parse errors: Unexpected token" },
+        { filePath: "/external/deep.ts", message: "skipped: code is nested too deeply to parse" },
+        // A message that names its file already is not prefixed again.
+        {
+          filePath: "/repo/src/locked.ts",
+          message: "Failed to read /repo/src/locked.ts: EACCES: permission denied",
+        },
+        { message: "Path not found or not accessible: missing.ts" },
+      ],
+    });
+
+    const rendered = formatPrettyReport(report, "/repo", ["functions"]);
+    const warnings = rendered.slice(rendered.indexOf("Warnings:")).split("\n");
+
+    expect(warnings).toEqual([
+      "Warnings:",
+      "- src/broken.ts: skipped: Parse errors: Unexpected token",
+      "- /external/deep.ts: skipped: code is nested too deeply to parse",
+      "- Failed to read /repo/src/locked.ts: EACCES: permission denied",
+      "- Path not found or not accessible: missing.ts",
+    ]);
+  });
+
   it("uses absolute paths for pair locations outside the current working directory", () => {
     const outsidePair = createPair({
       right: {

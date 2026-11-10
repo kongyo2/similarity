@@ -4,6 +4,7 @@ import type {
   SimilarityCluster,
   SimilarityPair,
 } from "./types.js";
+import { compareStrings } from "./utils/path.js";
 
 /**
  * Modes whose pairs relate whole declarations. Overlap pairs relate token
@@ -22,15 +23,6 @@ function locationKey(location: AnalyzerLocation): string {
     location.symbolName,
     location.kind,
   ].join("\u0000");
-}
-
-/**
- * Code-unit order, the same on every machine. `localeCompare` depends on
- * the host's default locale and ICU data, and the member and cluster order
- * is part of the JSON report.
- */
-function compareStrings(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function compareLocations(a: AnalyzerLocation, b: AnalyzerLocation): number {

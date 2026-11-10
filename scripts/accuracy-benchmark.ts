@@ -147,10 +147,10 @@ function summarize(outcomes: PairOutcome[]): Summary {
 
   const byMode: Record<string, { total: number; errors: number }> = {};
   for (const outcome of outcomes) {
-    byMode[outcome.mode] ??= { total: 0, errors: 0 };
-    byMode[outcome.mode].total += 1;
+    const mode = (byMode[outcome.mode] ??= { total: 0, errors: 0 });
+    mode.total += 1;
     if (!outcome.correct) {
-      byMode[outcome.mode].errors += 1;
+      mode.errors += 1;
     }
   }
 

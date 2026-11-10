@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import pLimit from "p-limit";
 import {
+  ANALYZER_MODES,
   DEFAULT_EXTENSIONS,
   DEFAULT_MIN_LINES,
   DEFAULT_MODES,
@@ -9,17 +10,48 @@ import {
   DEFAULT_OVERLAP_MIN_WINDOW,
   DEFAULT_OVERLAP_SIZE_TOLERANCE,
   DEFAULT_THRESHOLD,
+  MAX_OVERLAP_WINDOW,
+  TYPE_FILTERS,
 } from "./defaults.js";
 import { buildClusters } from "./clusters.js";
 import { analyzeWithWasm } from "./engine/wasm.js";
-import type { AnalyzeProjectOptions, AnalyzeReport, AnalyzerMode, LoadedFile } from "./types.js";
+import type {
+  AnalyzeProjectOptions,
+  AnalyzeReport,
+  AnalyzerMode,
+  AnalyzerWarning,
+  LoadedFile,
+  TypeFilter,
+} from "./types.js";
 import { collectTypeScriptFiles } from "./utils/files.js";
 
-function uniqueModes(modes: AnalyzerMode[] | undefined): AnalyzerMode[] {
-  const resolved = modes && modes.length > 0 ? modes : DEFAULT_MODES;
-  return [...new Set(resolved)];
+/**
+ * The modes to run: the requested ones without repeats — a mode listed
+ * twice would be reported twice — or all of them when none is requested.
+ */
+export function resolveModes(modes: readonly string[] | undefined): AnalyzerMode[] {
+  if (!modes || modes.length === 0) {
+    return [...DEFAULT_MODES];
+  }
+  for (const mode of modes) {
+    if (!(ANALYZER_MODES as readonly string[]).includes(mode)) {
+      throw new Error(`Unknown mode "${mode}" (expected one of: ${ANALYZER_MODES.join(", ")})`);
+    }
+  }
+  return [...new Set(modes as readonly AnalyzerMode[])];
 }
 
+function resolveTypeFilter(typesOnly: string | undefined): TypeFilter {
+  if (typesOnly === undefined) {
+    return "all";
+  }
+  if (!(TYPE_FILTERS as readonly string[]).includes(typesOnly)) {
+    throw new Error(`typesOnly must be one of: ${TYPE_FILTERS.join(", ")}`);
+  }
+  return typesOnly as TypeFilter;
+}
+
+/** {@link AnalyzeProjectOptions} with every default filled in. */
 export interface ResolvedAnalyzeOptions {
   cwd: string;
   paths: string[];
@@ -32,7 +64,7 @@ export interface ResolvedAnalyzeOptions {
   crossFileOnly: boolean;
   extensions: string[];
   exclude: string[];
-  typesOnly: "interface" | "type" | "all";
+  typesOnly: TypeFilter;
   allowCrossKind: boolean;
   includeTypeLiterals: boolean;
   overlapMinWindow: number;
@@ -91,11 +123,14 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
   if (overlapMinWindow > overlapMaxWindow) {
     throw new Error("overlapMinWindow must be less than or equal to overlapMaxWindow");
   }
+  if (overlapMaxWindow > MAX_OVERLAP_WINDOW) {
+    throw new Error(`overlapMaxWindow must be less than or equal to ${MAX_OVERLAP_WINDOW}`);
+  }
 
   return {
     cwd: input.cwd ?? process.cwd(),
     paths: input.paths,
-    modes: uniqueModes(input.modes),
+    modes: resolveModes(input.modes),
     threshold,
     minLines,
     minTokens,
@@ -109,7 +144,7 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
       (extension) => extension.replace(/^\./, "").toLowerCase(),
     ),
     exclude: input.exclude ?? [],
-    typesOnly: input.typesOnly ?? "all",
+    typesOnly: resolveTypeFilter(input.typesOnly),
     // Default to cross-kind comparison so an `interface User` and a
     // structurally identical `type User = {...}` show up as a refactoring
     // candidate. Pass `false` explicitly when the caller wants to restrict
@@ -124,32 +159,29 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
 
 async function loadFiles(
   filePaths: string[],
-): Promise<{ files: LoadedFile[]; warnings: { filePath: string; message: string }[] }> {
-  const warnings: { filePath: string; message: string }[] = [];
-  const limiter = pLimit(Math.max(4, Math.min(32, os.cpus().length)));
+): Promise<{ files: LoadedFile[]; unreadable: AnalyzerWarning[] }> {
+  const limiter = pLimit(Math.max(4, Math.min(32, os.availableParallelism())));
   const loaded = await Promise.all(
     filePaths.map((filePath) =>
-      limiter(async () => {
+      limiter(async (): Promise<LoadedFile | AnalyzerWarning> => {
         try {
-          const content = await fs.readFile(filePath, "utf8");
-          return { filePath, content } satisfies LoadedFile;
+          return { filePath, content: await fs.readFile(filePath, "utf8") };
         } catch (error) {
-          warnings.push({
-            filePath,
-            message: `Failed to read ${filePath}: ${(error as Error).message}`,
-          });
-          return null;
+          return { filePath, message: `Failed to read ${filePath}: ${(error as Error).message}` };
         }
       }),
     ),
   );
-  return { files: loaded.filter((entry): entry is LoadedFile => entry !== null), warnings };
+  // In the order of `filePaths`, whatever order the reads finished in.
+  return {
+    files: loaded.filter((entry): entry is LoadedFile => "content" in entry),
+    unreadable: loaded.filter((entry): entry is AnalyzerWarning => "message" in entry),
+  };
 }
 
 export async function analyzeProject(input: AnalyzeProjectOptions): Promise<AnalyzeReport> {
   const startTime = Date.now();
   const options = resolveAnalyzeOptions(input);
-  const warnings: { filePath?: string; message: string }[] = [];
 
   const collected = await collectTypeScriptFiles({
     cwd: options.cwd,
@@ -157,12 +189,9 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
     extensions: options.extensions,
     exclude: options.exclude,
   });
-  warnings.push(...collected.warnings.map((message) => ({ message })));
+  const { files, unreadable } = await loadFiles(collected.files);
 
-  const { files, warnings: readWarnings } = await loadFiles(collected.files);
-  warnings.push(...readWarnings);
-
-  const wasmReport = await analyzeWithWasm({
+  const engineReport = analyzeWithWasm({
     files,
     modes: options.modes,
     threshold: options.threshold,
@@ -179,14 +208,25 @@ export async function analyzeProject(input: AnalyzeProjectOptions): Promise<Anal
     overlapSizeTolerance: options.overlapSizeTolerance,
   });
 
-  const clusters = buildClusters(wasmReport.byMode);
+  const clusters = buildClusters(engineReport.byMode);
   return {
-    ...wasmReport,
-    skippedFiles: [...wasmReport.skippedFiles, ...collected.skipped],
-    warnings: [...wasmReport.warnings, ...warnings],
+    ...engineReport,
+    // Everything that was found or named and not analyzed: files the
+    // engine could not parse, files that could not be read, and files an
+    // ignore rule or the extension filter left out.
+    skippedFiles: [
+      ...engineReport.skippedFiles,
+      ...unreadable.flatMap((warning) => warning.filePath ?? []),
+      ...collected.skipped,
+    ],
+    warnings: [
+      ...engineReport.warnings,
+      ...collected.warnings.map((message) => ({ message })),
+      ...unreadable,
+    ],
     clusters,
     stats: {
-      ...wasmReport.stats,
+      ...engineReport.stats,
       clusterCount: clusters.length,
       elapsedMs: Date.now() - startTime,
     },
