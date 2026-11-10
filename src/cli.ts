@@ -19,8 +19,9 @@ import {
   MAX_OVERLAP_WINDOW,
   TYPE_FILTERS,
 } from "./defaults.js";
-import { formatJsonReport, formatPrettyReport } from "./format.js";
+import { formatJsonReport, formatPrettyReport, formatWarning } from "./format.js";
 import type { TypeFilter } from "./types.js";
+import { errorMessage } from "./utils/errors.js";
 
 /** Where the CLI writes: the report and help to `log`, problems to `error`. */
 export interface CliIO {
@@ -71,16 +72,6 @@ function parseCommaList(rawValue: string): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
-}
-
-function parseExtensions(rawExtensions: string): string[] {
-  const parsed = parseCommaList(rawExtensions).map((extension) =>
-    extension.replace(/^\./, "").toLowerCase(),
-  );
-  if (parsed.length === 0) {
-    return DEFAULT_EXTENSIONS;
-  }
-  return [...new Set(parsed)];
 }
 
 function buildProgram(io: CliIO): Command {
@@ -246,7 +237,8 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
     noSizePenalty: !sizePenalty,
     sameFileOnly: rawOptions.sameFileOnly,
     crossFileOnly: rawOptions.crossFileOnly,
-    extensions: parseExtensions(rawOptions.extensions),
+    // Dots, case, repeats and an empty list are the library's to settle.
+    extensions: parseCommaList(rawOptions.extensions),
     exclude: rawOptions.exclude ?? [],
     typesOnly: rawOptions.typesOnly,
     allowCrossKind: rawOptions.allowCrossKind,
@@ -309,9 +301,7 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
 
     const warnings = report.warnings;
     for (const warning of warnings) {
-      // "Failed to read <path>: …" already names its file.
-      const namesFile = warning.filePath === undefined || warning.message.includes(warning.filePath);
-      io.error(namesFile ? warning.message : `${warning.filePath}: ${warning.message}`);
+      io.error(formatWarning(warning, process.cwd()));
     }
     // Zero analyzed files is only an error when something went wrong
     // getting there (missing paths, unreadable files — i.e. a warning
@@ -331,7 +321,7 @@ export async function runCli(argv: string[], io: CliIO = console): Promise<numbe
       // code remains to be propagated.
       return error.exitCode;
     }
-    io.error(error instanceof Error ? error.message : String(error));
+    io.error(errorMessage(error));
     return 1;
   }
 }

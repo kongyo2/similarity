@@ -8,6 +8,7 @@ import type {
   AnalyzeReport,
   AnalyzerLocation,
   AnalyzerMode,
+  AnalyzerWarning,
   SimilarityCluster,
   SimilarityPair,
 } from "./types.js";
@@ -94,34 +95,33 @@ function wrapLongWords(text: string, width: number): string {
     .join(" ");
 }
 
-function formatModeLabel(mode: AnalyzerMode): string {
-  switch (mode) {
-    case "functions":
-      return "Function Similarity";
-    case "types":
-      return "Type Similarity";
-    case "classes":
-      return "Class Similarity";
-    case "overlap":
-      return "Overlap Detection";
-    default:
-      return mode;
-  }
+/** How a mode is called in the report: its section, and what it pairs. */
+const MODE_WORDING: Record<AnalyzerMode, { heading: string; members: string }> = {
+  functions: { heading: "Function Similarity", members: "functions" },
+  types: { heading: "Type Similarity", members: "types" },
+  classes: { heading: "Class Similarity", members: "classes" },
+  overlap: { heading: "Overlap Detection", members: "fragments" },
+};
+
+/**
+ * The wording for `mode`. A report is data, and may name a mode this
+ * version does not know: it gets a section under its own name.
+ */
+function wordingOf(mode: AnalyzerMode): { heading: string; members: string } {
+  const known: Partial<typeof MODE_WORDING> = MODE_WORDING;
+  return known[mode] ?? { heading: mode, members: "declarations" };
 }
 
-function memberNoun(mode: AnalyzerMode): string {
-  switch (mode) {
-    case "functions":
-      return "functions";
-    case "types":
-      return "types";
-    case "classes":
-      return "classes";
-    case "overlap":
-      return "fragments";
-    default:
-      return "declarations";
+/**
+ * A warning as one line. A warning about a file names the file, relative
+ * to `cwd` — "skipped: Parse errors: …" on its own says nothing about
+ * which — unless the message names it already.
+ */
+export function formatWarning(warning: AnalyzerWarning, cwd: string): string {
+  if (warning.filePath === undefined || warning.message.includes(warning.filePath)) {
+    return warning.message;
   }
+  return `${toRelativePath(warning.filePath, cwd)}: ${warning.message}`;
 }
 
 function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
@@ -145,7 +145,7 @@ function renderCluster(
     : "";
   const lines = [
     styles.bold(
-      `Cluster ${index + 1}: ${cluster.members.length} ${memberNoun(mode)}${shape}, ` +
+      `Cluster ${index + 1}: ${cluster.members.length} ${wordingOf(mode).members}${shape}, ` +
         `${plural(cluster.pairCount, "pairwise match", "pairwise matches")}, ` +
         `similarity ${similarity}`,
     ),
@@ -179,7 +179,7 @@ function renderMode(
   styles: Styles,
 ): string {
   const lines: string[] = [];
-  lines.push(styles.bold(`=== ${formatModeLabel(mode)} ===`));
+  lines.push(styles.bold(`=== ${wordingOf(mode).heading} ===`));
   if (pairs.length === 0) {
     lines.push("No similar pairs found.");
     lines.push("");
@@ -243,14 +243,7 @@ export function formatPrettyReport(
   if (report.warnings.length > 0) {
     lines.push(styles.warning("Warnings:"));
     for (const warning of report.warnings) {
-      // A warning about a file says which file: "skipped: Parse errors: …"
-      // on its own names none.
-      const subject = warning.filePath === undefined ? "" : toRelativePath(warning.filePath, cwd);
-      lines.push(
-        subject === "" || warning.message.includes(warning.filePath as string)
-          ? `- ${warning.message}`
-          : `- ${subject}: ${warning.message}`,
-      );
+      lines.push(`- ${formatWarning(warning, cwd)}`);
     }
   }
 

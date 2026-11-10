@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import ignore, { type Ignore } from "ignore";
 import { DEFAULT_EXCLUDES } from "../defaults.js";
-import { compareStrings, isInsideDirectory, toPosixPath } from "./path.js";
+import { errorMessage } from "./errors.js";
+import { compareStrings, isInsideDirectory, normalizeExtensions, toPosixPath } from "./path.js";
 
 export interface CollectFilesOptions {
   cwd: string;
@@ -76,14 +77,6 @@ function isIgnored(rules: IgnoreRules, absolutePath: string, isDirectory: boolea
   return rules.defaults !== undefined && ruledOut(rules.defaults, absolutePath, isDirectory).ignored;
 }
 
-function normalizeExtensions(extensions: string[]): Set<string> {
-  return new Set(
-    extensions
-      .map((extension) => extension.replace(/^\./, "").toLowerCase())
-      .filter((extension) => extension.length > 0),
-  );
-}
-
 function extensionOf(fileName: string): string {
   return path.extname(fileName).slice(1).toLowerCase();
 }
@@ -109,7 +102,7 @@ export async function collectTypeScriptFiles(
   // Resolved so comparisons with paths produced by `path.resolve(cwd, …)`
   // hold whatever form the caller passed.
   const cwd = path.resolve(options.cwd);
-  const extensions = normalizeExtensions(options.extensions);
+  const extensions = new Set(normalizeExtensions(options.extensions));
 
   const discovered = new Set<string>();
   const skipped = new Set<string>();
@@ -192,7 +185,7 @@ export async function collectTypeScriptFiles(
     try {
       entries = await fs.readdir(directory, { withFileTypes: true });
     } catch (error) {
-      warnings.push(`Failed to read directory ${directory}: ${(error as Error).message}`);
+      warnings.push(`Failed to read directory ${directory}: ${errorMessage(error)}`);
       return;
     }
     entries.sort((left, right) => compareStrings(left.name, right.name));

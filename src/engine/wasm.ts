@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import type { AnalyzeReport, AnalyzerMode, AnalyzerWarning, LoadedFile } from "../types.js";
+import { errorMessage } from "../utils/errors.js";
 
 /**
  * The report the engine returns: everything in {@link AnalyzeReport}
@@ -94,8 +95,15 @@ function isEngineCrash(error: unknown): boolean {
   return error instanceof RangeError || error instanceof WebAssembly.RuntimeError;
 }
 
-function crashReason(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/**
+ * After a call that threw: pass on what is no crash, and drop the instance
+ * a crash leaves behind.
+ */
+function recoverFromCrash(error: unknown): void {
+  if (!isEngineCrash(error)) {
+    throw error;
+  }
+  discardEngine();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -161,10 +169,7 @@ function findUnparsableFiles(files: LoadedFile[]): Map<string, AnalyzerWarning> 
       // reports itself; only whether it survives matters here.
       loadEngine().check_source(file.filePath, file.content);
     } catch (error) {
-      if (!isEngineCrash(error)) {
-        throw error;
-      }
-      discardEngine();
+      recoverFromCrash(error);
       unparsable.set(file.filePath, {
         filePath: file.filePath,
         message: "skipped: code is nested too deeply to parse",
@@ -184,15 +189,12 @@ export function analyzeWithWasm(input: EngineInput): EngineReport {
   try {
     return runEngine(input);
   } catch (error) {
-    if (!isEngineCrash(error)) {
-      throw error;
-    }
-    discardEngine();
+    recoverFromCrash(error);
 
     const unparsable = findUnparsableFiles(input.files);
     const bug = (reason: unknown) =>
       new Error(
-        `The analysis engine crashed (${crashReason(reason)}). ` +
+        `The analysis engine crashed (${errorMessage(reason)}). ` +
           "This is a bug in similarity-ts; please report it at " +
           "https://github.com/kongyo2/similarity/issues with the input that triggers it.",
         { cause: reason },
@@ -208,10 +210,7 @@ export function analyzeWithWasm(input: EngineInput): EngineReport {
         files: input.files.filter((file) => !unparsable.has(file.filePath)),
       });
     } catch (retryError) {
-      if (!isEngineCrash(retryError)) {
-        throw retryError;
-      }
-      discardEngine();
+      recoverFromCrash(retryError);
       throw bug(retryError);
     }
 

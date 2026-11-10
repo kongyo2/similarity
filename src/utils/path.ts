@@ -23,6 +23,18 @@ export function toRelativePath(filePath: string, cwd: string): string {
 }
 
 /**
+ * File extensions the way the scan compares them: without the leading dot,
+ * in lower case, each once, in the order given. An entry with nothing
+ * behind the dot is dropped.
+ */
+export function normalizeExtensions(extensions: readonly string[]): string[] {
+  const normalized = extensions
+    .map((extension) => extension.trim().replace(/^\./, "").toLowerCase())
+    .filter((extension) => extension.length > 0);
+  return [...new Set(normalized)];
+}
+
+/**
  * Code-unit order, the same on every machine. `localeCompare` depends on
  * the host's default locale and ICU data, and the order of files, cluster
  * members and clusters is part of the report.

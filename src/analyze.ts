@@ -23,7 +23,9 @@ import type {
   LoadedFile,
   TypeFilter,
 } from "./types.js";
+import { errorMessage } from "./utils/errors.js";
 import { collectTypeScriptFiles } from "./utils/files.js";
+import { normalizeExtensions } from "./utils/path.js";
 
 /**
  * The modes to run: the requested ones without repeats — a mode listed
@@ -126,6 +128,7 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
   if (overlapMaxWindow > MAX_OVERLAP_WINDOW) {
     throw new Error(`overlapMaxWindow must be less than or equal to ${MAX_OVERLAP_WINDOW}`);
   }
+  const extensions = normalizeExtensions(input.extensions ?? []);
 
   return {
     cwd: input.cwd ?? process.cwd(),
@@ -137,12 +140,9 @@ export function resolveAnalyzeOptions(input: AnalyzeProjectOptions): ResolvedAna
     sizePenalty: !input.noSizePenalty,
     sameFileOnly: Boolean(input.sameFileOnly),
     crossFileOnly: Boolean(input.crossFileOnly),
-    // An explicitly-empty extension list behaves like "unspecified" (the
-    // CLI normalizes `--extensions ""` the same way) instead of silently
-    // matching zero files.
-    extensions: (input.extensions?.length ? input.extensions : DEFAULT_EXTENSIONS).map(
-      (extension) => extension.replace(/^\./, "").toLowerCase(),
-    ),
+    // A list that names no extension — empty, or nothing but "" and "." —
+    // means "unspecified" instead of silently matching no file.
+    extensions: extensions.length > 0 ? extensions : [...DEFAULT_EXTENSIONS],
     exclude: input.exclude ?? [],
     typesOnly: resolveTypeFilter(input.typesOnly),
     // Default to cross-kind comparison so an `interface User` and a
@@ -167,7 +167,7 @@ async function loadFiles(
         try {
           return { filePath, content: await fs.readFile(filePath, "utf8") };
         } catch (error) {
-          return { filePath, message: `Failed to read ${filePath}: ${(error as Error).message}` };
+          return { filePath, message: `Failed to read ${filePath}: ${errorMessage(error)}` };
         }
       }),
     ),

@@ -1,7 +1,7 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildClusters, clusterPairs, standalonePairs } from "../src/clusters.js";
-import { formatJsonReport, formatPrettyReport } from "../src/format.js";
+import { formatJsonReport, formatPrettyReport, formatWarning } from "../src/format.js";
 import type { AnalyzeReport, SimilarityPair } from "../src/types.js";
 
 function createPair(overrides: Partial<SimilarityPair> = {}): SimilarityPair {
@@ -138,6 +138,25 @@ describe("formatPrettyReport", () => {
       "- Failed to read /repo/src/locked.ts: EACCES: permission denied",
       "- Path not found or not accessible: missing.ts",
     ]);
+  });
+
+  it("words a warning the same wherever it is printed", () => {
+    // The report lists warnings and the command repeats them on stderr.
+    expect(
+      formatWarning({ filePath: "/repo/src/broken.ts", message: "skipped: Parse errors: 1" }, "/repo"),
+    ).toBe("src/broken.ts: skipped: Parse errors: 1");
+    expect(
+      formatWarning({ filePath: "/external/deep.ts", message: "skipped: nested" }, "/repo"),
+    ).toBe("/external/deep.ts: skipped: nested");
+    expect(
+      formatWarning(
+        { filePath: "/repo/locked.ts", message: "Failed to read /repo/locked.ts: EACCES" },
+        "/repo",
+      ),
+    ).toBe("Failed to read /repo/locked.ts: EACCES");
+    expect(formatWarning({ message: "Path not found: missing.ts" }, "/repo")).toBe(
+      "Path not found: missing.ts",
+    );
   });
 
   it("uses absolute paths for pair locations outside the current working directory", () => {

@@ -228,20 +228,24 @@ describe("runCli", () => {
     });
   });
 
-  it("falls back to default extensions when --extensions is empty", async () => {
+  it("falls back to default extensions when --extensions names none", async () => {
     await withTempProject(async (projectDir) => {
       await createCliFixture(projectDir);
-      const result = await run([
-        path.join(projectDir, "src"),
-        "--extensions",
-        "",
-        "--format",
-        "json",
-      ]);
+      // Empty, or nothing but separators and dots: a lone "." used to be
+      // taken for an extension, which matched no file.
+      for (const extensions of ["", ".", " , ."]) {
+        const result = await run([
+          path.join(projectDir, "src"),
+          "--extensions",
+          extensions,
+          "--format",
+          "json",
+        ]);
 
-      expect(result.exitCode).toBe(0);
-      expect(result.errors).toHaveLength(0);
-      expect(jsonReport(result).stats.fileCount).toBe(2);
+        expect(result.exitCode).toBe(0);
+        expect(result.errors).toHaveLength(0);
+        expect(jsonReport(result).stats.fileCount).toBe(2);
+      }
     });
   });
 

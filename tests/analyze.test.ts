@@ -335,6 +335,16 @@ describe("analyzeProject", () => {
       modes: ["functions", "types", "classes", "overlap"],
       extensions: ["ts", "tsx", "mts", "cts"],
     });
+    // A list that names no extension is no list, and a repeat is one entry.
+    expect(resolveAnalyzeOptions({ paths: ["."], extensions: ["", "."] }).extensions).toEqual([
+      "ts",
+      "tsx",
+      "mts",
+      "cts",
+    ]);
+    expect(resolveAnalyzeOptions({ paths: ["."], extensions: ["ts", ".TS"] }).extensions).toEqual([
+      "ts",
+    ]);
     expect(resolveAnalyzeOptions({ paths: ["."] }).cwd).toBe(process.cwd());
   });
 
