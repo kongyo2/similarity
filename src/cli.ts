@@ -40,7 +40,8 @@ interface ParsedCliOptions {
   sameFileOnly: boolean;
   crossFileOnly: boolean;
   extensions: string;
-  exclude: string[];
+  /** Absent when the option was not given. */
+  exclude?: string[];
   typesOnly: TypeFilter;
   /**
    * Commander's `--no-allow-cross-kind` flag stores its value on this key.
@@ -105,13 +106,14 @@ function buildProgram(io: CliIO): Command {
     .option("--cross-file-only", "Only compare symbols across different files", false)
     .option(
       "--extensions <list>",
-      "Comma-separated extensions (default: ts,tsx,mts,cts)",
+      "Comma-separated extensions of the files to scan",
       DEFAULT_EXTENSIONS.join(","),
     )
-    .option("--exclude <pattern>", "Exclude glob pattern (repeatable)", (value, previous: string[]) => {
-      previous.push(value);
-      return previous;
-    }, [])
+    .option(
+      "--exclude <pattern>",
+      "Leave out what a gitignore-style pattern matches (repeatable)",
+      (value: string, previous: string[] | undefined) => [...(previous ?? []), value],
+    )
     .addOption(
       new Option("--types-only <kind>", "Type mode filter").choices([...TYPE_FILTERS]).default("all"),
     )
@@ -245,7 +247,7 @@ function normalizeOptions(rawOptions: ParsedCliOptions) {
     sameFileOnly: rawOptions.sameFileOnly,
     crossFileOnly: rawOptions.crossFileOnly,
     extensions: parseExtensions(rawOptions.extensions),
-    exclude: rawOptions.exclude,
+    exclude: rawOptions.exclude ?? [],
     typesOnly: rawOptions.typesOnly,
     allowCrossKind: rawOptions.allowCrossKind,
     includeTypeLiterals: rawOptions.typeLiterals,
