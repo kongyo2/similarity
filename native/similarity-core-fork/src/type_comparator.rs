@@ -1,7 +1,10 @@
-use crate::type_extractor::{TypeDefinition, TypeLiteralDefinition};
+//! Type comparison: property-by-property similarity of two type shapes,
+//! and the pairwise scan.
+
+use crate::type_extractor::TypeDefinition;
 use crate::type_normalizer::{
-    calculate_property_similarity, find_property_matches, normalize_type, NormalizationOptions,
-    NormalizedType, PropertyMatch,
+    calculate_property_similarity, find_property_matches, is_discriminant_mismatch,
+    is_nominal_atom, normalize_type, NormalizationOptions, NormalizedType, PropertyMatch,
 };
 use std::collections::HashSet;
 
@@ -14,7 +17,7 @@ pub struct TypeComparisonResult {
     pub matched_properties: Vec<MatchedProperty>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TypeDifferences {
     pub missing_properties: Vec<String>,
     pub extra_properties: Vec<String>,
@@ -38,10 +41,12 @@ pub struct MatchedProperty {
 
 #[derive(Debug, Clone)]
 pub struct TypeComparisonOptions {
-    pub structural_weight: f64, // Weight for structural similarity (default: 0.6)
-    pub naming_weight: f64,     // Weight for naming similarity (default: 0.4)
-    pub property_match_threshold: f64, // Threshold for property matching (default: 0.7)
-    pub allow_cross_kind_comparison: bool, // Allow interface vs type comparison (default: true)
+    /// Weight of the structural (member-by-member) similarity.
+    pub structural_weight: f64,
+    /// Weight of the naming similarity.
+    pub naming_weight: f64,
+    /// Whether an `interface` may pair with a `type` alias.
+    pub allow_cross_kind_comparison: bool,
     pub normalization_options: NormalizationOptions,
 }
 
@@ -56,31 +61,45 @@ impl Default for TypeComparisonOptions {
             // different-type lookalikes fall well below it.
             structural_weight: 0.85,
             naming_weight: 0.15,
-            property_match_threshold: 0.7,
             allow_cross_kind_comparison: true,
             normalization_options: NormalizationOptions::default(),
         }
     }
 }
 
-/// Compare two type definitions and calculate their similarity
+/// Compare two type definitions and calculate their similarity.
+#[must_use]
 pub fn compare_types(
     type1: &TypeDefinition,
     type2: &TypeDefinition,
     options: &TypeComparisonOptions,
 ) -> TypeComparisonResult {
-    // Early exit if cross-kind comparison is not allowed
-    if !options.allow_cross_kind_comparison && type1.kind != type2.kind {
-        return create_empty_comparison_result();
+    compare_normalized_types(
+        &normalize_type(type1, &options.normalization_options),
+        &normalize_type(type2, &options.normalization_options),
+        options,
+    )
+}
+
+/// [`compare_types`] for types that are already normalized — a scan
+/// normalizes each type once, not once per pair it takes part in.
+#[must_use]
+pub fn compare_normalized_types(
+    normalized1: &NormalizedType,
+    normalized2: &NormalizedType,
+    options: &TypeComparisonOptions,
+) -> TypeComparisonResult {
+    if !options.allow_cross_kind_comparison && normalized1.kind != normalized2.kind {
+        return TypeComparisonResult {
+            similarity: 0.0,
+            structural_similarity: 0.0,
+            naming_similarity: 0.0,
+            differences: TypeDifferences::default(),
+            matched_properties: Vec::new(),
+        };
     }
 
-    // Normalize both types
-    let normalized1 = normalize_type(type1, &options.normalization_options);
-    let normalized2 = normalize_type(type2, &options.normalization_options);
-
-    // Find property matches
-    let property_matches =
-        find_property_matches(&normalized1, &normalized2, options.property_match_threshold);
+    let property_matches = find_property_matches(normalized1, normalized2);
 
     // Calculate structural similarity. Heritage is part of the contract: an
     // interface that `extends` a base carries every member of that base, so
@@ -91,7 +110,7 @@ pub fn compare_types(
     // near-duplicates on their shared `expression` member alone.
     let heritage_factor = if normalized1.extends == normalized2.extends { 1.0 } else { 0.7 };
     let mut structural_similarity =
-        calculate_structural_similarity(&normalized1, &normalized2, &property_matches)
+        calculate_structural_similarity(normalized1, normalized2, &property_matches)
             * heritage_factor;
 
     // An alias whose body is a single atom — a primitive, a literal, a
@@ -107,24 +126,20 @@ pub fn compare_types(
     // agreement, cubed so that only near-identical names (similarity above
     // ~0.91: the same name, a case variant) clear the default threshold
     // while one-letter label variants (`GLint64` vs `GLuint64`) do not.
-    if is_atomic_alias(&normalized1) && is_atomic_alias(&normalized2) {
+    if is_atomic_alias(normalized1) && is_atomic_alias(normalized2) {
         let name_similarity =
             calculate_property_similarity(&normalized1.original_name, &normalized2.original_name);
         structural_similarity *= name_similarity.powi(3);
     }
 
-    // Calculate naming similarity
     let naming_similarity =
-        calculate_naming_similarity(&normalized1, &normalized2, &property_matches);
+        calculate_naming_similarity(normalized1, normalized2, &property_matches);
 
-    // Calculate overall similarity
     let similarity = (structural_similarity * options.structural_weight)
         + (naming_similarity * options.naming_weight);
 
-    // Identify differences
-    let differences = identify_differences(&normalized1, &normalized2, &property_matches);
+    let differences = identify_differences(normalized1, normalized2, &property_matches);
 
-    // Create matched properties result
     let matched_properties = property_matches
         .iter()
         .map(|m| MatchedProperty {
@@ -146,13 +161,11 @@ pub fn compare_types(
 /// A type alias whose whole body is one nominal atom (see the call site).
 fn is_atomic_alias(normalized: &NormalizedType) -> bool {
     normalized.properties.len() == 1
-        && normalized
-            .properties
-            .get("<type-body>")
-            .is_some_and(|body| crate::type_normalizer::is_nominal_atom(body))
+        && normalized.properties.get("<type-body>").is_some_and(|body| is_nominal_atom(body))
 }
 
-/// Calculate structural similarity between two normalized types
+/// Calculate structural similarity between two normalized types.
+#[allow(clippy::cast_precision_loss)]
 fn calculate_structural_similarity(
     type1: &NormalizedType,
     type2: &NormalizedType,
@@ -169,10 +182,8 @@ fn calculate_structural_similarity(
         // named empties (the interface ⇔ alias cross-kind case) still
         // reach ~1.0, related names (EmptyA/EmptyB) stay above the
         // default threshold, unrelated names fall well below it.
-        let name_similarity = crate::type_normalizer::calculate_property_similarity(
-            &type1.original_name,
-            &type2.original_name,
-        );
+        let name_similarity =
+            calculate_property_similarity(&type1.original_name, &type2.original_name);
         return 0.6 + 0.4 * name_similarity;
     }
 
@@ -181,17 +192,17 @@ fn calculate_structural_similarity(
     }
 
     // Use the best matches (avoid double counting)
-    let mut used_props1 = HashSet::new();
-    let mut used_props2 = HashSet::new();
+    let mut used_props1: HashSet<&str> = HashSet::new();
+    let mut used_props2: HashSet<&str> = HashSet::new();
     let mut matched_count = 0;
     let mut total_match_score = 0.0;
 
     for property_match in matches {
-        if !used_props1.contains(&property_match.prop1)
-            && !used_props2.contains(&property_match.prop2)
+        if !used_props1.contains(property_match.prop1.as_str())
+            && !used_props2.contains(property_match.prop2.as_str())
         {
-            used_props1.insert(property_match.prop1.clone());
-            used_props2.insert(property_match.prop2.clone());
+            used_props1.insert(&property_match.prop1);
+            used_props2.insert(&property_match.prop2);
             matched_count += 1;
             total_match_score += property_match.overall_similarity;
         }
@@ -216,7 +227,7 @@ fn calculate_structural_similarity(
     // worth.
     let discriminant_mismatch = matches.iter().any(|property_match| {
         property_match.prop1 == property_match.prop2
-            && crate::type_normalizer::is_discriminant_mismatch(
+            && is_discriminant_mismatch(
                 &type1.properties[&property_match.prop1],
                 &type2.properties[&property_match.prop2],
             )
@@ -228,7 +239,8 @@ fn calculate_structural_similarity(
     structural
 }
 
-/// Calculate naming similarity between two normalized types
+/// Calculate naming similarity between two normalized types.
+#[allow(clippy::cast_precision_loss)]
 fn calculate_naming_similarity(
     type1: &NormalizedType,
     type2: &NormalizedType,
@@ -241,44 +253,47 @@ fn calculate_naming_similarity(
 
     if matches.is_empty() {
         // Without property matches the only remaining naming signal is the
-        // type alias / interface name itself. Returning 0.0 here used to
-        // collapse all property-less type comparisons onto the same 0.6
-        // similarity regardless of how close their bodies were.
+        // type alias / interface name itself.
         return type_name_similarity;
     }
 
-    // Calculate average naming similarity from matches
-    let naming_similarities: Vec<f64> = matches.iter().map(|m| m.name_similarity).collect();
     let average_naming_similarity =
-        naming_similarities.iter().sum::<f64>() / naming_similarities.len() as f64;
+        matches.iter().map(|m| m.name_similarity).sum::<f64>() / matches.len() as f64;
 
     // Weight property naming more heavily than type naming
     (average_naming_similarity * 0.8) + (type_name_similarity * 0.2)
 }
 
-/// Identify differences between two normalized types
+/// Identify differences between two normalized types.
 fn identify_differences(
     type1: &NormalizedType,
     type2: &NormalizedType,
     matches: &[PropertyMatch],
 ) -> TypeDifferences {
-    let matched_props1: HashSet<String> = matches.iter().map(|m| m.prop1.clone()).collect();
-    let matched_props2: HashSet<String> = matches.iter().map(|m| m.prop2.clone()).collect();
+    let matched_props1: HashSet<&str> = matches.iter().map(|m| m.prop1.as_str()).collect();
+    let matched_props2: HashSet<&str> = matches.iter().map(|m| m.prop2.as_str()).collect();
 
-    let missing_properties: Vec<String> =
-        type1.properties.keys().filter(|prop| !matched_props1.contains(*prop)).cloned().collect();
-
-    let extra_properties: Vec<String> =
-        type2.properties.keys().filter(|prop| !matched_props2.contains(*prop)).cloned().collect();
+    // Sorted: the properties live in hash maps, whose order changes from
+    // run to run.
+    let unmatched = |normalized: &NormalizedType, matched: &HashSet<&str>| -> Vec<String> {
+        let mut names: Vec<String> = normalized
+            .properties
+            .keys()
+            .filter(|name| !matched.contains(name.as_str()))
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    };
+    let missing_properties = unmatched(type1, &matched_props1);
+    let extra_properties = unmatched(type2, &matched_props2);
 
     let mut type_mismatches = Vec::new();
     let mut optionality_differences = Vec::new();
 
     for property_match in matches {
-        let empty_string = String::new();
-        let type1_type = type1.properties.get(&property_match.prop1).unwrap_or(&empty_string);
-        let type2_type = type2.properties.get(&property_match.prop2).unwrap_or(&empty_string);
-
+        let type1_type = &type1.properties[&property_match.prop1];
+        let type2_type = &type2.properties[&property_match.prop2];
         if type1_type != type2_type {
             type_mismatches.push(TypeMismatch {
                 property: format!("{} -> {}", property_match.prop1, property_match.prop2),
@@ -287,10 +302,8 @@ fn identify_differences(
             });
         }
 
-        // Check optionality differences
         let is_optional1 = type1.optional_properties.contains(&property_match.prop1);
         let is_optional2 = type2.optional_properties.contains(&property_match.prop2);
-
         if is_optional1 != is_optional2 {
             optionality_differences
                 .push(format!("{} -> {}", property_match.prop1, property_match.prop2));
@@ -305,22 +318,6 @@ fn identify_differences(
     }
 }
 
-/// Create an empty comparison result for cases where comparison is not possible
-fn create_empty_comparison_result() -> TypeComparisonResult {
-    TypeComparisonResult {
-        similarity: 0.0,
-        structural_similarity: 0.0,
-        naming_similarity: 0.0,
-        differences: TypeDifferences {
-            missing_properties: Vec::new(),
-            extra_properties: Vec::new(),
-            type_mismatches: Vec::new(),
-            optionality_differences: Vec::new(),
-        },
-        matched_properties: Vec::new(),
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SimilarTypePair {
     pub type1: TypeDefinition,
@@ -328,231 +325,40 @@ pub struct SimilarTypePair {
     pub result: TypeComparisonResult,
 }
 
-#[derive(Debug, Clone)]
-pub struct TypeLiteralComparisonPair {
-    pub type_literal: TypeLiteralDefinition,
-    pub type_definition: TypeDefinition,
-    pub result: TypeComparisonResult,
-}
-
-/// Compare multiple types and find similar pairs
+/// Compare every pair of types and return those at or above `threshold`,
+/// most similar first. Types under a `// similarity-ignore` directive take
+/// no part, and two declarations of one name in one file (declaration
+/// merging) are not a pair.
+#[must_use]
 pub fn find_similar_types(
     types: &[TypeDefinition],
     threshold: f64,
     options: &TypeComparisonOptions,
 ) -> Vec<SimilarTypePair> {
+    let candidates: Vec<(&TypeDefinition, NormalizedType)> = types
+        .iter()
+        .filter(|type_def| !type_def.has_ignore_directive)
+        .map(|type_def| (type_def, normalize_type(type_def, &options.normalization_options)))
+        .collect();
+
     let mut similar_pairs = Vec::new();
-
-    for i in 0..types.len() {
-        for j in (i + 1)..types.len() {
-            let type1 = &types[i];
-            let type2 = &types[j];
-
-            if type1.has_ignore_directive || type2.has_ignore_directive {
-                continue;
-            }
-
-            // Skip if same type (same name and file)
+    for (i, (type1, normalized1)) in candidates.iter().enumerate() {
+        for (type2, normalized2) in &candidates[i + 1..] {
             if type1.name == type2.name && type1.file_path == type2.file_path {
                 continue;
             }
-
-            let result = compare_types(type1, type2, options);
-
+            let result = compare_normalized_types(normalized1, normalized2, options);
             if result.similarity >= threshold {
                 similar_pairs.push(SimilarTypePair {
-                    type1: type1.clone(),
-                    type2: type2.clone(),
+                    type1: (*type1).clone(),
+                    type2: (*type2).clone(),
                     result,
                 });
             }
         }
     }
 
-    // Sort by similarity (descending)
     similar_pairs.sort_by(|a, b| b.result.similarity.total_cmp(&a.result.similarity));
-
-    similar_pairs
-}
-
-/// Find duplicate types (very high similarity)
-pub fn find_duplicate_types(
-    types: &[TypeDefinition],
-    threshold: f64,
-    options: &TypeComparisonOptions,
-) -> Vec<SimilarTypePair> {
-    find_similar_types(types, threshold.max(0.9), options)
-}
-
-/// Group similar types into clusters
-pub fn group_similar_types(
-    types: &[TypeDefinition],
-    threshold: f64,
-    options: &TypeComparisonOptions,
-) -> Vec<Vec<TypeDefinition>> {
-    let similar_pairs = find_similar_types(types, threshold, options);
-    let mut groups: Vec<Vec<TypeDefinition>> = Vec::new();
-    let mut processed = HashSet::new();
-
-    for pair in similar_pairs {
-        let type1_id = format!("{}:{}", pair.type1.file_path, pair.type1.name);
-        let type2_id = format!("{}:{}", pair.type2.file_path, pair.type2.name);
-
-        if processed.contains(&type1_id) || processed.contains(&type2_id) {
-            continue;
-        }
-
-        // Find existing group that contains either type
-        let mut found_group = None;
-        for (group_idx, group) in groups.iter().enumerate() {
-            if group.iter().any(|t| {
-                let id = format!("{}:{}", t.file_path, t.name);
-                id == type1_id || id == type2_id
-            }) {
-                found_group = Some(group_idx);
-                break;
-            }
-        }
-
-        match found_group {
-            Some(group_idx) => {
-                // Add to existing group
-                if !groups[group_idx].iter().any(|t| {
-                    let id = format!("{}:{}", t.file_path, t.name);
-                    id == type1_id
-                }) {
-                    groups[group_idx].push(pair.type1.clone());
-                }
-                if !groups[group_idx].iter().any(|t| {
-                    let id = format!("{}:{}", t.file_path, t.name);
-                    id == type2_id
-                }) {
-                    groups[group_idx].push(pair.type2.clone());
-                }
-            }
-            None => {
-                // Create new group
-                groups.push(vec![pair.type1.clone(), pair.type2.clone()]);
-            }
-        }
-
-        processed.insert(type1_id);
-        processed.insert(type2_id);
-    }
-
-    // Filter out groups with only one type
-    groups.into_iter().filter(|group| group.len() > 1).collect()
-}
-
-/// Compare type literal with type definition
-pub fn compare_type_literal_with_type(
-    type_literal: &TypeLiteralDefinition,
-    type_definition: &TypeDefinition,
-    options: &TypeComparisonOptions,
-) -> TypeComparisonResult {
-    // Convert type literal to TypeDefinition for comparison
-    let temp_type_def = TypeDefinition {
-        name: type_literal.name.clone(),
-        kind: crate::type_extractor::TypeKind::TypeLiteral,
-        properties: type_literal.properties.clone(),
-        generics: Vec::new(),
-        extends: Vec::new(),
-        start_line: type_literal.start_line,
-        end_line: type_literal.end_line,
-        file_path: type_literal.file_path.clone(),
-        has_ignore_directive: false,
-    };
-
-    compare_types(&temp_type_def, type_definition, options)
-}
-
-/// Find type literals that are similar to existing type definitions
-pub fn find_similar_type_literals(
-    type_literals: &[TypeLiteralDefinition],
-    type_definitions: &[TypeDefinition],
-    threshold: f64,
-    options: &TypeComparisonOptions,
-) -> Vec<TypeLiteralComparisonPair> {
-    let mut similar_pairs = Vec::new();
-
-    for type_literal in type_literals {
-        for type_definition in type_definitions {
-            // Skip if same file and overlapping lines (avoid self-comparison)
-            if type_literal.file_path == type_definition.file_path {
-                let literal_range = type_literal.start_line..=type_literal.end_line;
-                let def_range = type_definition.start_line..=type_definition.end_line;
-
-                // Check if ranges overlap
-                if literal_range.start() <= def_range.end()
-                    && def_range.start() <= literal_range.end()
-                {
-                    continue;
-                }
-            }
-
-            let result = compare_type_literal_with_type(type_literal, type_definition, options);
-
-            if result.similarity >= threshold {
-                similar_pairs.push(TypeLiteralComparisonPair {
-                    type_literal: type_literal.clone(),
-                    type_definition: type_definition.clone(),
-                    result,
-                });
-            }
-        }
-    }
-
-    // Sort by similarity (descending)
-    similar_pairs.sort_by(|a, b| b.result.similarity.total_cmp(&a.result.similarity));
-
-    similar_pairs
-}
-
-/// Find type literals that are similar to each other
-pub fn find_similar_type_literals_pairs(
-    type_literals: &[TypeLiteralDefinition],
-    threshold: f64,
-    options: &TypeComparisonOptions,
-) -> Vec<(TypeLiteralDefinition, TypeLiteralDefinition, TypeComparisonResult)> {
-    let mut similar_pairs = Vec::new();
-
-    for i in 0..type_literals.len() {
-        for j in (i + 1)..type_literals.len() {
-            let type_literal1 = &type_literals[i];
-            let type_literal2 = &type_literals[j];
-
-            // Skip if same context (avoid comparing function return type with its parameter)
-            if type_literal1.file_path == type_literal2.file_path
-                && type_literal1.name == type_literal2.name
-            {
-                continue;
-            }
-
-            let result = compare_type_literal_with_type(
-                type_literal1,
-                &TypeDefinition {
-                    name: type_literal2.name.clone(),
-                    kind: crate::type_extractor::TypeKind::TypeLiteral,
-                    properties: type_literal2.properties.clone(),
-                    generics: Vec::new(),
-                    extends: Vec::new(),
-                    start_line: type_literal2.start_line,
-                    end_line: type_literal2.end_line,
-                    file_path: type_literal2.file_path.clone(),
-                    has_ignore_directive: false,
-                },
-                options,
-            );
-
-            if result.similarity >= threshold {
-                similar_pairs.push((type_literal1.clone(), type_literal2.clone(), result));
-            }
-        }
-    }
-
-    // Sort by similarity (descending)
-    similar_pairs.sort_by(|a, b| b.2.similarity.partial_cmp(&a.2.similarity).unwrap());
-
     similar_pairs
 }
 
@@ -864,5 +670,94 @@ export type UserID = "user";
         );
         let literal = compare_types(&click, &tap, &options);
         assert!(literal.similarity < 0.7, "got {}", literal.similarity);
+    }
+
+    fn extracted(code: &str) -> Vec<TypeDefinition> {
+        crate::type_extractor::extract_types_from_code(code, "test.ts").unwrap()
+    }
+
+    fn similarity_of(code: &str) -> f64 {
+        let types = extracted(code);
+        assert_eq!(types.len(), 2, "{types:?}");
+        compare_types(&types[0], &types[1], &TypeComparisonOptions::default()).similarity
+    }
+
+    #[test]
+    fn signature_only_interfaces_compare_by_their_signatures() {
+        // Call and construct signatures used to be dropped: all of these
+        // were empty shapes that compared on their names alone.
+        let same = similarity_of(
+            "interface Render { (content: string, head: Head): Response }
+             interface Renderer { (body: string, head: Head): Response }",
+        );
+        assert!(same > 0.95, "{same}");
+
+        // An empty interface and one with a call signature under the same
+        // name used to be a 1.0 pair.
+        let empty_and_callable = similarity_of(
+            "interface ContextRenderer {}
+             namespace Augmented { export interface ContextRenderer { (content: string): Response } }",
+        );
+        assert!(empty_and_callable < 0.5, "{empty_and_callable}");
+
+        // Calling is not constructing.
+        let call_and_construct = similarity_of(
+            "interface ErrorMap { (issue: Issue): Message }
+             interface ErrorClass { new (issue: Issue): Message }",
+        );
+        assert!(call_and_construct < 0.5, "{call_and_construct}");
+
+        let different_contracts = similarity_of(
+            "interface Get { (key: string): Value }
+             interface Set { (key: string, value: Value): void }",
+        );
+        assert!(different_contracts < 0.8, "{different_contracts}");
+    }
+
+    #[test]
+    fn overloads_are_compared_one_by_one() {
+        // Only the last of several signatures of one name used to count:
+        // these two were identical on their shared `(): string`.
+        let one_shared_overload = similarity_of(
+            "interface Transition {
+                 (strings: TemplateStringsArray, ...values: Variable[]): string
+                 (content: string): string
+                 (): string
+             }
+             interface Transition2 {
+                 (first: number, second: number): Promise<number>
+                 (list: number[]): Promise<number>
+                 (): string
+             }",
+        );
+        assert!(one_shared_overload < 0.8, "{one_shared_overload}");
+
+        let same_overloads = similarity_of(
+            "interface Emitter {
+                 on(event: \"open\", listener: () => void): void;
+                 on(event: \"close\", listener: (code: number) => void): void;
+             }
+             interface Channel {
+                 on(event: \"open\", listener: () => void): void;
+                 on(event: \"close\", listener: (code: number) => void): void;
+             }",
+        );
+        assert!(same_overloads > 0.95, "{same_overloads}");
+    }
+
+    #[test]
+    fn numerically_keyed_members_take_part() {
+        // Members with numeric keys used to be dropped, so two generated
+        // response maps compared as two empty shapes.
+        let different_payloads = similarity_of(
+            "type UserListResponses = { 200: { result: { data: Array<User> } } };
+             type UserCreateResponses = { 200: { result: { data: { name: string; id: string; createdAt: Date } } } };",
+        );
+        assert!(different_payloads < 0.8, "{different_payloads}");
+        let same_payloads = similarity_of(
+            "type UserListResponses = { 200: { result: User[] }; 404: { error: string } };
+             type OrderListResponses = { 200: { result: User[] }; 404: { error: string } };",
+        );
+        assert!(same_payloads > 0.9, "{same_payloads}");
     }
 }

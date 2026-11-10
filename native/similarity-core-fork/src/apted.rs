@@ -1,4 +1,6 @@
 use crate::tree::TreeNode;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -20,6 +22,19 @@ impl Default for APTEDOptions {
         }
     }
 }
+
+/// Largest pair of child lists — in cells of their cost matrix — that is
+/// aligned exactly.
+///
+/// The exact alignment compares every child of one node with every child
+/// of the other: time and memory grow with the product of the two list
+/// lengths. That is nothing for the lists code has (statements of a block,
+/// arguments of a call) and ruinous for the ones data has — two functions
+/// that each return a table of ten thousand entries used to take minutes
+/// and gigabytes, and brought the whole run down when the allocation
+/// failed. Above this size the lists are aligned along the children they
+/// share instead (see [`Alignment::align_wide`]).
+const EXACT_ALIGNMENT_CELLS: usize = 1 << 20;
 
 /// Sentinel value indicating the distance exceeds the cutoff budget. Picked
 /// to be unambiguous when compared against any realistic distance value,
@@ -44,8 +59,8 @@ pub const DISTANCE_EXCEEDED: f64 = f64::MAX / 4.0;
 // are also semantic changes inside the same syntactic kind, so they too
 // stay outside this allow-list and end up paying the higher within-kind
 // rename cost.
-fn is_identifier_like_kind(value: &str) -> bool {
-    matches!(value, "Identifier" | "BindingIdentifier" | "PrivateIdentifier" | "Parameter")
+fn is_identifier_like_kind(kind: &str) -> bool {
+    matches!(kind, "Identifier" | "BindingIdentifier" | "PrivateIdentifier" | "Parameter")
 }
 
 /// Built-in collection/utility member names whose identity IS the behavior
@@ -117,28 +132,28 @@ fn is_semantic_builtin_name(label: &str) -> bool {
 ///
 /// The cost reflects how much semantic change the substitution represents:
 ///   * identical label and kind → 0 (exact match)
-///   * same kind (`value`), differing label, identifier-like leaf → `rename_cost`
+///   * same kind, differing label, identifier-like leaf → `rename_cost`
 ///     (e.g. parameter or variable rename — neutral refactor), EXCEPT when
 ///     both labels are well-known builtin member names — swapping `.map`
 ///     for `.filter` is a behavioural rewrite and pays the within-kind cap
 ///   * same kind, differing label, non-identifier-like (operator, method
 ///     key, literal value, etc.) → `rename_cost * 2.0` (semantic change
 ///     within a syntactic category)
-///   * differing kind (`value`) → `rename_cost * 3.0` (subtree-shape
+///   * differing kind → `rename_cost * 3.0` (subtree-shape
 ///     change — e.g. CallExpression vs BinaryExpression). Capped so that
 ///     APTED still prefers a rename over delete+insert when the rename
 ///     would otherwise be cheaper than delete + insert.
 fn label_rename_cost(
     label1: &str,
     label2: &str,
-    value1: &str,
-    value2: &str,
+    kind1: &str,
+    kind2: &str,
     options: &APTEDOptions,
 ) -> f64 {
     let labels_match = label1 == label2;
-    let values_match = value1 == value2;
+    let kinds_match = kind1 == kind2;
 
-    if labels_match && values_match {
+    if labels_match && kinds_match {
         return 0.0;
     }
 
@@ -150,47 +165,31 @@ fn label_rename_cost(
         return options.rename_cost;
     }
 
-    if values_match {
-        if is_identifier_like_kind(value1) {
+    if kinds_match {
+        if is_identifier_like_kind(kind1) {
             if is_semantic_builtin_name(label1) && is_semantic_builtin_name(label2) {
-                within_kind_rename_cap(options)
+                rename_cap(options)
             } else {
                 options.rename_cost
             }
         } else {
-            (options.rename_cost * 2.0).min(within_kind_rename_cap(options))
+            (options.rename_cost * 2.0).min(rename_cap(options))
         }
     } else {
-        (options.rename_cost * 3.0).min(cross_kind_rename_cap(options))
+        (options.rename_cost * 3.0).min(rename_cap(options))
     }
 }
 
-/// Maximum cost we allow a within-kind rename to charge.
+/// Maximum cost a rename may charge, whatever it renames.
 ///
-/// The cap exists so APTED's optimal alignment never prefers a
-/// delete-then-insert over a straight rename when the rename would
-/// otherwise be cheaper — i.e. the cap stays strictly below
-/// `delete + insert`. A naive `delete + insert - 0.01` offset would
-/// collapse to zero for callers that configure very small per-op costs
-/// (e.g. `delete = insert = 0.005`), and a zero cap would make many
-/// non-identifier substitutions effectively free — distance would
-/// collapse and similarity would inflate well above the intended
-/// values. Use a multiplicative epsilon instead so the cap scales with
-/// the configured cost and stays positive as long as the sum is
-/// positive.
-fn within_kind_rename_cap(options: &APTEDOptions) -> f64 {
-    cap_below_delete_plus_insert(options)
-}
-
-/// Same idea for cross-kind substitutions. Kept as a separate function
-/// so the intent reads clearly at the call sites.
-fn cross_kind_rename_cap(options: &APTEDOptions) -> f64 {
-    cap_below_delete_plus_insert(options)
-}
-
-fn cap_below_delete_plus_insert(options: &APTEDOptions) -> f64 {
-    let sum = options.delete_cost + options.insert_cost;
-    (sum * 0.99).max(0.0)
+/// The cap keeps the optimal alignment from ever preferring a
+/// delete-then-insert over a straight rename: it stays strictly below
+/// `delete + insert`. A fixed offset (`delete + insert - 0.01`) would
+/// collapse to zero for callers that configure very small per-operation
+/// costs, and a zero cap would make substitutions free, so the cap scales
+/// with the configured costs instead.
+fn rename_cap(options: &APTEDOptions) -> f64 {
+    ((options.delete_cost + options.insert_cost) * 0.99).max(0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -198,63 +197,34 @@ fn cap_below_delete_plus_insert(options: &APTEDOptions) -> f64 {
 // ---------------------------------------------------------------------------
 //
 // The recursive `Rc<TreeNode>` shape is convenient to build but slow to
-// compare: the edit-distance DP visits O(n1·n2) node pairs and previously
-// keyed its memo table by `(node.id, node.id)` in a `HashMap`, paying a
-// hash + probe on every visit, plus a fresh child-cost `HashMap` per
-// internal pair. Flattening each tree once per comparison into dense
-// arrays lets the DP address everything by small integer index: the memo
-// becomes a flat `Vec<f64>` and child costs a positional matrix. The
-// flatten pass is O(n) and trivially amortized by the O(n1·n2) DP.
+// compare. Each tree is flattened once per comparison into parallel arrays
+// in pre-order, where a subtree is a contiguous run: the first child of
+// node `i` is `i + 1`, and the sibling after a node `c` is `c + size(c)`.
+// No child lists are stored at all.
 
 struct FlatTree<'a> {
     labels: Vec<&'a str>,
-    values: Vec<&'a str>,
+    kinds: Vec<&'static str>,
+    /// Number of nodes in the subtree rooted at each node.
     sizes: Vec<u32>,
-    /// Children of node `i` are `child_data[child_start[i]..child_start[i+1]]`.
-    child_start: Vec<u32>,
-    child_data: Vec<u32>,
 }
 
 impl<'a> FlatTree<'a> {
     fn build(root: &'a Rc<TreeNode>) -> FlatTree<'a> {
-        let node_count = root.get_subtree_size();
+        let node_count = root.subtree_size();
         let mut tree = FlatTree {
             labels: Vec::with_capacity(node_count),
-            values: Vec::with_capacity(node_count),
+            kinds: Vec::with_capacity(node_count),
             sizes: Vec::with_capacity(node_count),
-            child_start: Vec::with_capacity(node_count + 1),
-            child_data: Vec::with_capacity(node_count.saturating_sub(1)),
         };
-        // First pass assigns indices in pre-order; child index data is
-        // appended in a second pass over the same order so the offsets
-        // stay contiguous per parent.
-        let mut order: Vec<&'a Rc<TreeNode>> = Vec::with_capacity(node_count);
-        let mut stack: Vec<&'a Rc<TreeNode>> = vec![root];
-        let mut index_of = std::collections::HashMap::with_capacity(node_count);
+        let mut stack: Vec<&'a TreeNode> = vec![root];
         while let Some(node) = stack.pop() {
-            index_of.insert(std::ptr::from_ref::<TreeNode>(node.as_ref()) as usize, order.len());
-            order.push(node);
-            for child in node.children.iter().rev() {
-                stack.push(child);
-            }
-        }
-        for node in &order {
             tree.labels.push(node.label.as_str());
-            tree.values.push(node.value.as_str());
+            tree.kinds.push(node.kind);
             #[allow(clippy::cast_possible_truncation)]
-            tree.sizes.push(node.get_subtree_size() as u32);
+            tree.sizes.push(node.subtree_size() as u32);
+            stack.extend(node.children.iter().rev().map(Rc::as_ref));
         }
-        for node in &order {
-            #[allow(clippy::cast_possible_truncation)]
-            tree.child_start.push(tree.child_data.len() as u32);
-            for child in &node.children {
-                let key = std::ptr::from_ref::<TreeNode>(child.as_ref()) as usize;
-                #[allow(clippy::cast_possible_truncation)]
-                tree.child_data.push(index_of[&key] as u32);
-            }
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        tree.child_start.push(tree.child_data.len() as u32);
         tree
     }
 
@@ -262,133 +232,369 @@ impl<'a> FlatTree<'a> {
         self.labels.len()
     }
 
-    fn children(&self, index: usize) -> &[u32] {
-        let start = self.child_start[index] as usize;
-        let end = self.child_start[index + 1] as usize;
-        &self.child_data[start..end]
-    }
-
     fn size(&self, index: usize) -> f64 {
         f64::from(self.sizes[index])
     }
-}
 
-/// Exact pairwise distance between subtree `i` of `tree1` and subtree `j`
-/// of `tree2`. The distance is the cheaper of:
-///   * replacing the whole subtree (delete every node of `i`, insert
-///     every node of `j`), or
-///   * renaming the root pair and optimally aligning the children.
-///
-/// The replace branch must charge `delete + insert`, not
-/// `min(delete, insert)`: an earlier version used the min, which let a
-/// large subtree "become" a completely different one at the cost of
-/// only the smaller side. That both inflated similarity between
-/// structurally unrelated size-mismatched trees and violated the
-/// `distance ≥ |size1 − size2| · min_op_cost` lower bound the
-/// threshold pruning in `tsed.rs`/`function_extractor.rs` relies on.
-///
-/// `memo` is indexed `i * tree2.len() + j`; NaN means "not computed yet".
-fn subtree_distance(
-    tree1: &FlatTree,
-    tree2: &FlatTree,
-    options: &APTEDOptions,
-    memo: &mut [f64],
-    i: usize,
-    j: usize,
-) -> f64 {
-    let key = i * tree2.len() + j;
-    let cached = memo[key];
-    if !cached.is_nan() {
-        return cached;
+    fn is_leaf(&self, index: usize) -> bool {
+        self.sizes[index] == 1
     }
 
-    let children1 = tree1.children(i);
-    let children2 = tree2.children(j);
+    /// Append the indices of `index`'s children to `out`, in order.
+    fn push_children(&self, index: usize, out: &mut Vec<u32>) {
+        let end = index + self.sizes[index] as usize;
+        let mut child = index + 1;
+        while child < end {
+            #[allow(clippy::cast_possible_truncation)]
+            out.push(child as u32);
+            child += self.sizes[child] as usize;
+        }
+    }
 
-    let rename_cost = label_rename_cost(
-        tree1.labels[i],
-        tree2.labels[j],
-        tree1.values[i],
-        tree2.values[j],
-        options,
-    );
+    /// A hash of every subtree: equal for subtrees with the same labels,
+    /// kinds and shape.
+    fn subtree_hashes(&self) -> Vec<u64> {
+        let mut hashes = vec![0u64; self.len()];
+        // Children come after their parent in pre-order, so walking
+        // backwards meets every child before its parent.
+        for index in (0..self.len()).rev() {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.labels[index].hash(&mut hasher);
+            self.kinds[index].hash(&mut hasher);
+            let end = index + self.sizes[index] as usize;
+            let mut child = index + 1;
+            while child < end {
+                hashes[child].hash(&mut hasher);
+                child += self.sizes[child] as usize;
+            }
+            hashes[index] = hasher.finish();
+        }
+        hashes
+    }
+}
 
-    let cost = if children1.is_empty() && children2.is_empty() {
-        rename_cost
-    } else {
-        let replace_cost =
-            options.delete_cost * tree1.size(i) + options.insert_cost * tree2.size(j);
-        let rename_plus_cost = rename_cost + children_alignment(tree1, tree2, options, memo, i, j);
+/// One edit-distance computation between two flattened trees.
+///
+/// Every pair of nodes is visited at most once — a pair is only ever
+/// reached through the pair of its parents — so nothing is memoized. (A
+/// dense `n1 × n2` memo table used to be allocated and filled per
+/// comparison; nothing ever read an entry back, and for two large
+/// functions the table alone ran to gigabytes.) The child-cost matrices
+/// and alignment rows live on two scratch stacks that are reused across
+/// the whole recursion, so a comparison allocates a handful of times, not
+/// once per node pair.
+struct Alignment<'t, 'a> {
+    tree1: &'t FlatTree<'a>,
+    tree2: &'t FlatTree<'a>,
+    options: &'t APTEDOptions,
+    /// Stack of child-cost matrices and alignment rows.
+    costs: Vec<f64>,
+    /// Stack of child index lists.
+    children: Vec<u32>,
+    /// Subtree hashes of both trees, computed when the first pair of
+    /// child lists too long to align exactly is met.
+    subtree_hashes: Option<(Vec<u64>, Vec<u64>)>,
+    /// Largest cost matrix aligned exactly, in cells.
+    exact_cells: usize,
+}
+
+/// A run of one node's children on the child stack: `start..end`.
+type ChildRange = (usize, usize);
+
+impl<'t, 'a> Alignment<'t, 'a> {
+    fn new(tree1: &'t FlatTree<'a>, tree2: &'t FlatTree<'a>, options: &'t APTEDOptions) -> Self {
+        Self {
+            tree1,
+            tree2,
+            options,
+            costs: Vec::new(),
+            children: Vec::new(),
+            subtree_hashes: None,
+            exact_cells: EXACT_ALIGNMENT_CELLS,
+        }
+    }
+
+    /// Exact distance between subtree `i` of `tree1` and subtree `j` of
+    /// `tree2`: the cheaper of
+    ///   * replacing the whole subtree (delete every node of `i`, insert
+    ///     every node of `j`), or
+    ///   * renaming the root pair and optimally aligning the children.
+    ///
+    /// The replace branch must charge `delete + insert`, not
+    /// `min(delete, insert)`: an earlier version used the min, which let a
+    /// large subtree "become" a completely different one at the cost of
+    /// only the smaller side. That both inflated similarity between
+    /// structurally unrelated size-mismatched trees and violated the
+    /// `distance ≥ |size1 − size2| · min_op_cost` lower bound the
+    /// threshold pruning in `tsed.rs`/`function_extractor.rs` relies on.
+    fn distance(&mut self, i: usize, j: usize) -> f64 {
+        let rename_cost = label_rename_cost(
+            self.tree1.labels[i],
+            self.tree2.labels[j],
+            self.tree1.kinds[i],
+            self.tree2.kinds[j],
+            self.options,
+        );
+        if self.tree1.is_leaf(i) && self.tree2.is_leaf(j) {
+            return rename_cost;
+        }
+        let replace_cost = self.options.delete_cost * self.tree1.size(i)
+            + self.options.insert_cost * self.tree2.size(j);
+        let rename_plus_cost = rename_cost + self.align_children(i, j);
         replace_cost.min(rename_plus_cost)
-    };
+    }
 
-    memo[key] = cost;
-    cost
+    /// Sequence alignment over the child lists of `tree1[i]` / `tree2[j]`:
+    /// the minimum cost to turn one list into the other, where skipping a
+    /// child costs deleting/inserting its whole subtree and matching a
+    /// pair costs their recursive distance.
+    fn align_children(&mut self, i: usize, j: usize) -> f64 {
+        let children_base = self.children.len();
+        self.tree1.push_children(i, &mut self.children);
+        let left = (children_base, self.children.len());
+        self.tree2.push_children(j, &mut self.children);
+        let right = (left.1, self.children.len());
+
+        let cost = if (left.1 - left.0).saturating_mul(right.1 - right.0) > self.exact_cells {
+            self.align_wide(left, right)
+        } else {
+            self.align(left, right)
+        };
+        self.children.truncate(children_base);
+        cost
+    }
+
+    /// Cost of deleting the left children in `range`.
+    fn delete_cost_of(&self, range: ChildRange) -> f64 {
+        self.children[range.0..range.1]
+            .iter()
+            .map(|&child| self.options.delete_cost * self.tree1.size(child as usize))
+            .sum()
+    }
+
+    /// Cost of inserting the right children in `range`.
+    fn insert_cost_of(&self, range: ChildRange) -> f64 {
+        self.children[range.0..range.1]
+            .iter()
+            .map(|&child| self.options.insert_cost * self.tree2.size(child as usize))
+            .sum()
+    }
+
+    /// The exact alignment of the left children in `left` with the right
+    /// children in `right`.
+    fn align(&mut self, left: ChildRange, right: ChildRange) -> f64 {
+        let (m, n) = (left.1 - left.0, right.1 - right.0);
+        if m == 0 {
+            return self.insert_cost_of(right);
+        }
+        if n == 0 {
+            return self.delete_cost_of(left);
+        }
+
+        // This call's slice of the cost stack: an `m × n` matrix of child
+        // pair distances, then one alignment row of `n + 1` cells. The
+        // recursion below pushes and pops above it, so it is addressed by
+        // index, never held as a slice.
+        let pair_base = self.costs.len();
+        let row_base = pair_base + m * n;
+        self.costs.resize(row_base + n + 1, 0.0);
+
+        for a in 0..m {
+            for b in 0..n {
+                let child1 = self.children[left.0 + a] as usize;
+                let child2 = self.children[right.0 + b] as usize;
+                let cost = self.distance(child1, child2);
+                self.costs[pair_base + a * n + b] = cost;
+            }
+        }
+
+        let (delete_unit, insert_unit) = (self.options.delete_cost, self.options.insert_cost);
+        let delete_cost_of = |this: &Self, a: usize| {
+            delete_unit * this.tree1.size(this.children[left.0 + a] as usize)
+        };
+        let insert_cost_of = |this: &Self, b: usize| {
+            insert_unit * this.tree2.size(this.children[right.0 + b] as usize)
+        };
+
+        // Single-row DP: `row[b]` holds the cost of aligning the first `a`
+        // left children with the first `b` right children while `a` sweeps
+        // upward.
+        self.costs[row_base] = 0.0;
+        for b in 1..=n {
+            self.costs[row_base + b] = self.costs[row_base + b - 1] + insert_cost_of(self, b - 1);
+        }
+        for a in 1..=m {
+            let delete_cost = delete_cost_of(self, a - 1);
+            let mut diagonal = self.costs[row_base];
+            self.costs[row_base] += delete_cost;
+            for b in 1..=n {
+                let insert_cost = insert_cost_of(self, b - 1);
+                let match_cost = diagonal + self.costs[pair_base + (a - 1) * n + (b - 1)];
+                diagonal = self.costs[row_base + b];
+                self.costs[row_base + b] = (self.costs[row_base + b] + delete_cost)
+                    .min(self.costs[row_base + b - 1] + insert_cost)
+                    .min(match_cost);
+            }
+        }
+
+        let cost = self.costs[row_base + n];
+        self.costs.truncate(pair_base);
+        cost
+    }
+
+    /// Alignment of two child lists too long to align exactly (see
+    /// [`EXACT_ALIGNMENT_CELLS`]): the cost of one valid alignment, found
+    /// along the children both lists share.
+    ///
+    /// Equal subtrees cost nothing to match, so equal children at the
+    /// start and at the end of the two lists are matched outright, and so
+    /// are the children that occur exactly once in each list, in the
+    /// longest order both lists agree on. What lies between two such
+    /// anchors is aligned the same way; a stretch small enough is aligned
+    /// exactly, and one that is still too long and shares nothing is cut
+    /// into pieces that are.
+    ///
+    /// For lists that are mostly the same — the only ones a long list can
+    /// be similar to — this finds the alignment the exact computation
+    /// would, at a cost that grows with the lists instead of with their
+    /// product. For others the result may exceed the exact distance; it
+    /// never falls below it.
+    fn align_wide(&mut self, left: ChildRange, right: ChildRange) -> f64 {
+        if self.subtree_hashes.is_none() {
+            self.subtree_hashes = Some((self.tree1.subtree_hashes(), self.tree2.subtree_hashes()));
+        }
+
+        let mut cost = 0.0;
+        let mut pending: Vec<(ChildRange, ChildRange)> = vec![(left, right)];
+        while let Some((left, right)) = pending.pop() {
+            let (left, right) = self.trim_shared_ends(left, right);
+            let (m, n) = (left.1 - left.0, right.1 - right.0);
+            if m.saturating_mul(n) <= self.exact_cells {
+                cost += self.align(left, right);
+                continue;
+            }
+            let anchors = self.unique_anchors(left, right);
+            if anchors.is_empty() {
+                cost += self.align_in_pieces(left, right);
+                continue;
+            }
+            // The stretches before, between and after the anchors.
+            let (mut left_start, mut right_start) = (left.0, right.0);
+            for (left_anchor, right_anchor) in anchors {
+                pending.push(((left_start, left_anchor), (right_start, right_anchor)));
+                left_start = left_anchor + 1;
+                right_start = right_anchor + 1;
+            }
+            pending.push(((left_start, left.1), (right_start, right.1)));
+        }
+        cost
+    }
+
+    /// The subtree hash of the left child at `position` of the child stack.
+    fn left_hash(&self, position: usize) -> u64 {
+        let (hashes, _) = self.subtree_hashes.as_ref().expect("hashes are computed first");
+        hashes[self.children[position] as usize]
+    }
+
+    /// The subtree hash of the right child at `position` of the child
+    /// stack.
+    fn right_hash(&self, position: usize) -> u64 {
+        let (_, hashes) = self.subtree_hashes.as_ref().expect("hashes are computed first");
+        hashes[self.children[position] as usize]
+    }
+
+    /// `left` and `right` without the equal children they start and end
+    /// with.
+    fn trim_shared_ends(
+        &self,
+        mut left: ChildRange,
+        mut right: ChildRange,
+    ) -> (ChildRange, ChildRange) {
+        while left.0 < left.1
+            && right.0 < right.1
+            && self.left_hash(left.0) == self.right_hash(right.0)
+        {
+            left.0 += 1;
+            right.0 += 1;
+        }
+        while left.0 < left.1
+            && right.0 < right.1
+            && self.left_hash(left.1 - 1) == self.right_hash(right.1 - 1)
+        {
+            left.1 -= 1;
+            right.1 -= 1;
+        }
+        (left, right)
+    }
+
+    /// The children that occur exactly once in `left` and exactly once in
+    /// `right`, as `(left position, right position)` pairs: the longest
+    /// selection that is in order in both lists.
+    fn unique_anchors(&self, left: ChildRange, right: ChildRange) -> Vec<(usize, usize)> {
+        // Hash → (occurrences in `left`, position there, occurrences in
+        // `right`, position there).
+        let mut occurrences: HashMap<u64, (u32, usize, u32, usize)> = HashMap::new();
+        for position in left.0..left.1 {
+            let entry = occurrences.entry(self.left_hash(position)).or_insert((0, 0, 0, 0));
+            entry.0 += 1;
+            entry.1 = position;
+        }
+        for position in right.0..right.1 {
+            if let Some(entry) = occurrences.get_mut(&self.right_hash(position)) {
+                entry.2 += 1;
+                entry.3 = position;
+            }
+        }
+        let mut shared: Vec<(usize, usize)> = occurrences
+            .into_values()
+            .filter(|&(in_left, _, in_right, _)| in_left == 1 && in_right == 1)
+            .map(|(_, left_position, _, right_position)| (left_position, right_position))
+            .collect();
+        shared.sort_unstable();
+        longest_increasing_by_second(&shared)
+    }
+
+    /// Alignment of two long lists that share no anchor: both are cut into
+    /// the same number of pieces, small enough to align exactly, and the
+    /// pieces are aligned in order.
+    fn align_in_pieces(&mut self, left: ChildRange, right: ChildRange) -> f64 {
+        let (m, n) = (left.1 - left.0, right.1 - right.0);
+        let mut pieces = 2usize;
+        while m.div_ceil(pieces).saturating_mul(n.div_ceil(pieces)) > self.exact_cells.max(1) {
+            pieces += 1;
+        }
+        let piece = |range: ChildRange, length: usize, index: usize| -> ChildRange {
+            (range.0 + length * index / pieces, range.0 + length * (index + 1) / pieces)
+        };
+        (0..pieces).map(|index| self.align(piece(left, m, index), piece(right, n, index))).sum()
+    }
 }
 
-/// Sequence-alignment DP over the child lists of `tree1[i]` / `tree2[j]`.
-/// `dp[a][b]` = minimum cost to align the first `a` children of node1 with
-/// the first `b` children of node2, where skipping a child costs
-/// deleting/inserting its whole subtree and matching a pair costs their
-/// recursive distance.
-fn children_alignment(
-    tree1: &FlatTree,
-    tree2: &FlatTree,
-    options: &APTEDOptions,
-    memo: &mut [f64],
-    i: usize,
-    j: usize,
-) -> f64 {
-    let m = tree1.children(i).len();
-    let n = tree2.children(j).len();
-    if m == 0 {
-        return tree2
-            .children(j)
-            .iter()
-            .map(|&c| options.insert_cost * tree2.size(c as usize))
-            .sum();
-    }
-    if n == 0 {
-        return tree1
-            .children(i)
-            .iter()
-            .map(|&c| options.delete_cost * tree1.size(c as usize))
-            .sum();
-    }
-
-    // Recursive child distances are computed up front so the DP loop
-    // below is pure arithmetic over the memo-backed matrix. Child index
-    // slices are re-fetched by position to keep the borrows disjoint from
-    // the `&mut memo` recursion.
-    let mut pair_cost = vec![0.0f64; m * n];
-    for a in 0..m {
-        for b in 0..n {
-            let c1 = tree1.children(i)[a] as usize;
-            let c2 = tree2.children(j)[b] as usize;
-            pair_cost[a * n + b] = subtree_distance(tree1, tree2, options, memo, c1, c2);
+/// The longest run of `pairs` — sorted by their first component — whose
+/// second components increase.
+fn longest_increasing_by_second(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    // Patience sorting: `tails[k]` is the pair that ends the best run of
+    // length `k + 1` found so far, `previous[i]` the pair before `pairs[i]`
+    // in its run.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut previous: Vec<Option<usize>> = vec![None; pairs.len()];
+    for (index, &(_, second)) in pairs.iter().enumerate() {
+        let length = tails.partition_point(|&tail| pairs[tail].1 < second);
+        previous[index] = length.checked_sub(1).map(|shorter| tails[shorter]);
+        if length == tails.len() {
+            tails.push(index);
+        } else {
+            tails[length] = index;
         }
     }
-
-    let children1 = tree1.children(i);
-    let children2 = tree2.children(j);
-
-    // Single-row DP: row[b] holds dp[a][b] while sweeping a upward.
-    let mut row = vec![0.0f64; n + 1];
-    for b in 1..=n {
-        row[b] = row[b - 1] + options.insert_cost * tree2.size(children2[b - 1] as usize);
+    let mut run = Vec::with_capacity(tails.len());
+    let mut current = tails.last().copied();
+    while let Some(index) = current {
+        run.push(pairs[index]);
+        current = previous[index];
     }
-    for a in 1..=m {
-        let delete_cost = options.delete_cost * tree1.size(children1[a - 1] as usize);
-        let mut diagonal = row[0];
-        row[0] += delete_cost;
-        for b in 1..=n {
-            let insert_cost = options.insert_cost * tree2.size(children2[b - 1] as usize);
-            let match_cost = diagonal + pair_cost[(a - 1) * n + (b - 1)];
-            diagonal = row[b];
-            row[b] = (row[b] + delete_cost).min(row[b - 1] + insert_cost).min(match_cost);
-        }
-    }
-    row[n]
+    run.reverse();
+    run
 }
 
 #[must_use]
@@ -399,13 +605,12 @@ pub fn compute_edit_distance(
 ) -> f64 {
     let flat1 = FlatTree::build(tree1);
     let flat2 = FlatTree::build(tree2);
-    let mut memo = vec![f64::NAN; flat1.len() * flat2.len()];
-    subtree_distance(&flat1, &flat2, options, &mut memo, 0, 0)
+    Alignment::new(&flat1, &flat2, options).distance(0, 0)
 }
 
-/// Compute the edit distance, aborting as soon as a partial result proves
+/// Compute the edit distance, giving up as soon as a lower bound proves
 /// it cannot stay within `max_distance`. Callers should treat any return
-/// value `>= DISTANCE_EXCEEDED` as "the distance is at least
+/// value `>= DISTANCE_EXCEEDED` as "the distance is more than
 /// `max_distance`, exact value unknown".
 ///
 /// The cutoff is a pure performance hint — when the budget is generous
@@ -424,8 +629,8 @@ pub fn compute_edit_distance_with_cutoff(
 
     // Sound global lower bound: every edit script has to bridge the size
     // gap one delete or insert at a time. (This holds because the replace
-    // branch in `distance` charges delete + insert — see the comment
-    // there.)
+    // branch in `Alignment::distance` charges delete + insert — see the
+    // comment there.)
     let min_op_cost = options.delete_cost.min(options.insert_cost);
     let size_gap = (flat1.size(0) - flat2.size(0)).abs();
     if size_gap * min_op_cost > max_distance {
@@ -439,17 +644,17 @@ pub fn compute_edit_distance_with_cutoff(
     // costs at least the cheapest operation. This is O(n1 + n2) and
     // prunes the "similar size, unrelated content" pairs that the pure
     // size-gap bound cannot touch — the case where skipping the full
-    // O(n1·n2) DP actually matters.
+    // alignment actually matters.
     let cheapest_edit = options.delete_cost.min(options.insert_cost).min(options.rename_cost);
     if cheapest_edit > 0.0 {
         let mut labels: std::collections::HashMap<(&str, &str), i64> =
             std::collections::HashMap::with_capacity(flat1.len());
         for index in 0..flat1.len() {
-            *labels.entry((flat1.labels[index], flat1.values[index])).or_insert(0) += 1;
+            *labels.entry((flat1.labels[index], flat1.kinds[index])).or_insert(0) += 1;
         }
         let mut overlap = 0usize;
         for index in 0..flat2.len() {
-            if let Some(count) = labels.get_mut(&(flat2.labels[index], flat2.values[index])) {
+            if let Some(count) = labels.get_mut(&(flat2.labels[index], flat2.kinds[index])) {
                 if *count > 0 {
                     *count -= 1;
                     overlap += 1;
@@ -463,8 +668,7 @@ pub fn compute_edit_distance_with_cutoff(
         }
     }
 
-    let mut memo = vec![f64::NAN; flat1.len() * flat2.len()];
-    let distance = subtree_distance(&flat1, &flat2, options, &mut memo, 0, 0);
+    let distance = Alignment::new(&flat1, &flat2, options).distance(0, 0);
     if distance > max_distance {
         DISTANCE_EXCEEDED
     } else {
@@ -476,12 +680,12 @@ pub fn compute_edit_distance_with_cutoff(
 mod tests {
     use super::*;
 
-    fn leaf(label: &str, kind: &str, id: usize) -> Rc<TreeNode> {
-        Rc::new(TreeNode::new(label.to_string(), kind.to_string(), id))
+    fn leaf(label: &str, kind: &'static str) -> Rc<TreeNode> {
+        Rc::new(TreeNode::new(label, kind))
     }
 
-    fn node(label: &str, kind: &str, id: usize, children: Vec<Rc<TreeNode>>) -> Rc<TreeNode> {
-        let mut inner = TreeNode::new(label.to_string(), kind.to_string(), id);
+    fn node(label: &str, kind: &'static str, children: Vec<Rc<TreeNode>>) -> Rc<TreeNode> {
+        let mut inner = TreeNode::new(label, kind);
         for child in children {
             inner.add_child(child);
         }
@@ -494,8 +698,8 @@ mod tests {
 
     #[test]
     fn identical_trees_have_zero_distance() {
-        let t1 = node("A", "K", 0, vec![leaf("x", "Identifier", 1), leaf("y", "Identifier", 2)]);
-        let t2 = node("A", "K", 0, vec![leaf("x", "Identifier", 1), leaf("y", "Identifier", 2)]);
+        let t1 = node("A", "K", vec![leaf("x", "Identifier"), leaf("y", "Identifier")]);
+        let t2 = node("A", "K", vec![leaf("x", "Identifier"), leaf("y", "Identifier")]);
         assert_eq!(compute_edit_distance(&t1, &t2, &unit_options()), 0.0);
     }
 
@@ -504,8 +708,8 @@ mod tests {
         // A single leaf vs a 3-node subtree with nothing in common: the
         // distance must cover deleting one node and inserting three (or
         // renaming + inserting two), never the old min(delete, insert).
-        let t1 = leaf("a", "Identifier", 0);
-        let t2 = node("B", "K", 0, vec![leaf("c", "Identifier", 1), leaf("d", "Identifier", 2)]);
+        let t1 = leaf("a", "Identifier");
+        let t2 = node("B", "K", vec![leaf("c", "Identifier"), leaf("d", "Identifier")]);
         let distance = compute_edit_distance(&t1, &t2, &unit_options());
         // rename a→B is cross-kind (cost min(3, 1.98)) + insert 2 children = 3.98,
         // replace = 1 + 3 = 4. The rename path is cheaper.
@@ -516,13 +720,9 @@ mod tests {
     fn distance_respects_size_gap_lower_bound() {
         // Unrelated subtrees where one side is much larger: distance must
         // be at least the size gap.
-        let big = node(
-            "Root",
-            "K",
-            0,
-            (1..=10).map(|i| leaf(&format!("n{i}"), "Identifier", i)).collect(),
-        );
-        let small = node("Root", "K", 0, vec![leaf("n1", "Identifier", 1)]);
+        let big =
+            node("Root", "K", (1..=10).map(|i| leaf(&format!("n{i}"), "Identifier")).collect());
+        let small = node("Root", "K", vec![leaf("n1", "Identifier")]);
         let distance = compute_edit_distance(&big, &small, &unit_options());
         assert!(distance >= 9.0, "distance {distance} must cover the 9-node gap");
     }
@@ -532,22 +732,12 @@ mod tests {
         let t1 = node(
             "F",
             "K",
-            0,
-            vec![
-                leaf("a", "Identifier", 1),
-                leaf("b", "Identifier", 2),
-                leaf("c", "Identifier", 3),
-            ],
+            vec![leaf("a", "Identifier"), leaf("b", "Identifier"), leaf("c", "Identifier")],
         );
         let t2 = node(
             "F",
             "K",
-            0,
-            vec![
-                leaf("a", "Identifier", 1),
-                leaf("x", "Identifier", 2),
-                leaf("c", "Identifier", 3),
-            ],
+            vec![leaf("a", "Identifier"), leaf("x", "Identifier"), leaf("c", "Identifier")],
         );
         let options = unit_options();
         let exact = compute_edit_distance(&t1, &t2, &options);
@@ -557,9 +747,8 @@ mod tests {
 
     #[test]
     fn cutoff_flags_pairs_beyond_budget() {
-        let t1 =
-            node("F", "K", 0, (1..=12).map(|i| leaf(&format!("a{i}"), "Identifier", i)).collect());
-        let t2 = node("G", "K", 0, vec![leaf("z", "Identifier", 1)]);
+        let t1 = node("F", "K", (1..=12).map(|i| leaf(&format!("a{i}"), "Identifier")).collect());
+        let t2 = node("G", "K", vec![leaf("z", "Identifier")]);
         let distance = compute_edit_distance_with_cutoff(&t1, &t2, &unit_options(), 1.0);
         assert!(distance >= DISTANCE_EXCEEDED);
     }
@@ -568,10 +757,8 @@ mod tests {
     fn cutoff_prunes_same_size_unrelated_trees() {
         // Equal sizes defeat the size-gap bound; the label-histogram bound
         // must still flag the pair without running the full DP.
-        let t1 =
-            node("F", "K", 0, (1..=12).map(|i| leaf(&format!("a{i}"), "Identifier", i)).collect());
-        let t2 =
-            node("F", "K", 0, (1..=12).map(|i| leaf(&format!("z{i}"), "Identifier", i)).collect());
+        let t1 = node("F", "K", (1..=12).map(|i| leaf(&format!("a{i}"), "Identifier")).collect());
+        let t2 = node("F", "K", (1..=12).map(|i| leaf(&format!("z{i}"), "Identifier")).collect());
         let options = APTEDOptions { rename_cost: 0.3, compare_values: false, ..unit_options() };
         let distance = compute_edit_distance_with_cutoff(&t1, &t2, &options, 1.0);
         assert!(distance >= DISTANCE_EXCEEDED);
@@ -580,13 +767,174 @@ mod tests {
     #[test]
     fn builtin_method_swap_costs_more_than_identifier_rename() {
         let options = APTEDOptions { rename_cost: 0.3, compare_values: false, ..unit_options() };
-        let map1 = leaf("map", "Identifier", 0);
-        let filter = leaf("filter", "Identifier", 0);
-        let local1 = leaf("total", "Identifier", 0);
-        let local2 = leaf("sum", "Identifier", 0);
+        let map1 = leaf("map", "Identifier");
+        let filter = leaf("filter", "Identifier");
+        let local1 = leaf("total", "Identifier");
+        let local2 = leaf("sum", "Identifier");
         let builtin_swap = compute_edit_distance(&map1, &filter, &options);
         let plain_rename = compute_edit_distance(&local1, &local2, &options);
         assert!(builtin_swap > plain_rename);
         assert!((plain_rename - 0.3).abs() < 1e-12);
+    }
+
+    /// The distance with child lists aligned exactly up to `exact_cells`
+    /// cells.
+    fn distance_with_limit(t1: &Rc<TreeNode>, t2: &Rc<TreeNode>, exact_cells: usize) -> f64 {
+        let options = APTEDOptions { rename_cost: 0.3, compare_values: false, ..unit_options() };
+        let (flat1, flat2) = (FlatTree::build(t1), FlatTree::build(t2));
+        let mut alignment = Alignment::new(&flat1, &flat2, &options);
+        alignment.exact_cells = exact_cells;
+        alignment.distance(0, 0)
+    }
+
+    /// `log(<name>, <number>);`-like statement.
+    fn statement(name: &str, number: usize) -> Rc<TreeNode> {
+        node(
+            "ExpressionStatement",
+            "ExpressionStatement",
+            vec![node(
+                "CallExpression",
+                "CallExpression",
+                vec![
+                    leaf("log", "Identifier"),
+                    leaf(name, "Identifier"),
+                    leaf(&number.to_string(), "NumericLiteral"),
+                ],
+            )],
+        )
+    }
+
+    fn block(statements: Vec<Rc<TreeNode>>) -> Rc<TreeNode> {
+        node("BlockStatement", "BlockStatement", statements)
+    }
+
+    /// Deterministic pseudo-random numbers.
+    fn random_numbers(seed: u64) -> impl FnMut(usize) -> usize {
+        let mut state = seed;
+        move |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % bound
+        }
+    }
+
+    #[test]
+    fn increasing_runs_are_found() {
+        let run = |seconds: &[usize]| -> Vec<usize> {
+            let pairs: Vec<(usize, usize)> = seconds.iter().copied().enumerate().collect();
+            longest_increasing_by_second(&pairs).into_iter().map(|(_, second)| second).collect()
+        };
+        assert_eq!(run(&[]), Vec::<usize>::new());
+        assert_eq!(run(&[5]), [5]);
+        assert_eq!(run(&[1, 2, 3, 4]), [1, 2, 3, 4]);
+        assert_eq!(run(&[4, 3, 2, 1]).len(), 1);
+        assert_eq!(run(&[2, 9, 3, 4, 1, 5]), [2, 3, 4, 5]);
+        assert_eq!(run(&[10, 0, 11, 1, 12, 2, 3]), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn long_lists_that_are_mostly_the_same_align_as_the_exact_computation_does() {
+        // 60 distinct statements; each variant applies a few edits. With
+        // the limit at 16 cells every list here is "too long".
+        let base: Vec<Rc<TreeNode>> = (0..60).map(|i| statement(&format!("v{i}"), i)).collect();
+        let mut variants: Vec<Vec<Rc<TreeNode>>> = Vec::new();
+        // One statement changed, inserted or removed, at the start, in
+        // the middle and at the end.
+        for position in [0, 1, 29, 30, 58, 59] {
+            let mut changed = base.clone();
+            changed[position] = statement("other", 1000 + position);
+            variants.push(changed);
+            let mut inserted = base.clone();
+            inserted.insert(position, statement("extra", 2000 + position));
+            variants.push(inserted);
+            let mut removed = base.clone();
+            removed.remove(position);
+            variants.push(removed);
+        }
+        // Several edits spread over the list.
+        let mut scattered = base.clone();
+        scattered[5] = statement("a", 3001);
+        scattered.remove(20);
+        scattered.insert(40, statement("b", 3002));
+        scattered[55] = statement("c", 3003);
+        variants.push(scattered);
+
+        let left = block(base.clone());
+        assert_eq!(distance_with_limit(&left, &block(base.clone()), 16), 0.0);
+
+        // A moved block is where the two part ways: the statements that
+        // stayed anchor the alignment, so the block is deleted and
+        // inserted, while the exact computation shifts every statement in
+        // between onto its neighbour at the price of renames.
+        let mut moved = base;
+        let chunk: Vec<Rc<TreeNode>> = moved.drain(10..15).collect();
+        moved.splice(35..35, chunk);
+        let right = block(moved);
+        let exact = distance_with_limit(&left, &right, usize::MAX);
+        let wide = distance_with_limit(&left, &right, 16);
+        assert!(exact < wide, "exact {exact}, wide {wide}");
+        // Five statements of five nodes, deleted and inserted.
+        assert!((wide - 50.0).abs() < 1e-9, "{wide}");
+
+        for (index, variant) in variants.into_iter().enumerate() {
+            let right = block(variant);
+            let exact = distance_with_limit(&left, &right, usize::MAX);
+            let wide = distance_with_limit(&left, &right, 16);
+            assert!(exact > 0.0);
+            assert!((wide - exact).abs() < 1e-9, "variant {index}: exact {exact}, wide {wide}");
+            // And the other way around.
+            let exact = distance_with_limit(&right, &left, usize::MAX);
+            let wide = distance_with_limit(&right, &left, 16);
+            assert!((wide - exact).abs() < 1e-9, "variant {index} reversed: {exact} vs {wide}");
+        }
+    }
+
+    #[test]
+    fn the_alignment_of_long_lists_never_undercuts_the_exact_distance() {
+        // Random lists over a small alphabet: repeated statements, few
+        // unique anchors, sometimes none.
+        let mut next = random_numbers(7);
+        for round in 0..60 {
+            let alphabet = 2 + next(12);
+            let mut list = |length: usize| -> Vec<Rc<TreeNode>> {
+                (0..length)
+                    .map(|_| {
+                        let symbol = next(alphabet);
+                        statement(&format!("v{symbol}"), symbol)
+                    })
+                    .collect()
+            };
+            let left = block(list(30 + round % 25));
+            let right = block(list(30 + (round * 7) % 25));
+            let exact = distance_with_limit(&left, &right, usize::MAX);
+            for limit in [1, 16, 100] {
+                let wide = distance_with_limit(&left, &right, limit);
+                assert!(wide >= exact - 1e-9, "round {round}: exact {exact}, wide {wide}");
+                // Replacing everything is always possible.
+                let replace = (left.subtree_size() + right.subtree_size()) as f64;
+                assert!(wide <= replace + 1e-9, "round {round}: {wide} > {replace}");
+            }
+        }
+    }
+
+    #[test]
+    fn lists_longer_than_the_exact_limit_are_compared() {
+        // 1500 × 1500 children is past the limit. Two tables that differ
+        // in three entries are three renames apart; aligning them exactly
+        // would take a matrix of 2.25 million cells.
+        let table = |changed: &[usize]| {
+            let entries: Vec<Rc<TreeNode>> = (0..1500)
+                .map(|i| {
+                    let value = if changed.contains(&i) { i + 5000 } else { i };
+                    leaf(&value.to_string(), "NumericLiteral")
+                })
+                .collect();
+            node("ArrayExpression", "ArrayExpression", entries)
+        };
+        let options = APTEDOptions { rename_cost: 0.3, compare_values: false, ..unit_options() };
+        let distance = compute_edit_distance(&table(&[]), &table(&[3, 700, 1499]), &options);
+        assert!((distance - 3.0 * 0.6).abs() < 1e-9, "{distance}");
+        assert_eq!(compute_edit_distance(&table(&[]), &table(&[]), &options), 0.0);
     }
 }

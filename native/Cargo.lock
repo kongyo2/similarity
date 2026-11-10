@@ -533,6 +533,7 @@ version = "0.8.1"
 dependencies = [
  "oxc_allocator",
  "oxc_ast",
+ "oxc_ast_visit",
  "oxc_parser",
  "oxc_semantic",
  "oxc_span",
@@ -553,7 +554,6 @@ dependencies = [
 name = "similarity-wasm"
 version = "0.8.1"
 dependencies = [
- "serde_json",
  "similarity-core-ts",
  "wasm-bindgen",
 ]

@@ -9,6 +9,7 @@ authors = ["mizchi"]
 [dependencies]
 oxc_parser = "0.124.0"
 oxc_ast = "0.124.0"
+oxc_ast_visit = "0.124.0"
 oxc_span = "0.124.0"
 oxc_allocator = "0.124.0"
 serde = { version = "1.0", features = ["derive"] }

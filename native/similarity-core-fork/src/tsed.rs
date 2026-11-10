@@ -55,8 +55,8 @@ impl Default for TSEDOptions {
 #[allow(clippy::cast_precision_loss)]
 pub fn calculate_tsed(tree1: &Rc<TreeNode>, tree2: &Rc<TreeNode>, options: &TSEDOptions) -> f64 {
     let distance = compute_edit_distance(tree1, tree2, &options.apted_options);
-    let size1 = tree1.get_subtree_size() as f64;
-    let size2 = tree2.get_subtree_size() as f64;
+    let size1 = tree1.subtree_size() as f64;
+    let size2 = tree2.subtree_size() as f64;
     finalize_tsed_similarity(distance, size1, size2, options)
 }
 
@@ -73,8 +73,8 @@ pub fn calculate_tsed_with_threshold(
     options: &TSEDOptions,
     threshold: f64,
 ) -> f64 {
-    let size1 = tree1.get_subtree_size() as f64;
-    let size2 = tree2.get_subtree_size() as f64;
+    let size1 = tree1.subtree_size() as f64;
+    let size2 = tree2.subtree_size() as f64;
     let max_size = size1.max(size2);
     if max_size == 0.0 {
         return 1.0;

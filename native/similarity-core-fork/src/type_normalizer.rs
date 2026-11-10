@@ -1,12 +1,20 @@
+//! Type normalization: one spelling per type, and the similarity of two
+//! spellings.
+
+use crate::text::levenshtein_similarity;
 use crate::type_extractor::{TypeDefinition, TypeKind};
 use std::collections::{HashMap, HashSet};
 
+/// A type declaration prepared for comparison.
 #[derive(Debug, Clone)]
 pub struct NormalizedType {
-    pub properties: HashMap<String, String>, // プロパティ名 -> 型
+    /// Property name → normalized type annotation.
+    pub properties: HashMap<String, String>,
     pub optional_properties: HashSet<String>,
     pub readonly_properties: HashSet<String>,
-    pub signature: String, // 正規化された型シグネチャ
+    /// The whole shape as one normalized string.
+    pub signature: String,
+    /// The declaration's name without its namespace qualifier.
     pub original_name: String,
     pub kind: TypeKind,
     /// Sorted, deduplicated `extends` clause (interfaces only; empty for
@@ -111,7 +119,7 @@ pub fn normalize_type(type_def: &TypeDefinition, options: &NormalizationOptions)
         // the same namespace must not read as lexically related because
         // they share its prefix.
         original_name: crate::module_scope::unqualified_name(&type_def.name).to_string(),
-        kind: type_def.kind.clone(),
+        kind: type_def.kind,
         extends,
     }
 }
@@ -211,27 +219,15 @@ pub fn normalize_type_name(type_name: &str) -> String {
 
     // Function types: strip parameter NAMES (they are local to the
     // signature — `(request: string) => R` and `(url: string) => R` are
-    // the same contract) and normalize parameter/return types.
+    // the same contract) and normalize parameter/return types. What a name
+    // carries besides itself stays: the rest parameter keeps its `...`,
+    // and an optional parameter's type admits `undefined`, the way an
+    // optional property's does.
     if let Some((params, return_type)) = split_function_type(trimmed) {
         let normalized_params: Vec<String> = split_top_level(&params, ',')
             .iter()
             .filter(|piece| !piece.is_empty())
-            .map(|piece| {
-                // `name: T` / `name?: T` → T; a piece without a colon is
-                // already a bare type (or a rest param `...rest: T`).
-                let piece = piece.trim_start_matches("...");
-                match piece.find(':') {
-                    Some(colon)
-                        if piece[..colon]
-                            .trim_end_matches('?')
-                            .chars()
-                            .all(|c| c.is_alphanumeric() || c == '_' || c == '$') =>
-                    {
-                        normalize_type_name(piece[colon + 1..].trim())
-                    }
-                    _ => normalize_type_name(piece),
-                }
-            })
+            .map(|piece| normalize_function_parameter(piece))
             .collect();
         return format!(
             "({}) => {}",
@@ -283,6 +279,32 @@ pub fn normalize_type_name(type_name: &str) -> String {
         "Object" => "object".to_string(),
         _ => trimmed.to_string(),
     }
+}
+
+/// One piece of a function type's parameter list, without its name:
+/// `name: T` → `T`, `name?: T` → `T | undefined`, `...name: T` → `...T`. A
+/// piece without a parameter name is already a bare type.
+fn normalize_function_parameter(piece: &str) -> String {
+    let (rest, piece) = match piece.strip_prefix("...") {
+        Some(remainder) => ("...", remainder),
+        None => ("", piece),
+    };
+    let named = piece.find(':').and_then(|colon| {
+        let name = piece[..colon].trim();
+        let (name, optional) = match name.strip_suffix('?') {
+            Some(name) => (name, true),
+            None => (name, false),
+        };
+        let is_name =
+            !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+        is_name.then(|| (piece[colon + 1..].trim(), optional))
+    });
+    let normalized = match named {
+        Some((annotation, true)) => normalize_type_name(&format!("{annotation} | undefined")),
+        Some((annotation, false)) => normalize_type_name(annotation),
+        None => normalize_type_name(piece),
+    };
+    format!("{rest}{normalized}")
 }
 
 /// Strip parentheses that wrap the ENTIRE type (`(User | Error)` →
@@ -394,17 +416,15 @@ pub fn calculate_property_similarity(prop1: &str, prop2: &str) -> f64 {
         return 0.95;
     }
 
-    let max_length = normalized1.len().max(normalized2.len());
-    if max_length == 0 {
-        return 1.0;
-    }
-
-    let distance = levenshtein_distance(normalized1, normalized2);
-    (1.0 - (distance as f64 / max_length as f64)).max(0.0)
+    levenshtein_similarity(normalized1, normalized2)
 }
 
 /// Calculate similarity between two type strings
 pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
+    // Equal spellings normalize alike; most compared annotations are equal.
+    if type1 == type2 {
+        return 1.0;
+    }
     let normalized1 = normalize_type_name(type1);
     let normalized2 = normalize_type_name(type2);
 
@@ -549,13 +569,7 @@ pub fn calculate_type_similarity(type1: &str, type2: &str) -> f64 {
     }
 
     // For other (structured) types, use string similarity
-    let max_length = normalized1.len().max(normalized2.len());
-    if max_length == 0 {
-        return 1.0;
-    }
-
-    let distance = levenshtein_distance(&normalized1, &normalized2);
-    (1.0 - (distance as f64 / max_length as f64)).max(0.0)
+    levenshtein_similarity(&normalized1, &normalized2)
 }
 
 /// Split a top-level `(params) => return` function type. Returns `None`
@@ -566,10 +580,16 @@ fn split_function_type(type_name: &str) -> Option<(String, String)> {
         return None;
     }
     let mut depth = 0i32;
+    let mut previous = '\0';
     let mut params_end = None;
     for (index, ch) in type_name.char_indices() {
         match ch {
             '(' | '<' | '[' | '{' => depth += 1,
+            // The `>` of an arrow is an operator, not a bracket: a
+            // parameter that is itself a function type (`(done: (error:
+            // Error) => void) => void`) used to end the scan below zero,
+            // and the type was not recognized as a function type at all.
+            '>' if previous == '=' => {}
             ')' | '>' | ']' | '}' => {
                 depth -= 1;
                 if depth == 0 && ch == ')' {
@@ -579,6 +599,7 @@ fn split_function_type(type_name: &str) -> Option<(String, String)> {
             }
             _ => {}
         }
+        previous = ch;
     }
     let params_end = params_end?;
     let rest = type_name[params_end + 1..].trim_start();
@@ -780,11 +801,7 @@ pub struct PropertyMatch {
 ///
 /// Optionality disagreement discounts a match's quality: `x: T` and
 /// `x?: T` are different contracts.
-pub fn find_property_matches(
-    type1: &NormalizedType,
-    type2: &NormalizedType,
-    _threshold: f64, // Keep for API compatibility but not used
-) -> Vec<PropertyMatch> {
+pub fn find_property_matches(type1: &NormalizedType, type2: &NormalizedType) -> Vec<PropertyMatch> {
     let mut matches = Vec::new();
 
     let optionality_factor = |name1: &String, name2: &String| -> f64 {
@@ -899,44 +916,6 @@ pub fn find_property_matches(
     matches
 }
 
-/// Calculate Levenshtein distance between two strings
-fn levenshtein_distance(s1: &str, s2: &str) -> usize {
-    let len1 = s1.chars().count();
-    let len2 = s2.chars().count();
-
-    if len1 == 0 {
-        return len2;
-    }
-    if len2 == 0 {
-        return len1;
-    }
-
-    let mut matrix = vec![vec![0; len2 + 1]; len1 + 1];
-
-    // Initialize first row and column
-    for (i, row) in matrix.iter_mut().enumerate().take(len1 + 1) {
-        row[0] = i;
-    }
-    for (j, cell) in matrix[0].iter_mut().enumerate().take(len2 + 1) {
-        *cell = j;
-    }
-
-    let chars1: Vec<char> = s1.chars().collect();
-    let chars2: Vec<char> = s2.chars().collect();
-
-    for i in 1..=len1 {
-        for j in 1..=len2 {
-            let cost = if chars1[i - 1] == chars2[j - 1] { 0 } else { 1 };
-
-            matrix[i][j] = (matrix[i - 1][j] + 1) // deletion
-                .min(matrix[i][j - 1] + 1) // insertion
-                .min(matrix[i - 1][j - 1] + cost); // substitution
-        }
-    }
-
-    matrix[len1][len2]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,14 +996,6 @@ mod tests {
     }
 
     #[test]
-    fn test_levenshtein_distance() {
-        assert_eq!(levenshtein_distance("", ""), 0);
-        assert_eq!(levenshtein_distance("abc", "abc"), 0);
-        assert_eq!(levenshtein_distance("abc", "ab"), 1);
-        assert_eq!(levenshtein_distance("abc", "def"), 3);
-    }
-
-    #[test]
     fn array_types_compare_by_element() {
         // `ShopUser[]` vs `ShopOrder[]` is the nominal payload contrast,
         // not a Levenshtein near-match of the bracketed spellings.
@@ -1069,7 +1040,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&flags, &options),
             &normalize_type(&toggle, &options),
-            0.7,
         );
         assert!(matches.is_empty(), "index signature must not match a concrete property");
 
@@ -1079,7 +1049,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&flags, &options),
             &normalize_type(&toggles, &options),
-            0.7,
         );
         assert_eq!(matches.len(), 1);
 
@@ -1092,7 +1061,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&flags, &options),
             &normalize_type(&numeric_keys, &options),
-            0.7,
         );
         assert!(matches.is_empty(), "string-keyed and number-keyed index signatures must not pair");
     }
@@ -1226,7 +1194,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&start, &options),
             &normalize_type(&error, &options),
-            0.7,
         );
         assert!(matches.is_empty(), "a single renamed property must not pair: {matches:?}");
 
@@ -1242,7 +1209,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&package, &options),
             &normalize_type(&marker, &options),
-            0.7,
         );
         let renamed =
             matches.iter().find(|m| m.prop1 == "version").expect("version pairs with value");
@@ -1272,7 +1238,6 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&address, &options),
             &normalize_type(&location, &options),
-            0.7,
         );
         assert_eq!(matches.len(), 3);
         assert!(matches.iter().all(|m| (m.overall_similarity - 0.95).abs() < 1e-9));
@@ -1301,8 +1266,56 @@ mod tests {
         let matches = find_property_matches(
             &normalize_type(&expression, &options),
             &normalize_type(&statement, &options),
-            0.7,
         );
         assert_eq!(matches.len(), 2, "only the exact-name members pair: {matches:?}");
+    }
+
+    #[test]
+    fn function_parameters_keep_what_their_names_carry() {
+        // Names are local to a signature and go; a rest parameter stays a
+        // rest parameter, and an optional parameter admits `undefined`.
+        assert_eq!(
+            normalize_type_name("(message: string, level?: Level, ...details: unknown[]) => void"),
+            "(string, Level | undefined, ...unknown[]) => void"
+        );
+        assert_eq!(normalize_type_name("(request: Request) => void"), "(Request) => void");
+        // One list of strings is not any number of strings.
+        assert_ne!(
+            normalize_type_name("(...parts: string[]) => string"),
+            normalize_type_name("(parts: string[]) => string")
+        );
+        assert_eq!(
+            normalize_type_name("(level?: Level) => void"),
+            normalize_type_name("(level: Level | undefined) => void")
+        );
+        assert_ne!(
+            normalize_type_name("(level?: Level) => void"),
+            normalize_type_name("(level: Level) => void")
+        );
+    }
+
+    #[test]
+    fn a_function_typed_parameter_does_not_end_the_parameter_list() {
+        // The `>` of the inner arrow used to count as a closing bracket,
+        // so the type was not recognized as a function type and kept its
+        // parameter names.
+        assert_eq!(
+            normalize_type_name("(done: (error: Error) => void) => void"),
+            "((Error) => void) => void"
+        );
+        assert_eq!(
+            normalize_type_name(
+                "(next: (value: Map<string, number>) => Promise<void>, label: string) => boolean"
+            ),
+            "((Map<string, number>) => Promise<void>, string) => boolean"
+        );
+        assert!(
+            (calculate_type_similarity(
+                "(done: (error: Error) => void) => void",
+                "(callback: (failure: Error) => void) => void"
+            ) - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
     }
 }

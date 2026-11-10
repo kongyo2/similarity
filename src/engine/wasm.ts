@@ -7,7 +7,7 @@ import type { AnalyzeReport, LoadedFile } from "../types.js";
  * except what the JavaScript layer derives (duplicate clusters).
  */
 export type WasmReport = Omit<AnalyzeReport, "clusters" | "stats"> & {
-  stats: Omit<AnalyzeReport["stats"], "clusterCount">;
+  stats: Omit<AnalyzeReport["stats"], "clusterCount" | "elapsedMs">;
 };
 
 const locationSchema = z.object({
@@ -43,7 +43,6 @@ const reportSchema = z.object({
   stats: z.object({
     fileCount: z.number(),
     pairCount: z.number(),
-    elapsedMs: z.number(),
   }),
 });
 
