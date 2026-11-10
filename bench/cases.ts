@@ -27,6 +27,7 @@
 import { classAndScenarioCases } from "./cases/classes-and-scenarios.js";
 import { functionNegativeCases } from "./cases/functions-negative.js";
 import { functionPositiveCases } from "./cases/functions-positive.js";
+import { syntaxCoverageCases } from "./cases/syntax-coverage.js";
 import { typeCases } from "./cases/types.js";
 
 export type BenchMode = "functions" | "types" | "classes";
@@ -1775,4 +1776,5 @@ export const benchCases: BenchCase[] = [
   ...functionNegativeCases,
   ...typeCases,
   ...classAndScenarioCases,
+  ...syntaxCoverageCases,
 ];
