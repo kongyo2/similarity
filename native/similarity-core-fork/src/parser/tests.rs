@@ -822,6 +822,27 @@ fn default_parameter_values_are_part_of_the_signature() {
 }
 
 #[test]
+fn a_default_value_costs_what_it_holds() {
+    // The value sits next to the binding. Wrapped around it, a literal
+    // default cost 2.9: the binding renamed into the wrapper, and the
+    // wrapper's two children inserted.
+    let distance = |left: &str, right: &str| {
+        compute_edit_distance(&canonical_tree(left), &canonical_tree(right), &structural_options())
+    };
+    let plain = "function page(items: Item[], size: number) { return items.slice(0, size); }";
+    let with_literal = "function page(items: Item[], size = 10) { return items.slice(0, size); }";
+    let with_call =
+        "function page(items: Item[], size = pageSize()) { return items.slice(0, size); }";
+    assert!(
+        (distance(plain, with_literal) - 1.0).abs() < 1e-9,
+        "{}",
+        distance(plain, with_literal)
+    );
+    // A call is the call and its callee.
+    assert!((distance(plain, with_call) - 2.0).abs() < 1e-9, "{}", distance(plain, with_call));
+}
+
+#[test]
 fn the_rest_parameter_is_a_parameter() {
     // The rest parameter used to be dropped, so `log(...parts)` had the
     // signature of `log()` and `parts` was a free identifier.

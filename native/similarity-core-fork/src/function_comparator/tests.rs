@@ -972,6 +972,50 @@ export class Relay {
 }
 
 #[test]
+fn a_default_value_is_a_small_difference() {
+    // Sibling error classes: the constructors differ in their constants,
+    // and one of them gives its parameter a default.
+    let code = r#"
+export class ValidationError extends ApplicationError {
+  constructor(message: string) {
+    super(message, "VALIDATION_ERROR");
+    this.name = "ValidationError";
+  }
+}
+
+export class ConflictError extends ApplicationError {
+  constructor(message: string) {
+    super(message, "CONFLICT");
+    this.name = "ConflictError";
+  }
+}
+
+export class UnauthorizedError extends ApplicationError {
+  constructor(message: string = "Unauthorized") {
+    super(message, "UNAUTHORIZED");
+    this.name = "UnauthorizedError";
+  }
+}
+"#;
+    let options = TSEDOptions { min_lines: 3, ..TSEDOptions::default() };
+    let pairs = find_similar_functions_in_file("test.ts", code, 0.6, &options).unwrap();
+    let similarity = |left: &str, right: &str| {
+        pairs
+            .iter()
+            .find(|pair| pair.func1.name == left && pair.func2.name == right)
+            .map(|pair| pair.similarity)
+            .unwrap_or_else(|| panic!("{left} and {right} are not paired"))
+    };
+    let constants_only = similarity("ValidationError.constructor", "ConflictError.constructor");
+    let with_default = similarity("ValidationError.constructor", "UnauthorizedError.constructor");
+    // The default counts, as one more constant. While it was wrapped
+    // around the binding the pair scored 0.19.
+    assert!(constants_only > 0.85, "{constants_only}");
+    assert!(with_default < constants_only, "{with_default} against {constants_only}");
+    assert!(with_default > 0.7, "{with_default}");
+}
+
+#[test]
 fn a_function_is_named_by_the_path_that_leads_to_it() {
     let code = r"
 export namespace Legacy {
