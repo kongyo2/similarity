@@ -1,33 +1,12 @@
-import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
 import { analyzeProject } from "../src/index.js";
 import type { AnalyzerMode, SimilarityPair } from "../src/types.js";
-
-async function withTempProject(run: (projectDir: string) => Promise<void>) {
-  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "similarity-ts-accuracy-"));
-  try {
-    await run(tempRoot);
-  } finally {
-    await fs.rm(tempRoot, { recursive: true, force: true });
-  }
-}
-
-async function writeSource(projectDir: string, relativePath: string, content: string) {
-  const filePath = path.join(projectDir, relativePath);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, content, "utf8");
-  return filePath;
-}
+import { withTempProject, writeSource } from "./helpers.js";
 
 function hasPair(pairs: SimilarityPair[], leftName: string, rightName: string): boolean {
-  return pairs.some((pair) => {
-    const names = [pair.left.symbolName, pair.right.symbolName].sort();
-    return names[0] === [leftName, rightName].sort()[0] &&
-      names[1] === [leftName, rightName].sort()[1];
-  });
+  return similarityOf(pairs, leftName, rightName) !== undefined;
 }
 
 /** The similarity the report gives a pair of symbols, if it lists the pair. */

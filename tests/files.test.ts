@@ -1,29 +1,8 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { collectTypeScriptFiles } from "../src/utils/files.js";
-
-async function withTempProject(run: (projectDir: string) => Promise<void>) {
-  // Resolved: on macOS the temporary directory is itself behind a symlink.
-  const tempRoot = await fs.realpath(
-    await fs.mkdtemp(path.join(os.tmpdir(), "similarity-ts-files-")),
-  );
-  try {
-    await run(tempRoot);
-  } finally {
-    await fs.rm(tempRoot, { recursive: true, force: true });
-  }
-}
-
-/** Create `files` (path → content) under `root`, with their directories. */
-async function writeTree(root: string, files: Record<string, string>): Promise<void> {
-  for (const [relative, content] of Object.entries(files)) {
-    const target = path.join(root, relative);
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, content, "utf8");
-  }
-}
+import { withTempProject, writeTree } from "./helpers.js";
 
 const SOURCE = "export const value = true;\n";
 

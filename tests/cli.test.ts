@@ -1,29 +1,11 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type * as ChalkModule from "chalk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isCliEntrypoint, runCli } from "../src/cli.js";
 import type { AnalyzeReport } from "../src/index.js";
-
-async function withTempProject(run: (projectDir: string) => Promise<void>) {
-  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "similarity-ts-cli-"));
-  try {
-    await run(tempRoot);
-  } finally {
-    await fs.rm(tempRoot, { recursive: true, force: true });
-  }
-}
-
-/** Create `files` (path → content) under `root`, with their directories. */
-async function writeTree(root: string, files: Record<string, string>): Promise<void> {
-  for (const [relative, content] of Object.entries(files)) {
-    const target = path.join(root, relative);
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, content, "utf8");
-  }
-}
+import { withTempProject, writeTree } from "./helpers.js";
 
 /** Two files, each with one object type of the same shape. */
 async function createCliFixture(projectDir: string) {

@@ -1,18 +1,9 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { analyzeProject, resolveAnalyzeOptions } from "../src/index.js";
 import type { AnalyzeProjectOptions, AnalyzeReport } from "../src/index.js";
-
-async function withTempProject(run: (projectDir: string) => Promise<void>) {
-  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "similarity-ts-"));
-  try {
-    await run(tempRoot);
-  } finally {
-    await fs.rm(tempRoot, { recursive: true, force: true });
-  }
-}
+import { withTempProject } from "./helpers.js";
 
 async function createFixtureProject(projectDir: string) {
   await fs.mkdir(path.join(projectDir, "src"), { recursive: true });
