@@ -22,6 +22,7 @@ export type {
   AnalyzerMode,
   AnalyzerWarning,
   SimilarityCluster,
+  SimilarityFragment,
   SimilarityPair,
   TypeFilter,
 } from "./types.js";

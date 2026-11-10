@@ -34,8 +34,11 @@ on TypeScript files and turns its clusters and pairs into a refactoring plan.
 
 Three or more copies of one declaration are reported once, as a **cluster**,
 instead of as every pair among them: five identical `dispose()` methods are
-one block listing five locations, not ten table rows. The JSON report keeps
-every pair in `results`/`byMode` and adds the groups as `clusters`.
+one block listing five locations, not ten table rows. Overlap mode groups
+the same way: a guard clause pasted into five functions is one cluster of
+five fragments, with the fragment's size and syntactic kind. The JSON
+report keeps every pair in `results`/`byMode` and adds the groups as
+`clusters`.
 
 ## What it detects
 

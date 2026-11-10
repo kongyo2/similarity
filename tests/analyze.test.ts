@@ -146,6 +146,69 @@ describe("analyzeProject", () => {
     });
   });
 
+  it("groups a fragment pasted into three functions into one cluster", async () => {
+    await withTempProject(async (projectDir) => {
+      const cacheGuard = [
+        "  if (cached !== undefined && cached.expires > Date.now()) {",
+        '    metrics.increment("cache.hit", { kind: "lookup" });',
+        "    return cached;",
+        "  }",
+      ];
+      await fs.writeFile(
+        path.join(projectDir, "load.ts"),
+        [
+          "export function loadUser(id: string, cache: Map<string, User>) {",
+          "  const cached = cache.get(id);",
+          ...cacheGuard,
+          "  return fetchUser(id);",
+          "}",
+          "",
+          "export function loadOrder(id: string, cache: Map<string, Order>, audit: Audit) {",
+          '  audit.record("order.load", id);',
+          "  const cached = cache.get(id);",
+          ...cacheGuard,
+          "  const order = fetchOrder(id);",
+          '  audit.record("order.loaded", order.total);',
+          "  return order;",
+          "}",
+          "",
+          "export function loadInvoice(key: string, cache: Map<string, Invoice>) {",
+          "  if (key.length === 0) {",
+          '    throw new Error("empty key");',
+          "  }",
+          "  const cached = cache.get(key);",
+          ...cacheGuard,
+          "  return fetchInvoice(key, { retries: 3, timeout: 1000 });",
+          "}",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const report = await analyzeProject({ cwd: projectDir, paths: ["."], modes: ["overlap"] });
+
+      // The guard in each pair of the three functions, and the lookup
+      // before it where it reads the same parameter.
+      expect(report.byMode.overlap).toHaveLength(4);
+      expect(report.stats.clusterCount).toBe(1);
+      expect(report.clusters).toEqual([
+        {
+          mode: "overlap",
+          members: [
+            expect.objectContaining({ symbolName: "loadUser", startLine: 3, endLine: 6 }),
+            expect.objectContaining({ symbolName: "loadOrder", startLine: 13, endLine: 16 }),
+            expect.objectContaining({ symbolName: "loadInvoice", startLine: 27, endLine: 30 }),
+          ],
+          fragment: { nodeCount: 26, nodeType: "IfStatement" },
+          pairCount: 3,
+          maxSimilarity: 1,
+          minSimilarity: 1,
+          averageSimilarity: 1,
+        },
+      ]);
+    });
+  });
+
   it("supports cross-file-only constraints", async () => {
     await withTempProject(async (projectDir) => {
       await createFixtureProject(projectDir);

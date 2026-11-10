@@ -1,5 +1,8 @@
 import { Chalk, type ChalkInstance } from "chalk";
 import Table from "cli-table3";
+// The release the table library itself measures cells with: a line this
+// module makes to fit, the table sees as fitting.
+import stringWidth from "string-width";
 import { standalonePairs } from "./clusters.js";
 import type {
   AnalyzeReport,
@@ -38,9 +41,57 @@ function stylesFor(color: boolean): Styles {
   };
 }
 
+/** Width of the pair table's columns, borders excluded, padding included. */
+const COLUMN_WIDTHS = { similarity: 12, location: 56 };
+/** Columns of text a location cell holds: its width less the padding. */
+const LOCATION_TEXT_WIDTH = COLUMN_WIDTHS.location - 2;
+
 function formatLocation(location: AnalyzerLocation, cwd: string): string {
   const relativePath = toRelativePath(location.filePath, cwd);
   return `${relativePath}:${location.startLine}-${location.endLine} ${location.symbolName}`;
+}
+
+/**
+ * `word` in pieces of at most `width` columns, each ending after a path
+ * separator where one fits.
+ */
+function breakWord(word: string, width: number): string[] {
+  const pieces: string[] = [];
+  let piece = "";
+  let pieceWidth = 0;
+  // Length of `piece` up to and including its last path separator.
+  let separatorEnd = 0;
+  for (const character of word) {
+    const characterWidth = stringWidth(character);
+    // Twice at most: what follows the separator can still be too wide for
+    // a character of two columns, and then goes out whole.
+    while (piece.length > 0 && pieceWidth + characterWidth > width) {
+      const cut = separatorEnd > 0 ? separatorEnd : piece.length;
+      pieces.push(piece.slice(0, cut));
+      piece = piece.slice(cut);
+      pieceWidth = stringWidth(piece);
+      separatorEnd = 0;
+    }
+    piece += character;
+    pieceWidth += characterWidth;
+    if (character === "/" || character === "\\") {
+      separatorEnd = piece.length;
+    }
+  }
+  pieces.push(piece);
+  return pieces;
+}
+
+/**
+ * `text` with a line break inside every word wider than `width` columns.
+ * The table wraps between words and cuts off a word it cannot fit, which
+ * for a location is the end of the path: the file name and the lines.
+ */
+function wrapLongWords(text: string, width: number): string {
+  return text
+    .split(" ")
+    .map((word) => (stringWidth(word) > width ? breakWord(word, width).join("\n") : word))
+    .join(" ");
 }
 
 function formatModeLabel(mode: AnalyzerMode): string {
@@ -66,6 +117,8 @@ function memberNoun(mode: AnalyzerMode): string {
       return "types";
     case "classes":
       return "classes";
+    case "overlap":
+      return "fragments";
     default:
       return "declarations";
   }
@@ -82,14 +135,19 @@ function renderCluster(
   cwd: string,
   styles: Styles,
 ): string[] {
-  const range = cluster.minSimilarity === cluster.maxSimilarity
+  // One number says it all when every pair scores the same.
+  const similarity = cluster.minSimilarity === cluster.maxSimilarity
     ? cluster.maxSimilarity.toFixed(3)
-    : `${cluster.minSimilarity.toFixed(3)}–${cluster.maxSimilarity.toFixed(3)}`;
+    : `${cluster.minSimilarity.toFixed(3)}–${cluster.maxSimilarity.toFixed(3)} ` +
+      `(avg ${cluster.averageSimilarity.toFixed(3)})`;
+  const shape = cluster.fragment
+    ? ` (${cluster.fragment.nodeType}, ${plural(cluster.fragment.nodeCount, "node")})`
+    : "";
   const lines = [
     styles.bold(
-      `Cluster ${index + 1}: ${cluster.members.length} ${memberNoun(mode)}, ` +
+      `Cluster ${index + 1}: ${cluster.members.length} ${memberNoun(mode)}${shape}, ` +
         `${plural(cluster.pairCount, "pairwise match", "pairwise matches")}, ` +
-        `similarity ${range} (avg ${cluster.averageSimilarity.toFixed(3)})`,
+        `similarity ${similarity}`,
     ),
   ];
   for (const member of cluster.members) {
@@ -103,14 +161,12 @@ function renderPairTable(pairs: SimilarityPair[], cwd: string, styles: Styles): 
     head: ["Similarity", "Left", "Right"],
     style: styles.table,
     wordWrap: true,
-    colWidths: [12, 56, 56],
+    colWidths: [COLUMN_WIDTHS.similarity, COLUMN_WIDTHS.location, COLUMN_WIDTHS.location],
   });
+  const cell = (location: AnalyzerLocation) =>
+    wrapLongWords(formatLocation(location, cwd), LOCATION_TEXT_WIDTH);
   for (const pair of pairs) {
-    table.push([
-      pair.similarity.toFixed(3),
-      formatLocation(pair.left, cwd),
-      formatLocation(pair.right, cwd),
-    ]);
+    table.push([pair.similarity.toFixed(3), cell(pair.left), cell(pair.right)]);
   }
   return table.toString();
 }
@@ -130,10 +186,10 @@ function renderMode(
     return lines.join("\n");
   }
 
-  // Three or more copies of one declaration are listed once, as a
-  // cluster, instead of as every pair among them. The clusters are the
-  // report's own, so the blocks agree with the summary's cluster count
-  // and with the JSON report.
+  // Three or more copies of one declaration — or, in overlap mode, of one
+  // fragment — are listed once, as a cluster, instead of as every pair
+  // among them. The clusters are the report's own, so the blocks agree
+  // with the summary's cluster count and with the JSON report.
   const clusters = reportClusters.filter((cluster) => cluster.mode === mode);
   const standalone = standalonePairs(mode, pairs, clusters);
   clusters.forEach((cluster, index) => {

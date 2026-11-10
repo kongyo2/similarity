@@ -52,7 +52,8 @@
     "cli-table3": "^0.6.5",
     "commander": "^14.0.3",
     "ignore": "^7.0.14",
-    "p-limit": "^7.3.3"
+    "p-limit": "^7.3.3",
+    "string-width": "^4.2.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

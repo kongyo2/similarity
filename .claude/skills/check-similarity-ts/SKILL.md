@@ -36,7 +36,13 @@ unless the generator itself is the subject.
   output) are three or more declarations connected by reported pairs. Treat
   each cluster as one refactoring: one shared implementation, every member
   rewritten to use it.
-- **Standalone pairs** are two declarations with no third copy.
+- **Overlap clusters** (`mode: "overlap"`, "N fragments") are three or more
+  copies of one fragment inside functions that differ as a whole — a guard,
+  a lookup, a block. `fragment` gives its size in syntax nodes and the kind
+  of its root (`IfStatement`, `VariableDeclaration`, …); the members are
+  the line ranges to replace with a call to one extracted helper.
+- **Standalone pairs** are two declarations, or two fragments, with no
+  third copy.
 - `similarity` 1.000 means the canonical trees are identical: the code is
   the same up to renames and accepted style spellings (arrow vs function,
   `.then` vs `await`, `forEach` vs `for-of`, guard style, …).
@@ -51,6 +57,7 @@ unless the generator itself is the subject.
 | Function pair at 0.80–0.95 | Extract the shared skeleton; keep the differing step as a callback or strategy |
 | Interfaces / type aliases | Keep one definition and re-export it, or extract a base interface and `extends` it |
 | Classes | Extract a base class or a shared helper the classes delegate to; generic parameters for differing payload types |
+| Overlap cluster or pair | Extract the fragment into a helper when it is a step of its own (a guard, a conversion); leave incidental one-line repeats alone |
 
 Show before/after code for each high-similarity cluster. Check behavior
 before merging: a cluster is connected through pairs, so two members can be
