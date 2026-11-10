@@ -1,4 +1,5 @@
 use crate::tree::TreeNode;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
@@ -40,6 +41,10 @@ const EXACT_ALIGNMENT_CELLS: usize = 1 << 20;
 /// [`common_subsequence`]). The search takes time and memory that grow
 /// with this number; lists further apart than this are not alike.
 const MAX_LIST_EDITS: usize = 2000;
+
+/// How far the lower bound on a distance may exceed a budget before the
+/// distance is taken to exceed it too.
+const LOWER_BOUND_SLACK: f64 = 1e-9;
 
 /// Sentinel value indicating the distance exceeds the cutoff budget. Picked
 /// to be unambiguous when compared against any realistic distance value,
@@ -133,55 +138,245 @@ fn is_semantic_builtin_name(label: &str) -> bool {
     )
 }
 
-/// Compute the rename cost for substituting one node with another.
+/// The labels and kinds of the trees of one scan, each `(label, kind)`
+/// pair numbered once.
 ///
-/// The cost reflects how much semantic change the substitution represents:
-///   * identical label and kind → 0 (exact match)
-///   * same kind, differing label, identifier-like leaf → `rename_cost`
-///     (e.g. parameter or variable rename — neutral refactor), EXCEPT when
-///     both labels are well-known builtin member names — swapping `.map`
-///     for `.filter` is a behavioural rewrite and pays the within-kind cap
-///   * same kind, differing label, non-identifier-like (operator, method
-///     key, literal value, etc.) → `rename_cost * 2.0` (semantic change
-///     within a syntactic category)
-///   * differing kind → `rename_cost * 3.0` (subtree-shape
-///     change — e.g. CallExpression vs BinaryExpression). Capped so that
-///     APTED still prefers a rename over delete+insert when the rename
-///     would otherwise be cheaper than delete + insert.
-fn label_rename_cost(
-    label1: &str,
-    label2: &str,
-    kind1: &str,
-    kind2: &str,
-    options: &APTEDOptions,
-) -> f64 {
-    let labels_match = label1 == label2;
-    let kinds_match = kind1 == kind2;
+/// Comparing two nodes is the innermost step of every comparison, and a
+/// scan compares each function with thousands of others. Numbered, two
+/// nodes are equal when their numbers are, and what a rename between them
+/// costs is a matter of two small records — no string is compared, hashed
+/// or matched against a list after the tree was prepared.
+#[derive(Debug, Default)]
+pub struct SymbolTable {
+    /// Kind → label → symbol.
+    symbols: HashMap<&'static str, HashMap<String, u32>>,
+    /// What the rename cost reads of each symbol.
+    traits: Vec<SymbolTraits>,
+    kinds: HashMap<&'static str, u32>,
+    /// Per kind number, whether the kind is identifier-like.
+    identifier_like_kinds: Vec<bool>,
+}
 
-    if labels_match && kinds_match {
-        return 0.0;
+#[derive(Debug, Clone, Copy)]
+struct SymbolTraits {
+    /// The kind, numbered.
+    kind: u32,
+    /// See [`is_identifier_like_kind`].
+    identifier_like: bool,
+    /// See [`is_semantic_builtin_name`].
+    semantic_builtin: bool,
+}
+
+impl SymbolTable {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    if options.compare_values {
-        // `compare_values: true` mode is used by the class/type
-        // comparators where rich semantics on a single node matter less
-        // than the surrounding declaration shape. Use the legacy flat
-        // cost so those callers see the same behaviour they always did.
-        return options.rename_cost;
+    /// The number of `(label, kind)`.
+    fn intern(&mut self, label: &str, kind: &'static str) -> u32 {
+        let of_kind = self.symbols.entry(kind).or_default();
+        if let Some(&symbol) = of_kind.get(label) {
+            return symbol;
+        }
+        let next_kind = u32::try_from(self.kinds.len()).expect("fewer than 2^32 kinds");
+        let kind_number = *self.kinds.entry(kind).or_insert(next_kind);
+        if kind_number == next_kind {
+            self.identifier_like_kinds.push(is_identifier_like_kind(kind));
+        }
+        let symbol = u32::try_from(self.traits.len()).expect("fewer than 2^32 symbols");
+        self.traits.push(SymbolTraits {
+            kind: kind_number,
+            identifier_like: is_identifier_like_kind(kind),
+            semantic_builtin: is_semantic_builtin_name(label),
+        });
+        of_kind.insert(label.to_string(), symbol);
+        symbol
     }
 
-    if kinds_match {
-        if is_identifier_like_kind(kind1) {
-            if is_semantic_builtin_name(label1) && is_semantic_builtin_name(label2) {
-                rename_cap(options)
+    /// Prepare `root` for comparison with the other trees prepared by this
+    /// table.
+    pub fn prepare(&mut self, root: &TreeNode) -> PreparedTree {
+        let node_count = root.subtree_size();
+        let mut symbols = Vec::with_capacity(node_count);
+        let mut sizes = Vec::with_capacity(node_count);
+        let mut stack: Vec<&TreeNode> = vec![root];
+        while let Some(node) = stack.pop() {
+            symbols.push(self.intern(&node.label, node.kind));
+            #[allow(clippy::cast_possible_truncation)]
+            sizes.push(node.subtree_size() as u32);
+            stack.extend(node.children.iter().rev().map(Rc::as_ref));
+        }
+
+        let mut sorted: Vec<(u32, u32)> =
+            symbols.iter().map(|&symbol| (self.traits[symbol as usize].kind, symbol)).collect();
+        sorted.sort_unstable();
+        let mut histogram: Vec<SymbolCount> = Vec::new();
+        for (kind, symbol) in sorted {
+            match histogram.last_mut() {
+                Some(last) if last.symbol == symbol => last.count += 1,
+                _ => histogram.push(SymbolCount { kind, symbol, count: 1 }),
+            }
+        }
+        PreparedTree { symbols, sizes, histogram }
+    }
+
+    /// A lower bound on the edit distance between two prepared trees, from
+    /// what their nodes are alone — not from how they nest.
+    ///
+    /// Whatever the alignment, it pairs each node with at most one node of
+    /// the other tree and deletes or inserts the rest. A pair is free only
+    /// between equal nodes; between nodes of one kind it costs a rename
+    /// within the kind, between kinds the dearer rename across kinds. So
+    /// no alignment is cheaper than the cheapest pairing of the two bags
+    /// of nodes: equal nodes first, then nodes of the same kind, then
+    /// whatever is left across kinds, and what one tree has more of
+    /// deleted or inserted.
+    ///
+    /// This costs a walk over two short sorted lists, and it is what keeps
+    /// the alignment — hundreds of times dearer — for pairs that have a
+    /// chance: most functions of similar size share plenty of node kinds
+    /// and still differ in far more nodes than a threshold allows.
+    fn edit_lower_bound(
+        &self,
+        tree1: &PreparedTree,
+        tree2: &PreparedTree,
+        options: &APTEDOptions,
+    ) -> f64 {
+        // The cheapest a pair of unequal nodes can be: within an
+        // identifier-like kind, within any other kind, and across kinds
+        // (see `rename_cost`; a pair of builtin names costs the cap, which
+        // only matters when a plain rename is configured dearer than
+        // that). Pairing never has to cost more than deleting one node and
+        // inserting the other.
+        let replace = options.delete_cost + options.insert_cost;
+        let cap = rename_cap(options);
+        let (within_identifiers, within_others, across) = if options.compare_values {
+            let flat = options.rename_cost.min(replace);
+            (flat, flat, flat)
+        } else {
+            (
+                options.rename_cost.min(cap),
+                (options.rename_cost * 2.0).min(cap),
+                (options.rename_cost * 3.0).min(cap),
+            )
+        };
+
+        let (left, right) = (&tree1.histogram, &tree2.histogram);
+        let (mut i, mut j) = (0, 0);
+        let mut bound = 0.0;
+        // Nodes without a partner of their own kind.
+        let (mut spare_left, mut spare_right) = (0u64, 0u64);
+        while i < left.len() || j < right.len() {
+            let kind = match (left.get(i), right.get(j)) {
+                (Some(a), Some(b)) => a.kind.min(b.kind),
+                (Some(a), None) => a.kind,
+                (None, Some(b)) => b.kind,
+                (None, None) => unreachable!("the loop runs while one list has entries"),
+            };
+            // The nodes of this kind on either side, and how many of them
+            // have an equal on the other.
+            let (mut in_left, mut in_right, mut equal) = (0u64, 0u64, 0u64);
+            loop {
+                let a = left.get(i).filter(|entry| entry.kind == kind);
+                let b = right.get(j).filter(|entry| entry.kind == kind);
+                match (a, b) {
+                    (Some(a), Some(b)) if a.symbol == b.symbol => {
+                        equal += u64::from(a.count.min(b.count));
+                        in_left += u64::from(a.count);
+                        in_right += u64::from(b.count);
+                        i += 1;
+                        j += 1;
+                    }
+                    (Some(a), Some(b)) if a.symbol < b.symbol => {
+                        in_left += u64::from(a.count);
+                        i += 1;
+                    }
+                    (Some(_), Some(b)) => {
+                        in_right += u64::from(b.count);
+                        j += 1;
+                    }
+                    (Some(a), None) => {
+                        in_left += u64::from(a.count);
+                        i += 1;
+                    }
+                    (None, Some(b)) => {
+                        in_right += u64::from(b.count);
+                        j += 1;
+                    }
+                    (None, None) => break,
+                }
+            }
+            let paired = in_left.min(in_right);
+            let within = if self.identifier_like_kinds[kind as usize] {
+                within_identifiers
             } else {
-                options.rename_cost
+                within_others
+            };
+            #[allow(clippy::cast_precision_loss)]
+            {
+                bound += (paired - equal) as f64 * within;
+            }
+            spare_left += in_left - paired;
+            spare_right += in_right - paired;
+        }
+
+        let across_kinds = spare_left.min(spare_right);
+        #[allow(clippy::cast_precision_loss)]
+        {
+            bound
+                + across_kinds as f64 * across
+                + (spare_left - across_kinds) as f64 * options.delete_cost
+                + (spare_right - across_kinds) as f64 * options.insert_cost
+        }
+    }
+
+    /// The rename cost for substituting a node of symbol `symbol1` with
+    /// one of `symbol2`.
+    ///
+    /// The cost reflects how much semantic change the substitution
+    /// represents:
+    ///   * identical label and kind → 0 (exact match)
+    ///   * same kind, differing label, identifier-like leaf →
+    ///     `rename_cost` (e.g. parameter or variable rename — neutral
+    ///     refactor), EXCEPT when both labels are well-known builtin
+    ///     member names — swapping `.map` for `.filter` is a behavioural
+    ///     rewrite and pays the within-kind cap
+    ///   * same kind, differing label, non-identifier-like (operator,
+    ///     method key, literal value, etc.) → `rename_cost * 2.0`
+    ///     (semantic change within a syntactic category)
+    ///   * differing kind → `rename_cost * 3.0` (subtree-shape change —
+    ///     e.g. CallExpression vs BinaryExpression). Capped so that the
+    ///     alignment still prefers a rename over delete+insert when the
+    ///     rename would otherwise be cheaper than delete + insert.
+    fn rename_cost(&self, symbol1: u32, symbol2: u32, options: &APTEDOptions) -> f64 {
+        if symbol1 == symbol2 {
+            return 0.0;
+        }
+
+        if options.compare_values {
+            // `compare_values: true` mode is used by the class/type
+            // comparators where rich semantics on a single node matter
+            // less than the surrounding declaration shape. Use the legacy
+            // flat cost so those callers see the same behaviour they
+            // always did.
+            return options.rename_cost;
+        }
+
+        let (traits1, traits2) = (self.traits[symbol1 as usize], self.traits[symbol2 as usize]);
+        if traits1.kind == traits2.kind {
+            if traits1.identifier_like {
+                if traits1.semantic_builtin && traits2.semantic_builtin {
+                    rename_cap(options)
+                } else {
+                    options.rename_cost
+                }
+            } else {
+                (options.rename_cost * 2.0).min(rename_cap(options))
             }
         } else {
-            (options.rename_cost * 2.0).min(rename_cap(options))
+            (options.rename_cost * 3.0).min(rename_cap(options))
         }
-    } else {
-        (options.rename_cost * 3.0).min(rename_cap(options))
     }
 }
 
@@ -197,44 +392,43 @@ fn rename_cap(options: &APTEDOptions) -> f64 {
     ((options.delete_cost + options.insert_cost) * 0.99).max(0.0)
 }
 
-// ---------------------------------------------------------------------------
-// Flat tree representation
-// ---------------------------------------------------------------------------
-//
-// The recursive `Rc<TreeNode>` shape is convenient to build but slow to
-// compare. Each tree is flattened once per comparison into parallel arrays
-// in pre-order, where a subtree is a contiguous run: the first child of
-// node `i` is `i + 1`, and the sibling after a node `c` is `c + size(c)`.
-// No child lists are stored at all.
-
-struct FlatTree<'a> {
-    labels: Vec<&'a str>,
-    kinds: Vec<&'static str>,
+/// A tree prepared for comparison (see [`SymbolTable::prepare`]).
+///
+/// The recursive `Rc<TreeNode>` shape is convenient to build but slow to
+/// compare. A prepared tree is parallel arrays in pre-order, where a
+/// subtree is a contiguous run: the first child of node `i` is `i + 1`,
+/// and the sibling after a node `c` is `c + size(c)`. No child lists are
+/// stored at all. A function is prepared once, however many functions it
+/// is compared with.
+#[derive(Debug, Clone)]
+pub struct PreparedTree {
+    /// The symbol of each node.
+    symbols: Vec<u32>,
     /// Number of nodes in the subtree rooted at each node.
     sizes: Vec<u32>,
+    /// How often each symbol occurs, ordered by kind, then symbol.
+    histogram: Vec<SymbolCount>,
 }
 
-impl<'a> FlatTree<'a> {
-    fn build(root: &'a Rc<TreeNode>) -> FlatTree<'a> {
-        let node_count = root.subtree_size();
-        let mut tree = FlatTree {
-            labels: Vec::with_capacity(node_count),
-            kinds: Vec::with_capacity(node_count),
-            sizes: Vec::with_capacity(node_count),
-        };
-        let mut stack: Vec<&'a TreeNode> = vec![root];
-        while let Some(node) = stack.pop() {
-            tree.labels.push(node.label.as_str());
-            tree.kinds.push(node.kind);
-            #[allow(clippy::cast_possible_truncation)]
-            tree.sizes.push(node.subtree_size() as u32);
-            stack.extend(node.children.iter().rev().map(Rc::as_ref));
-        }
-        tree
+/// How often one symbol occurs in a tree.
+#[derive(Debug, Clone, Copy)]
+struct SymbolCount {
+    /// The kind of the symbol, numbered.
+    kind: u32,
+    symbol: u32,
+    count: u32,
+}
+
+impl PreparedTree {
+    /// Number of nodes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.symbols.len()
     }
 
-    fn len(&self) -> usize {
-        self.labels.len()
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.symbols.is_empty()
     }
 
     fn size(&self, index: usize) -> f64 {
@@ -257,15 +451,14 @@ impl<'a> FlatTree<'a> {
     }
 
     /// A hash of every subtree: equal for subtrees with the same labels,
-    /// kinds and shape.
+    /// kinds and shape, in any tree of the same table.
     fn subtree_hashes(&self) -> Vec<u64> {
         let mut hashes = vec![0u64; self.len()];
         // Children come after their parent in pre-order, so walking
         // backwards meets every child before its parent.
         for index in (0..self.len()).rev() {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            self.labels[index].hash(&mut hasher);
-            self.kinds[index].hash(&mut hasher);
+            self.symbols[index].hash(&mut hasher);
             let end = index + self.sizes[index] as usize;
             let mut child = index + 1;
             while child < end {
@@ -278,7 +471,7 @@ impl<'a> FlatTree<'a> {
     }
 }
 
-/// One edit-distance computation between two flattened trees.
+/// One edit-distance computation between two prepared trees.
 ///
 /// Every pair of nodes is visited at most once — a pair is only ever
 /// reached through the pair of its parents — so nothing is memoized. (A
@@ -288,9 +481,10 @@ impl<'a> FlatTree<'a> {
 /// and alignment rows live on two scratch stacks that are reused across
 /// the whole recursion, so a comparison allocates a handful of times, not
 /// once per node pair.
-struct Alignment<'t, 'a> {
-    tree1: &'t FlatTree<'a>,
-    tree2: &'t FlatTree<'a>,
+struct Alignment<'t> {
+    tree1: &'t PreparedTree,
+    tree2: &'t PreparedTree,
+    table: &'t SymbolTable,
     options: &'t APTEDOptions,
     /// Stack of child-cost matrices and alignment rows.
     costs: Vec<f64>,
@@ -306,11 +500,17 @@ struct Alignment<'t, 'a> {
 /// A run of one node's children on the child stack: `start..end`.
 type ChildRange = (usize, usize);
 
-impl<'t, 'a> Alignment<'t, 'a> {
-    fn new(tree1: &'t FlatTree<'a>, tree2: &'t FlatTree<'a>, options: &'t APTEDOptions) -> Self {
+impl<'t> Alignment<'t> {
+    fn new(
+        tree1: &'t PreparedTree,
+        tree2: &'t PreparedTree,
+        table: &'t SymbolTable,
+        options: &'t APTEDOptions,
+    ) -> Self {
         Self {
             tree1,
             tree2,
+            table,
             options,
             costs: Vec::new(),
             children: Vec::new(),
@@ -333,13 +533,8 @@ impl<'t, 'a> Alignment<'t, 'a> {
     /// `distance ≥ |size1 − size2| · min_op_cost` lower bound the
     /// threshold pruning in `tsed.rs`/`function_extractor.rs` relies on.
     fn distance(&mut self, i: usize, j: usize) -> f64 {
-        let rename_cost = label_rename_cost(
-            self.tree1.labels[i],
-            self.tree2.labels[j],
-            self.tree1.kinds[i],
-            self.tree2.kinds[j],
-            self.options,
-        );
+        let rename_cost =
+            self.table.rename_cost(self.tree1.symbols[i], self.tree2.symbols[j], self.options);
         if self.tree1.is_leaf(i) && self.tree2.is_leaf(j) {
             return rename_cost;
         }
@@ -660,15 +855,27 @@ fn walk_back(rounds: &[Vec<isize>], left_len: isize, right_len: isize) -> Vec<(u
     matches
 }
 
+/// The edit distance between two trees.
 #[must_use]
 pub fn compute_edit_distance(
     tree1: &Rc<TreeNode>,
     tree2: &Rc<TreeNode>,
     options: &APTEDOptions,
 ) -> f64 {
-    let flat1 = FlatTree::build(tree1);
-    let flat2 = FlatTree::build(tree2);
-    Alignment::new(&flat1, &flat2, options).distance(0, 0)
+    let mut table = SymbolTable::new();
+    let (prepared1, prepared2) = (table.prepare(tree1), table.prepare(tree2));
+    prepared_edit_distance(&prepared1, &prepared2, &table, options)
+}
+
+/// [`compute_edit_distance`] for trees prepared by `table`.
+#[must_use]
+pub fn prepared_edit_distance(
+    tree1: &PreparedTree,
+    tree2: &PreparedTree,
+    table: &SymbolTable,
+    options: &APTEDOptions,
+) -> f64 {
+    Alignment::new(tree1, tree2, table, options).distance(0, 0)
 }
 
 /// Compute the edit distance, giving up as soon as a lower bound proves
@@ -687,51 +894,38 @@ pub fn compute_edit_distance_with_cutoff(
     options: &APTEDOptions,
     max_distance: f64,
 ) -> f64 {
-    let flat1 = FlatTree::build(tree1);
-    let flat2 = FlatTree::build(tree2);
+    let mut table = SymbolTable::new();
+    let (prepared1, prepared2) = (table.prepare(tree1), table.prepare(tree2));
+    prepared_edit_distance_with_cutoff(&prepared1, &prepared2, &table, options, max_distance)
+}
 
+/// [`compute_edit_distance_with_cutoff`] for trees prepared by `table`.
+#[must_use]
+pub fn prepared_edit_distance_with_cutoff(
+    tree1: &PreparedTree,
+    tree2: &PreparedTree,
+    table: &SymbolTable,
+    options: &APTEDOptions,
+    max_distance: f64,
+) -> f64 {
     // Sound global lower bound: every edit script has to bridge the size
     // gap one delete or insert at a time. (This holds because the replace
     // branch in `Alignment::distance` charges delete + insert — see the
     // comment there.)
     let min_op_cost = options.delete_cost.min(options.insert_cost);
-    let size_gap = (flat1.size(0) - flat2.size(0)).abs();
+    let size_gap = (tree1.size(0) - tree2.size(0)).abs();
     if size_gap * min_op_cost > max_distance {
         return DISTANCE_EXCEEDED;
     }
 
-    // Label-histogram lower bound. Any edit script maps nodes 1:1 (plus
-    // deletes/inserts); a mapped pair costs 0 only when label AND kind
-    // agree, so at most `overlap` node pairs are free and every one of
-    // the remaining `max(n1, n2) - overlap` nodes on the larger side
-    // costs at least the cheapest operation. This is O(n1 + n2) and
-    // prunes the "similar size, unrelated content" pairs that the pure
-    // size-gap bound cannot touch — the case where skipping the full
-    // alignment actually matters.
-    let cheapest_edit = options.delete_cost.min(options.insert_cost).min(options.rename_cost);
-    if cheapest_edit > 0.0 {
-        let mut labels: std::collections::HashMap<(&str, &str), i64> =
-            std::collections::HashMap::with_capacity(flat1.len());
-        for index in 0..flat1.len() {
-            *labels.entry((flat1.labels[index], flat1.kinds[index])).or_insert(0) += 1;
-        }
-        let mut overlap = 0usize;
-        for index in 0..flat2.len() {
-            if let Some(count) = labels.get_mut(&(flat2.labels[index], flat2.kinds[index])) {
-                if *count > 0 {
-                    *count -= 1;
-                    overlap += 1;
-                }
-            }
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let histogram_bound = (flat1.len().max(flat2.len()) - overlap) as f64 * cheapest_edit;
-        if histogram_bound > max_distance {
-            return DISTANCE_EXCEEDED;
-        }
+    // The bound adds its terms up in another order than the alignment
+    // does; a distance that equals the budget must not lose to a rounding
+    // error in the last place.
+    if table.edit_lower_bound(tree1, tree2, options) > max_distance + LOWER_BOUND_SLACK {
+        return DISTANCE_EXCEEDED;
     }
 
-    let distance = Alignment::new(&flat1, &flat2, options).distance(0, 0);
+    let distance = prepared_edit_distance(tree1, tree2, table, options);
     if distance > max_distance {
         DISTANCE_EXCEEDED
     } else {
@@ -844,8 +1038,9 @@ mod tests {
     /// cells.
     fn distance_with_limit(t1: &Rc<TreeNode>, t2: &Rc<TreeNode>, exact_cells: usize) -> f64 {
         let options = APTEDOptions { rename_cost: 0.3, compare_values: false, ..unit_options() };
-        let (flat1, flat2) = (FlatTree::build(t1), FlatTree::build(t2));
-        let mut alignment = Alignment::new(&flat1, &flat2, &options);
+        let mut table = SymbolTable::new();
+        let (prepared1, prepared2) = (table.prepare(t1), table.prepare(t2));
+        let mut alignment = Alignment::new(&prepared1, &prepared2, &table, &options);
         alignment.exact_cells = exact_cells;
         alignment.distance(0, 0)
     }
@@ -1063,5 +1258,139 @@ mod tests {
         let distance = compute_edit_distance(&table(&[]), &table(&[3, 700, 1499]), &options);
         assert!((distance - 3.0 * 0.6).abs() < 1e-9, "{distance}");
         assert_eq!(compute_edit_distance(&table(&[]), &table(&[]), &options), 0.0);
+    }
+
+    /// A pseudo-random tree of about `budget` nodes over a small alphabet
+    /// of kinds and labels.
+    fn random_tree(next: &mut impl FnMut(usize) -> usize, budget: usize) -> Rc<TreeNode> {
+        const LEAVES: [(&str, &str); 6] = [
+            ("a", "Identifier"),
+            ("b", "Identifier"),
+            ("map", "Identifier"),
+            ("filter", "Identifier"),
+            ("1", "NumericLiteral"),
+            ("\"x\"", "StringLiteral"),
+        ];
+        const BRANCHES: [(&str, &str); 5] = [
+            ("CallExpression", "CallExpression"),
+            ("Addition", "BinaryExpression"),
+            ("Subtraction", "BinaryExpression"),
+            ("BlockStatement", "BlockStatement"),
+            ("IfStatement", "IfStatement"),
+        ];
+        if budget <= 1 || next(4) == 0 {
+            let (label, kind) = LEAVES[next(LEAVES.len())];
+            return leaf(label, kind);
+        }
+        let (label, kind) = BRANCHES[next(BRANCHES.len())];
+        let child_count = 1 + next(4);
+        let children =
+            (0..child_count).map(|_| random_tree(next, (budget - 1) / child_count)).collect();
+        node(label, kind, children)
+    }
+
+    #[test]
+    fn the_lower_bound_never_exceeds_the_distance() {
+        let mut next = random_numbers(23);
+        let option_sets = [
+            APTEDOptions { rename_cost: 0.3, compare_values: false, ..unit_options() },
+            unit_options(),
+            APTEDOptions { compare_values: true, ..unit_options() },
+            // Costs under which a rename is dearer than a delete and an
+            // insert, and asymmetric ones.
+            APTEDOptions { rename_cost: 5.0, compare_values: false, ..unit_options() },
+            APTEDOptions {
+                rename_cost: 0.4,
+                delete_cost: 0.5,
+                insert_cost: 2.0,
+                compare_values: false,
+            },
+        ];
+        let mut tight = 0;
+        for round in 0..400 {
+            let left = random_tree(&mut next, 1 + round % 40);
+            let right = random_tree(&mut next, 1 + (round * 7) % 40);
+            for options in &option_sets {
+                let mut table = SymbolTable::new();
+                let (prepared1, prepared2) = (table.prepare(&left), table.prepare(&right));
+                let bound = table.edit_lower_bound(&prepared1, &prepared2, options);
+                let distance = prepared_edit_distance(&prepared1, &prepared2, &table, options);
+                assert!(
+                    bound <= distance + 1e-9,
+                    "round {round}, {options:?}: bound {bound} > distance {distance}"
+                );
+                // The bound is symmetric in what it counts.
+                let reversed = APTEDOptions {
+                    delete_cost: options.insert_cost,
+                    insert_cost: options.delete_cost,
+                    ..options.clone()
+                };
+                let mirrored = table.edit_lower_bound(&prepared2, &prepared1, &reversed);
+                assert!((bound - mirrored).abs() < 1e-9, "round {round}: {bound} vs {mirrored}");
+                // And the cutoff built on it agrees with the plain distance.
+                let within = prepared_edit_distance_with_cutoff(
+                    &prepared1, &prepared2, &table, options, distance,
+                );
+                assert!((within - distance).abs() < 1e-9, "round {round}");
+                if distance > 0.5 {
+                    let beyond = prepared_edit_distance_with_cutoff(
+                        &prepared1,
+                        &prepared2,
+                        &table,
+                        options,
+                        distance - 0.25,
+                    );
+                    assert!(beyond >= DISTANCE_EXCEEDED, "round {round}");
+                }
+                if (bound - distance).abs() < 1e-9 {
+                    tight += 1;
+                }
+            }
+        }
+        // It is not a trivial bound: often it is the distance itself.
+        assert!(tight > 100, "{tight}");
+    }
+
+    #[test]
+    fn the_lower_bound_prices_what_differs_by_what_it_is() {
+        let options = APTEDOptions { rename_cost: 0.3, compare_values: false, ..unit_options() };
+        let bound = |left: &Rc<TreeNode>, right: &Rc<TreeNode>| {
+            let mut table = SymbolTable::new();
+            let (prepared1, prepared2) = (table.prepare(left), table.prepare(right));
+            table.edit_lower_bound(&prepared1, &prepared2, &options)
+        };
+        let call = |callee: &str, argument: Rc<TreeNode>| {
+            node("CallExpression", "CallExpression", vec![leaf(callee, "Identifier"), argument])
+        };
+        let base = call("run", leaf("1", "NumericLiteral"));
+        assert_eq!(bound(&base, &base), 0.0);
+        // A renamed identifier: one cheap rename.
+        assert!((bound(&base, &call("go", leaf("1", "NumericLiteral"))) - 0.3).abs() < 1e-9);
+        // Another literal: a rename within its kind.
+        assert!((bound(&base, &call("run", leaf("2", "NumericLiteral"))) - 0.6).abs() < 1e-9);
+        // A literal of another kind: a rename across kinds.
+        assert!((bound(&base, &call("run", leaf("\"1\"", "StringLiteral"))) - 0.9).abs() < 1e-9);
+        // One node more: an insertion.
+        let longer = node(
+            "CallExpression",
+            "CallExpression",
+            vec![leaf("run", "Identifier"), leaf("1", "NumericLiteral"), leaf("run", "Identifier")],
+        );
+        assert!((bound(&base, &longer) - 1.0).abs() < 1e-9);
+        assert!((bound(&longer, &base) - 1.0).abs() < 1e-9);
+        // The old bound charged every unmatched node the cheapest rename:
+        // three statements against three expressions were 0.9 apart, not
+        // 2.7.
+        let statements = node(
+            "BlockStatement",
+            "BlockStatement",
+            (0..3).map(|_| leaf("IfStatement", "IfStatement")).collect(),
+        );
+        let expressions = node(
+            "BlockStatement",
+            "BlockStatement",
+            (0..3).map(|_| leaf("Addition", "BinaryExpression")).collect(),
+        );
+        assert!((bound(&statements, &expressions) - 2.7).abs() < 1e-9);
     }
 }

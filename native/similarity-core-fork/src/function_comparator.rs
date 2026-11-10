@@ -3,11 +3,12 @@
 use std::cell::OnceCell;
 use std::rc::Rc;
 
+use crate::apted::{PreparedTree, SymbolTable};
 use crate::function_atoms::{dependent_statements_permuted, AtomSets, BodyStatements};
 use crate::function_extractor::{extract_functions, FunctionDefinition};
 use crate::function_fragment::parse_function_for_comparison;
 use crate::tree::TreeNode;
-use crate::tsed::{calculate_tsed, calculate_tsed_with_threshold, TSEDOptions};
+use crate::tsed::{prepared_tsed, prepared_tsed_with_threshold, TSEDOptions};
 
 #[derive(Debug, Clone)]
 pub struct SimilarityResult {
@@ -26,23 +27,34 @@ impl SimilarityResult {
     }
 }
 
-/// A function ready to be compared: its canonical tree, and what the
-/// scoring layers read off that tree. Each of those is the same for every
-/// pair the function takes part in, so it is computed once, the first time
-/// a pair gets far enough to need it.
+/// A function ready to be compared: its canonical tree, the same tree
+/// prepared for the edit distance, and what the scoring layers read off
+/// it. Each of those is the same for every pair the function takes part
+/// in, so it is computed once — the scoring layers' the first time a pair
+/// gets far enough to need it.
 struct ComparableFunction<'a> {
     func: &'a FunctionDefinition,
     tree: Rc<TreeNode>,
+    prepared: PreparedTree,
     atoms: OnceCell<AtomSets>,
     body_statements: OnceCell<Option<BodyStatements>>,
     yields_promise: OnceCell<bool>,
 }
 
 impl<'a> ComparableFunction<'a> {
-    fn parse(filename: &str, func: &'a FunctionDefinition, source: &str) -> Result<Self, String> {
+    /// Parse `func` for comparison with the other functions prepared by
+    /// `symbols`.
+    fn parse(
+        filename: &str,
+        func: &'a FunctionDefinition,
+        source: &str,
+        symbols: &mut SymbolTable,
+    ) -> Result<Self, String> {
+        let tree = parse_function_for_comparison(filename, func, source)?;
         Ok(Self {
             func,
-            tree: parse_function_for_comparison(filename, func, source)?,
+            prepared: symbols.prepare(&tree),
+            tree,
             atoms: OnceCell::new(),
             body_statements: OnceCell::new(),
             yields_promise: OnceCell::new(),
@@ -101,21 +113,23 @@ pub fn compare_functions_with_threshold(
     options: &TSEDOptions,
     threshold: f64,
 ) -> Result<f64, String> {
-    let left = ComparableFunction::parse("func1.ts", func1, source1)?;
-    let right = ComparableFunction::parse("func2.ts", func2, source2)?;
-    Ok(score_pair(&left, &right, options, threshold))
+    let mut symbols = SymbolTable::new();
+    let left = ComparableFunction::parse("func1.ts", func1, source1, &mut symbols)?;
+    let right = ComparableFunction::parse("func2.ts", func2, source2, &mut symbols)?;
+    Ok(score_pair(&left, &right, &symbols, options, threshold))
 }
 
-/// The similarity of two prepared functions.
+/// The similarity of two functions prepared by `symbols`.
 #[allow(clippy::cast_precision_loss)]
 fn score_pair(
     left: &ComparableFunction,
     right: &ComparableFunction,
+    symbols: &SymbolTable,
     options: &TSEDOptions,
     threshold: f64,
 ) -> f64 {
-    let size1 = left.tree.subtree_size() as f64;
-    let size2 = right.tree.subtree_size() as f64;
+    let size1 = left.prepared.len() as f64;
+    let size2 = right.prepared.len() as f64;
     // Pre-filter by size ratio. The minimum edit distance is at least
     // `|size1 - size2| * min(delete_cost, insert_cost)` (one tree has to
     // consume the size gap via deletes or inserts at that per-op rate),
@@ -146,19 +160,26 @@ fn score_pair(
     // a useful budget; otherwise fall through to the full computation so
     // callers that expect the exact score still get it.
     let mut similarity = if threshold > 0.0 {
-        // Reserve some headroom for the line-count penalty that may
-        // follow — be conservative so we never under-report a real
-        // duplicate. Using `threshold * 0.7` keeps the budget loose
-        // enough that the penalty layer can shave the score without
-        // pushing it below an "exact-zero" sentinel.
-        let apted_threshold = (threshold * 0.7).max(0.0);
-        let sim = calculate_tsed_with_threshold(&left.tree, &right.tree, options, apted_threshold);
+        // Every layer below only ever lowers the score — each is a factor
+        // of at most one or a cap — so a pair whose tree similarity is
+        // under the threshold stays under it, and the distance can give
+        // up at exactly the threshold. (It used to give up at 0.7 times
+        // the threshold, "for headroom": the alignment, by far the
+        // costliest step of a scan, ran to the end for every pair sharing
+        // little more than half its nodes.)
+        let sim = prepared_tsed_with_threshold(
+            &left.prepared,
+            &right.prepared,
+            symbols,
+            options,
+            threshold,
+        );
         if sim == 0.0 {
             return 0.0;
         }
         sim
     } else {
-        calculate_tsed(&left.tree, &right.tree, options)
+        prepared_tsed(&left.prepared, &right.prepared, symbols, options)
     };
 
     // Apply line-count size penalty for short functions if enabled. This is a
@@ -393,6 +414,7 @@ pub fn find_similar_function_pairs(
         function: ComparableFunction<'a>,
     }
 
+    let mut symbols = SymbolTable::new();
     let mut candidates: Vec<Candidate> = Vec::new();
     for (file_index, source) in sources.iter().enumerate() {
         for func in source.functions {
@@ -404,14 +426,15 @@ pub fn find_similar_function_pairs(
             if options.min_tokens.is_none() && func.line_count() < options.min_lines {
                 continue;
             }
-            let Ok(function) = ComparableFunction::parse(source.path, func, source.source_text)
+            let Ok(function) =
+                ComparableFunction::parse(source.path, func, source.source_text, &mut symbols)
             else {
                 continue;
             };
             // The token gate is measured on the tree that gets compared,
             // so the gate and the score agree.
             if let Some(min_tokens) = options.min_tokens {
-                let tree_size = u32::try_from(function.tree.subtree_size()).unwrap_or(u32::MAX);
+                let tree_size = u32::try_from(function.prepared.len()).unwrap_or(u32::MAX);
                 if tree_size < min_tokens {
                     continue;
                 }
@@ -435,7 +458,8 @@ pub fn find_similar_function_pairs(
                 continue;
             }
 
-            let similarity = score_pair(&left.function, &right.function, options, threshold);
+            let similarity =
+                score_pair(&left.function, &right.function, &symbols, options, threshold);
             if similarity >= threshold {
                 similar_pairs.push(SimilarFunctionPair {
                     left_file: left.file_index,

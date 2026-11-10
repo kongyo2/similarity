@@ -3,10 +3,11 @@
 
 use crate::type_extractor::TypeDefinition;
 use crate::type_normalizer::{
-    calculate_property_similarity, find_property_matches, is_discriminant_mismatch,
-    is_nominal_atom, normalize_type, NormalizationOptions, NormalizedType, PropertyMatch,
+    calculate_property_similarity, edit_distance_length, find_property_matches_with,
+    is_discriminant_mismatch, is_nominal_atom, normalize_type, Computed, NormalizationOptions,
+    NormalizedType, PropertyMatch, Remembered, Similarities,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct TypeComparisonResult {
@@ -89,6 +90,17 @@ pub fn compare_normalized_types(
     normalized2: &NormalizedType,
     options: &TypeComparisonOptions,
 ) -> TypeComparisonResult {
+    compare_normalized_types_with(normalized1, normalized2, options, &mut Computed)
+}
+
+/// [`compare_normalized_types`] with the similarities of annotations and
+/// property names taken from `similarities`.
+fn compare_normalized_types_with<'a>(
+    normalized1: &'a NormalizedType,
+    normalized2: &'a NormalizedType,
+    options: &TypeComparisonOptions,
+    similarities: &mut dyn Similarities<'a>,
+) -> TypeComparisonResult {
     if !options.allow_cross_kind_comparison && normalized1.kind != normalized2.kind {
         return TypeComparisonResult {
             similarity: 0.0,
@@ -99,7 +111,7 @@ pub fn compare_normalized_types(
         };
     }
 
-    let property_matches = find_property_matches(normalized1, normalized2);
+    let property_matches = find_property_matches_with(normalized1, normalized2, similarities);
 
     // Calculate structural similarity. Heritage is part of the contract: an
     // interface that `extends` a base carries every member of that base, so
@@ -108,7 +120,7 @@ pub fn compare_normalized_types(
     // `NonNullExpression extends LeftHandSideExpressionBase` vs
     // `VoidExpression extends UnaryExpressionBase` twins used to score as
     // near-duplicates on their shared `expression` member alone.
-    let heritage_factor = if normalized1.extends == normalized2.extends { 1.0 } else { 0.7 };
+    let heritage_factor = heritage_factor(normalized1, normalized2);
     let mut structural_similarity =
         calculate_structural_similarity(normalized1, normalized2, &property_matches)
             * heritage_factor;
@@ -155,6 +167,16 @@ pub fn compare_normalized_types(
         naming_similarity,
         differences,
         matched_properties,
+    }
+}
+
+/// What two shapes with different `extends` clauses keep of their
+/// structural similarity.
+fn heritage_factor(normalized1: &NormalizedType, normalized2: &NormalizedType) -> f64 {
+    if normalized1.extends == normalized2.extends {
+        1.0
+    } else {
+        0.7
     }
 }
 
@@ -325,6 +347,177 @@ pub struct SimilarTypePair {
     pub result: TypeComparisonResult,
 }
 
+/// A type of the scan: its normalized shape, and its members numbered for
+/// the cheap comparison that comes before the real one.
+struct ScannedType<'a> {
+    definition: &'a TypeDefinition,
+    normalized: NormalizedType,
+    /// `(property name, annotation)` of every member, each numbered across
+    /// the scan, ordered by name.
+    members: Vec<(u32, u32)>,
+}
+
+/// Numbers strings: equal strings get the same number.
+#[derive(Default)]
+struct Interner {
+    numbers: HashMap<String, u32>,
+}
+
+impl Interner {
+    /// The number of `text`, and whether it is new.
+    fn number(&mut self, text: &str) -> (u32, bool) {
+        if let Some(&number) = self.numbers.get(text) {
+            return (number, false);
+        }
+        let number = u32::try_from(self.numbers.len()).expect("fewer than 2^32 strings");
+        self.numbers.insert(text.to_string(), number);
+        (number, true)
+    }
+}
+
+/// The names and annotations of a scan, numbered.
+#[derive(Default)]
+struct MemberTable {
+    names: Interner,
+    annotations: Interner,
+    /// Per annotation, [`edit_distance_length`].
+    edit_distance_lengths: Vec<Option<usize>>,
+}
+
+impl MemberTable {
+    /// `normalized` with its members numbered.
+    fn scanned<'a>(
+        &mut self,
+        definition: &'a TypeDefinition,
+        normalized: NormalizedType,
+    ) -> ScannedType<'a> {
+        let mut members: Vec<(u32, u32)> = normalized
+            .properties
+            .iter()
+            .map(|(name, annotation)| {
+                let (annotation_number, is_new) = self.annotations.number(annotation);
+                if is_new {
+                    self.edit_distance_lengths.push(edit_distance_length(annotation));
+                }
+                (self.names.number(name).0, annotation_number)
+            })
+            .collect();
+        members.sort_unstable();
+        ScannedType { definition, normalized, members }
+    }
+
+    /// An upper bound on the similarity of two annotations: one for equal
+    /// ones, and for two that are compared by edit distance, what their
+    /// lengths allow.
+    fn annotation_similarity_bound(&self, annotation1: u32, annotation2: u32) -> f64 {
+        if annotation1 == annotation2 {
+            return 1.0;
+        }
+        match (
+            self.edit_distance_lengths[annotation1 as usize],
+            self.edit_distance_lengths[annotation2 as usize],
+        ) {
+            #[allow(clippy::cast_precision_loss)]
+            (Some(length1), Some(length2)) if length1.max(length2) > 0 => {
+                length1.min(length2) as f64 / length1.max(length2) as f64
+            }
+            _ => 1.0,
+        }
+    }
+}
+
+/// How far a bound on a similarity may fall short of the threshold before
+/// the pair is given up: the bound and the similarity add up the same
+/// terms in different orders.
+const BOUND_SLACK: f64 = 1e-9;
+
+/// An upper bound on the similarity of two types, from the names and
+/// annotations of their members alone.
+///
+/// The structural term is the summed quality of the matched members over
+/// the mean member count. A member matches by name at a quality of at most
+/// the similarity of the two annotations (see
+/// [`MemberTable::annotation_similarity_bound`]), or — renamed — a member
+/// with the very same annotation at no more than `0.95 × rename
+/// confidence`; the naming term is at most one. So two types that share
+/// few names and few annotations cannot be similar, whatever their
+/// annotations turn out to have in common — and finding that out is the
+/// expensive part: it normalizes, splits and measures strings for every
+/// pair of members.
+fn similarity_upper_bound(
+    type1: &ScannedType,
+    type2: &ScannedType,
+    table: &MemberTable,
+    options: &TypeComparisonOptions,
+    spare: &mut (Vec<u32>, Vec<u32>),
+) -> f64 {
+    let (count1, count2) = (type1.members.len(), type2.members.len());
+    if count1 == 0 && count2 == 0 {
+        // Two empty shapes compare by their names alone.
+        return f64::INFINITY;
+    }
+    if count1 == 0 || count2 == 0 {
+        // An empty shape and one with members have no structure in common.
+        return options.naming_weight;
+    }
+
+    // Members with a name both types have, and the annotations of the
+    // others.
+    let (spare1, spare2) = spare;
+    spare1.clear();
+    spare2.clear();
+    let mut by_name = 0.0;
+    let (mut i, mut j) = (0, 0);
+    while i < count1 && j < count2 {
+        let ((name1, annotation1), (name2, annotation2)) = (type1.members[i], type2.members[j]);
+        match name1.cmp(&name2) {
+            std::cmp::Ordering::Equal => {
+                by_name += table.annotation_similarity_bound(annotation1, annotation2);
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                spare1.push(annotation1);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                spare2.push(annotation2);
+                j += 1;
+            }
+        }
+    }
+    spare1.extend(type1.members[i..].iter().map(|&(_, annotation)| annotation));
+    spare2.extend(type2.members[j..].iter().map(|&(_, annotation)| annotation));
+
+    // Renamed members pair up one to one among equal annotations (see
+    // `find_property_matches`).
+    #[allow(clippy::cast_precision_loss)]
+    let rename_confidence = ((count1.min(count2) as f64 - 1.0) / 2.0).clamp(0.0, 1.0);
+    let mut renamed = 0usize;
+    if rename_confidence > 0.0 {
+        spare1.sort_unstable();
+        spare2.sort_unstable();
+        let (mut i, mut j) = (0, 0);
+        while i < spare1.len() && j < spare2.len() {
+            match spare1[i].cmp(&spare2[j]) {
+                std::cmp::Ordering::Equal => {
+                    renamed += 1;
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let structural = 2.0 * (by_name + 0.95 * rename_confidence * renamed as f64)
+        / (count1 + count2) as f64
+        * heritage_factor(&type1.normalized, &type2.normalized);
+    structural * options.structural_weight + options.naming_weight
+}
+
 /// Compare every pair of types and return those at or above `threshold`,
 /// most similar first. Types under a `// similarity-ignore` directive take
 /// no part, and two declarations of one name in one file (declaration
@@ -335,23 +528,40 @@ pub fn find_similar_types(
     threshold: f64,
     options: &TypeComparisonOptions,
 ) -> Vec<SimilarTypePair> {
-    let candidates: Vec<(&TypeDefinition, NormalizedType)> = types
+    let mut table = MemberTable::default();
+    let candidates: Vec<ScannedType> = types
         .iter()
         .filter(|type_def| !type_def.has_ignore_directive)
-        .map(|type_def| (type_def, normalize_type(type_def, &options.normalization_options)))
+        .map(|definition| {
+            table.scanned(definition, normalize_type(definition, &options.normalization_options))
+        })
         .collect();
 
+    let mut similarities = Remembered::default();
+    let mut spare = (Vec::new(), Vec::new());
     let mut similar_pairs = Vec::new();
-    for (i, (type1, normalized1)) in candidates.iter().enumerate() {
-        for (type2, normalized2) in &candidates[i + 1..] {
-            if type1.name == type2.name && type1.file_path == type2.file_path {
+    for (i, type1) in candidates.iter().enumerate() {
+        for type2 in &candidates[i + 1..] {
+            if type1.definition.name == type2.definition.name
+                && type1.definition.file_path == type2.definition.file_path
+            {
                 continue;
             }
-            let result = compare_normalized_types(normalized1, normalized2, options);
+            if similarity_upper_bound(type1, type2, &table, options, &mut spare)
+                < threshold - BOUND_SLACK
+            {
+                continue;
+            }
+            let result = compare_normalized_types_with(
+                &type1.normalized,
+                &type2.normalized,
+                options,
+                &mut similarities,
+            );
             if result.similarity >= threshold {
                 similar_pairs.push(SimilarTypePair {
-                    type1: (*type1).clone(),
-                    type2: (*type2).clone(),
+                    type1: type1.definition.clone(),
+                    type2: type2.definition.clone(),
                     result,
                 });
             }
@@ -759,5 +969,168 @@ export type UserID = "user";
              type OrderListResponses = { 200: { result: User[] }; 404: { error: string } };",
         );
         assert!(same_payloads > 0.9, "{same_payloads}");
+    }
+
+    /// Types of every kind the comparison treats specially.
+    const SHAPES: &str = r#"
+export interface User { id: string; name: string; email: string; active: boolean }
+export interface Person { id: string; name: string; email: string; active: boolean }
+export interface Customer { id: string; name: string; email?: string; active: boolean }
+export type Member = { id: string; name: string; email: string; active: boolean };
+// Renamed twins, and types that only share annotations.
+export interface Address { street: string; city: string; zip: string }
+export interface Location { line: string; town: string; postal: string }
+export interface Size { width: number; height: number; depth: number }
+// Same names, different contracts.
+export interface Loader { load(id: string): Promise<User>; size: number }
+export interface SyncLoader { load(id: string): User; size: number }
+export interface OrderLoader { load(id: string): Promise<Order>; size: number }
+// Heritage.
+export interface Admin extends User { level: number; scope: string }
+export interface Auditor extends Person { level: number; scope: string }
+export interface Operator extends User { level: number; scope: string }
+// Discriminated variants.
+export interface Created { kind: "created"; at: Date; by: string }
+export interface Deleted { kind: "deleted"; at: Date; by: string }
+// Empty shapes, atoms, unions, index signatures, call signatures.
+export interface EmptyA {}
+export interface EmptyB {}
+export interface Marker {}
+export type UserId = string;
+export type UserID = string;
+export type OrderId = string;
+export type Status = "open" | "closed" | "pending";
+export type State = "open" | "closed" | "pending";
+export type Phase = "open" | "closed";
+export interface Dictionary { [key: string]: number }
+export interface Lookup { [key: string]: number }
+export interface Flags { [key: string]: boolean }
+export interface Handler { (request: Request): Response }
+export interface Listener { (request: Request): Response }
+export interface Factory { new (options: Options): Widget }
+// One member, two members.
+export interface Versioned { version: string }
+export interface Acted { resultingAction: string }
+export interface Point { x: number; y: number }
+export interface Offset { left: number; top: number }
+// Shapes without a rule of their own: compared by edit distance.
+export type Pair = [first: string, second: number];
+export type Couple = [first: string, second: number];
+export type Triple = [first: string, second: number, third: boolean, fourth: Date, fifth: RegExp];
+export type Flag<T> = T extends string ? "text" : T extends number ? "count" : never;
+export type Mark<T> = T extends string ? "text" : T extends number ? "total" : never;
+export type Keys<T> = { [K in keyof T]: K };
+export type Values<T> = { [K in keyof T]: T[K] };
+export type Getters<T> = { [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K] };
+export interface Holder { pair: [first: string, second: number]; flag: keyof Size }
+export interface Keeper { pair: [first: string, second: number, third: boolean, fourth: Date]; flag: keyof Size }
+export interface Wide {
+    a: string; b: string; c: string; d: string; e: string; f: string; g: string; h: string;
+    i: number; j: number; k: number; l: number; m: boolean; n: boolean; o: Date; p: Date;
+}
+export interface Wider {
+    a: string; b: string; c: string; d: string; e: string; f: string; g: string; h: string;
+    i: number; j: number; k: number; l: number; m: boolean; n: boolean; o: Date; q: Date;
+}
+"#;
+
+    #[test]
+    fn the_upper_bound_never_falls_below_the_similarity() {
+        let types = extracted(SHAPES);
+        assert!(types.len() > 35, "{}", types.len());
+        let option_sets = [
+            TypeComparisonOptions::default(),
+            TypeComparisonOptions { allow_cross_kind_comparison: false, ..Default::default() },
+            TypeComparisonOptions {
+                structural_weight: 0.5,
+                naming_weight: 0.5,
+                ..Default::default()
+            },
+        ];
+        for options in &option_sets {
+            let mut table = MemberTable::default();
+            let scanned: Vec<ScannedType> = types
+                .iter()
+                .map(|definition| {
+                    table.scanned(
+                        definition,
+                        normalize_type(definition, &options.normalization_options),
+                    )
+                })
+                .collect();
+            let mut spare = (Vec::new(), Vec::new());
+            let mut tight = 0;
+            for type1 in &scanned {
+                for type2 in &scanned {
+                    let bound = similarity_upper_bound(type1, type2, &table, options, &mut spare);
+                    let similarity =
+                        compare_normalized_types(&type1.normalized, &type2.normalized, options)
+                            .similarity;
+                    assert!(
+                        bound >= similarity - 1e-12,
+                        "{} vs {}: bound {bound} < similarity {similarity}",
+                        type1.definition.name,
+                        type2.definition.name
+                    );
+                    if (bound - similarity).abs() < 1e-9 {
+                        tight += 1;
+                    }
+                }
+            }
+            // Not a trivial bound: it is reached, and it rules pairs out.
+            assert!(tight >= scanned.len() / 2, "{tight}");
+            let ruled_out = scanned
+                .iter()
+                .flat_map(|type1| scanned.iter().map(move |type2| (type1, type2)))
+                .filter(|(type1, type2)| {
+                    similarity_upper_bound(type1, type2, &table, options, &mut spare) < 0.8
+                })
+                .count();
+            assert!(ruled_out > scanned.len() * scanned.len() / 2, "{ruled_out}");
+        }
+    }
+
+    #[test]
+    fn the_scan_reports_what_comparing_every_pair_reports() {
+        let types = extracted(SHAPES);
+        for options in [
+            TypeComparisonOptions::default(),
+            TypeComparisonOptions { allow_cross_kind_comparison: false, ..Default::default() },
+        ] {
+            for threshold in [0.0, 0.3, 0.5, 0.8, 0.95, 1.0] {
+                let mut expected: Vec<(String, String, f64, f64, f64)> = Vec::new();
+                for (i, type1) in types.iter().enumerate() {
+                    for type2 in &types[i + 1..] {
+                        let result = compare_types(type1, type2, &options);
+                        if result.similarity >= threshold {
+                            expected.push((
+                                type1.name.clone(),
+                                type2.name.clone(),
+                                result.similarity,
+                                result.structural_similarity,
+                                result.naming_similarity,
+                            ));
+                        }
+                    }
+                }
+                expected.sort_by(|a, b| b.2.total_cmp(&a.2));
+                let scanned: Vec<(String, String, f64, f64, f64)> =
+                    find_similar_types(&types, threshold, &options)
+                        .into_iter()
+                        .map(|pair| {
+                            (
+                                pair.type1.name,
+                                pair.type2.name,
+                                pair.result.similarity,
+                                pair.result.structural_similarity,
+                                pair.result.naming_similarity,
+                            )
+                        })
+                        .collect();
+                assert_eq!(scanned, expected, "threshold {threshold}");
+            }
+        }
+        // The fixtures do hold duplicates.
+        assert!(find_similar_types(&types, 0.8, &TypeComparisonOptions::default()).len() > 8);
     }
 }

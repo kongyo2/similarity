@@ -1,5 +1,6 @@
 use crate::apted::{
-    compute_edit_distance, compute_edit_distance_with_cutoff, APTEDOptions, DISTANCE_EXCEEDED,
+    prepared_edit_distance, prepared_edit_distance_with_cutoff, APTEDOptions, PreparedTree,
+    SymbolTable, DISTANCE_EXCEEDED,
 };
 use crate::tree::TreeNode;
 use std::rc::Rc;
@@ -52,12 +53,24 @@ impl Default for TSEDOptions {
 /// * functions ≥30 nodes pay no short-function penalty — APTED's
 ///   normalized distance is already well-calibrated there.
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
 pub fn calculate_tsed(tree1: &Rc<TreeNode>, tree2: &Rc<TreeNode>, options: &TSEDOptions) -> f64 {
-    let distance = compute_edit_distance(tree1, tree2, &options.apted_options);
-    let size1 = tree1.subtree_size() as f64;
-    let size2 = tree2.subtree_size() as f64;
-    finalize_tsed_similarity(distance, size1, size2, options)
+    let mut table = SymbolTable::new();
+    let (prepared1, prepared2) = (table.prepare(tree1), table.prepare(tree2));
+    prepared_tsed(&prepared1, &prepared2, &table, options)
+}
+
+/// [`calculate_tsed`] for trees prepared by `table`: a scan prepares each
+/// function once, not once per pair it takes part in.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn prepared_tsed(
+    tree1: &PreparedTree,
+    tree2: &PreparedTree,
+    table: &SymbolTable,
+    options: &TSEDOptions,
+) -> f64 {
+    let distance = prepared_edit_distance(tree1, tree2, table, &options.apted_options);
+    finalize_tsed_similarity(distance, tree1.len() as f64, tree2.len() as f64, options)
 }
 
 /// Variant of [`calculate_tsed`] that aborts early when the maximum
@@ -66,20 +79,34 @@ pub fn calculate_tsed(tree1: &Rc<TreeNode>, tree2: &Rc<TreeNode>, options: &TSED
 /// `calculate_tsed` to within floating-point noise — so this is purely a
 /// performance hint with no accuracy impact.
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
 pub fn calculate_tsed_with_threshold(
     tree1: &Rc<TreeNode>,
     tree2: &Rc<TreeNode>,
     options: &TSEDOptions,
     threshold: f64,
 ) -> f64 {
-    let size1 = tree1.subtree_size() as f64;
-    let size2 = tree2.subtree_size() as f64;
+    let mut table = SymbolTable::new();
+    let (prepared1, prepared2) = (table.prepare(tree1), table.prepare(tree2));
+    prepared_tsed_with_threshold(&prepared1, &prepared2, &table, options, threshold)
+}
+
+/// [`calculate_tsed_with_threshold`] for trees prepared by `table`.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn prepared_tsed_with_threshold(
+    tree1: &PreparedTree,
+    tree2: &PreparedTree,
+    table: &SymbolTable,
+    options: &TSEDOptions,
+    threshold: f64,
+) -> f64 {
+    let size1 = tree1.len() as f64;
+    let size2 = tree2.len() as f64;
     let max_size = size1.max(size2);
     if max_size == 0.0 {
         return 1.0;
     }
-    // Maximum APTED distance that could still yield similarity ≥ threshold:
+    // Maximum edit distance that could still yield similarity ≥ threshold:
     //   similarity = 1 - distance / max_size ≥ threshold
     //   ⇒ distance ≤ max_size × (1 − threshold)
     // The penalty layer can only further reduce the similarity, so any
@@ -88,8 +115,13 @@ pub fn calculate_tsed_with_threshold(
     // borderline case where distance is exactly on the boundary.
     let max_distance = (max_size * (1.0 - threshold) + 1e-9).max(0.0);
 
-    let distance =
-        compute_edit_distance_with_cutoff(tree1, tree2, &options.apted_options, max_distance);
+    let distance = prepared_edit_distance_with_cutoff(
+        tree1,
+        tree2,
+        table,
+        &options.apted_options,
+        max_distance,
+    );
     if distance >= DISTANCE_EXCEEDED {
         return 0.0;
     }
