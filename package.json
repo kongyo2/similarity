@@ -1,6 +1,6 @@
 {
   "name": "@kongyo2/similarity-ts",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "CLI and library for TypeScript code similarity analysis",
   "type": "module",
   "bin": {
@@ -37,6 +37,7 @@
     "prepack": "npm run clean && npm run build && npm run build:wasm && npm run typecheck",
     "metrics:baseline": "mkdir -p docs && tsx scripts/baseline-metrics.ts > docs/baseline-metrics.md",
     "bench:accuracy": "tsx scripts/accuracy-benchmark.ts",
+    "bench:accuracy:report": "tsx scripts/accuracy-benchmark.ts > docs/accuracy-benchmark.md",
     "build:wasm": "node scripts/build-wasm.mjs"
   },
   "keywords": [

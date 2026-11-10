@@ -26,6 +26,7 @@
  */
 
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -143,7 +144,11 @@ async function runCase(benchCase: BenchCase): Promise<PairOutcome[]> {
   }
 }
 
+/** The version of the package whose engine is measured. */
+const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
+
 interface Summary {
+  version: string;
   generatedAt: string;
   threshold: number;
   minLines: number;
@@ -178,6 +183,7 @@ function summarize(outcomes: PairOutcome[]): Summary {
   }
 
   return {
+    version,
     generatedAt: new Date().toISOString(),
     threshold: DEFAULT_THRESHOLD,
     minLines: DEFAULT_MIN_LINES,
@@ -205,6 +211,8 @@ function formatObserved(observed: number | null): string {
 function toMarkdown(summary: Summary, outcomes: PairOutcome[], verbose: boolean): string {
   const lines: string[] = [
     "# Refactoring Accuracy Benchmark",
+    "",
+    `Engine: v${summary.version}`,
     "",
     `Generated at: ${summary.generatedAt}`,
     "",
