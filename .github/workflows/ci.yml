@@ -6,17 +6,25 @@ on:
     branches:
       - main
 
+# A new push to a pull request replaces the run of the previous one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
 jobs:
   lint-and-typecheck:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       - name: Install dependencies
@@ -32,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -54,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -67,19 +75,27 @@ jobs:
       - name: Run Rust tests
         run: cargo test --manifest-path native/Cargo.toml --workspace --locked
 
-  # Builds the real WASM engine and runs the full vitest suite against it,
-  # including the labeled-corpus accuracy gate (337 pairs): every labeled
-  # pair must classify correctly — any mislabel fails the suite.
+  # Builds the real WASM engine and runs the full vitest suite against it on
+  # every Node line the toolchain runs on, including the labeled-corpus
+  # accuracy gate (364 pairs): every labeled pair must classify correctly —
+  # any mislabel fails the suite.
   tests-and-accuracy:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24, 26]
+    # The run on the primary Node keeps the plain name, which branch
+    # protection may list as a required check.
+    name: ${{ matrix.node-version == 24 && 'tests-and-accuracy' || format('tests-and-accuracy (Node {0})', matrix.node-version) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - name: Setup Rust
@@ -103,3 +119,72 @@ jobs:
 
       - name: Run tests (includes accuracy benchmark gate)
         run: npm test
+
+  # Packs the package the way `npm publish` does.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pack
+        run: npm pack
+
+      - name: Upload the tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: package
+          path: kongyo2-similarity-ts-*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  # Installs the tarball into an empty project and uses it, command and
+  # library, on every Node line the package supports. That includes Node 20,
+  # which the build and test tools no longer run on.
+  package-smoke:
+    needs: package
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24, 26]
+    name: package-smoke (Node ${{ matrix.node-version }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Download the tarball
+        uses: actions/download-artifact@v8
+        with:
+          name: package
+          path: package
+
+      - name: Install and use the package
+        run: node scripts/smoke-package.mjs package/kongyo2-similarity-ts-*.tgz
