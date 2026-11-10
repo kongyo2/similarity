@@ -81,7 +81,7 @@ export class Path {
             DeclarationKinds { functions: true, types: true, type_literals: true, classes: true };
         let declarations = extract_declarations("shapes.ts", SOURCE, all).unwrap();
         let functions: Vec<&str> = declarations.functions.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(functions, vec!["norm", "add"]);
+        assert_eq!(functions, vec!["norm", "Path.add"]);
         assert_eq!(declarations.types.len(), 1);
         assert_eq!(declarations.type_literals.len(), 1);
         assert_eq!(declarations.type_literals[0].name, "norm (parameter: point)");

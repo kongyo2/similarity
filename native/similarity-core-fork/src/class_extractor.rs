@@ -5,7 +5,7 @@ use oxc_ast::ast::{
     ClassElement, Declaration, ExportDefaultDeclarationKind, Expression, FormalParameter,
     FormalParameters, Function, MethodDefinition, MethodDefinitionKind, Program, PropertyKey,
     Statement, TSAccessibility, TSModuleDeclaration, TSModuleDeclarationBody, TSType,
-    TSTypeAnnotation, TSTypeParameterDeclaration, UnaryOperator,
+    TSTypeAnnotation, TSTypeParameterDeclaration, UnaryOperator, VariableDeclaration,
 };
 use oxc_span::{GetSpan, Span};
 use std::hash::{Hash, Hasher};
@@ -111,7 +111,8 @@ impl<'s> ClassExtractor<'s> {
         Self { source_text, file_path, lines, types }
     }
 
-    /// Every class declaration of the file, namespaces included.
+    /// Every class the file declares at the top level or in a namespace:
+    /// class declarations, and class expressions bound to a name.
     #[must_use]
     pub fn extract_classes(&self, program: &Program) -> Vec<ClassDefinition> {
         let mut classes = Vec::new();
@@ -144,14 +145,25 @@ impl<'s> ClassExtractor<'s> {
     ) {
         let ignored = ignored || self.directive_above(statement.span().start);
         match statement {
-            Statement::ExportDefaultDeclaration(export) => {
-                if let ExportDefaultDeclarationKind::ClassDeclaration(class) = &export.declaration {
-                    classes.push(self.extract_class(class, qualifier, ignored));
+            Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+                ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                    classes.push(self.extract_class(class, None, qualifier, ignored));
                 }
-            }
+                // `export default (class { … })`.
+                other => {
+                    if let Some(Expression::ClassExpression(class)) =
+                        other.as_expression().map(Expression::get_inner_expression)
+                    {
+                        classes.push(self.extract_class(class, None, qualifier, ignored));
+                    }
+                }
+            },
             Statement::ExportNamedDeclaration(export) => match &export.declaration {
                 Some(Declaration::ClassDeclaration(class)) => {
-                    classes.push(self.extract_class(class, qualifier, ignored));
+                    classes.push(self.extract_class(class, None, qualifier, ignored));
+                }
+                Some(Declaration::VariableDeclaration(declaration)) => {
+                    self.extract_bound_classes(declaration, classes, qualifier, ignored);
                 }
                 Some(Declaration::TSModuleDeclaration(module)) => {
                     self.extract_classes_from_module(module, classes, qualifier, ignored);
@@ -159,7 +171,10 @@ impl<'s> ClassExtractor<'s> {
                 _ => {}
             },
             Statement::ClassDeclaration(class) => {
-                classes.push(self.extract_class(class, qualifier, ignored));
+                classes.push(self.extract_class(class, None, qualifier, ignored));
+            }
+            Statement::VariableDeclaration(declaration) => {
+                self.extract_bound_classes(declaration, classes, qualifier, ignored);
             }
             // `namespace`/`module` blocks are ordinary declaration scopes
             // for the classes inside them; they used to be skipped. Their
@@ -169,6 +184,33 @@ impl<'s> ClassExtractor<'s> {
                 self.extract_classes_from_module(module, classes, qualifier, ignored);
             }
             _ => {}
+        }
+    }
+
+    /// `const Store = class { … }` declares a class as much as `class Store
+    /// { … }` does. Parentheses and `as`/`satisfies` wrappers around the
+    /// expression are transparent, as they are around a bound function.
+    fn extract_bound_classes(
+        &self,
+        declaration: &VariableDeclaration,
+        classes: &mut Vec<ClassDefinition>,
+        qualifier: &str,
+        ignored: bool,
+    ) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(binding) = &declarator.id else {
+                continue;
+            };
+            if let Some(Expression::ClassExpression(class)) =
+                declarator.init.as_ref().map(Expression::get_inner_expression)
+            {
+                classes.push(self.extract_class(
+                    class,
+                    Some(binding.name.as_str()),
+                    qualifier,
+                    ignored,
+                ));
+            }
         }
     }
 
@@ -298,13 +340,19 @@ impl<'s> ClassExtractor<'s> {
         pieces.join(", ")
     }
 
+    /// `binding` is the name a class expression is bound to — the name the
+    /// rest of the module knows the class by, whatever it calls itself.
     /// `qualifier` is the dotted path of the enclosing `namespace`/`module`
     /// blocks (`""` at the top level); see [`crate::module_scope`].
-    fn extract_class(&self, class: &Class, qualifier: &str, ignored: bool) -> ClassDefinition {
-        let name = qualified_name(
-            qualifier,
-            class.id.as_ref().map_or("AnonymousClass", |id| id.name.as_str()),
-        );
+    fn extract_class(
+        &self,
+        class: &Class,
+        binding: Option<&str>,
+        qualifier: &str,
+        ignored: bool,
+    ) -> ClassDefinition {
+        let own_name = class.id.as_ref().map(|id| id.name.as_str());
+        let name = qualified_name(qualifier, binding.or(own_name).unwrap_or("AnonymousClass"));
 
         // Heritage is recorded as written. Only bare identifiers used to
         // survive, so a qualified base (`React.Component`), a mixin call
@@ -1289,5 +1337,69 @@ export namespace Legacy {
         let classes = extract_classes_from_code(source, "test.ts").unwrap();
         let names: Vec<&str> = classes.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["Legacy.Pager", "Legacy.Inner.Hidden"]);
+    }
+
+    #[test]
+    fn class_expressions_bound_to_a_name_are_extracted() {
+        let source = r"
+export const UserStore = class {
+    items = new Map<string, User>();
+    load(id: string): User | undefined { return this.items.get(id); }
+};
+// Known to the module by its binding, whatever the class calls itself.
+const Internal = (class Named extends Base {
+    size = 0;
+}) satisfies Constructor;
+export namespace Legacy {
+    export const Pager = class { advance(): void {} };
+}
+// similarity-ignore
+const Skipped = class { size = 0; };
+// Not a class the module declares: built where it is used.
+const made = make(class { size = 0; });
+export default (class { size = 0; });
+";
+        let classes = extract_classes_from_code(source, "test.ts").unwrap();
+        let found: Vec<(&str, usize, usize, bool)> = classes
+            .iter()
+            .map(|c| (c.name.as_str(), c.start_line, c.end_line, c.has_ignore_directive))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("UserStore", 2, 5, false),
+                ("Internal", 7, 9, false),
+                ("Legacy.Pager", 11, 11, false),
+                ("Skipped", 14, 14, true),
+                ("AnonymousClass", 17, 17, false),
+            ]
+        );
+        let store = &classes[0];
+        assert_eq!(store.properties.len(), 1);
+        assert_eq!(store.methods.len(), 1);
+        assert_eq!(classes[1].extends.as_deref(), Some("Base"));
+    }
+
+    #[test]
+    fn a_class_expression_compares_like_the_declaration_it_stands_for() {
+        let declared = r"
+export class Store {
+    private items = new Map<string, Item>();
+    constructor(private readonly audit: Audit) {}
+    load(id: string): Item | undefined { return this.items.get(id); }
+    save(item: Item): void { this.items.set(item.id, item); this.audit.record(item.id); }
+}
+";
+        let bound = declared.replace("export class Store {", "export const Store = class {");
+        let mut declared_classes = extract_classes_from_code(declared, "test.ts").unwrap();
+        let mut bound_classes = extract_classes_from_code(&bound, "test.ts").unwrap();
+        assert_eq!((declared_classes.len(), bound_classes.len()), (1, 1));
+        let (declaration, expression) = (declared_classes.remove(0), bound_classes.remove(0));
+        let result = crate::class_comparator::compare_classes(&declaration, &expression);
+        assert!(
+            (result.similarity - 1.0).abs() < 1e-9,
+            "expected identical classes, got {}",
+            result.similarity
+        );
     }
 }

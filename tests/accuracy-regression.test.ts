@@ -30,6 +30,18 @@ function hasPair(pairs: SimilarityPair[], leftName: string, rightName: string): 
   });
 }
 
+/** The similarity the report gives a pair of symbols, if it lists the pair. */
+function similarityOf(
+  pairs: SimilarityPair[],
+  leftName: string,
+  rightName: string,
+): number | undefined {
+  const wanted = [leftName, rightName].sort().join("\u0000");
+  return pairs.find(
+    (pair) => [pair.left.symbolName, pair.right.symbolName].sort().join("\u0000") === wanted,
+  )?.similarity;
+}
+
 async function analyzeTempProject(
   projectDir: string,
   modes: AnalyzerMode[],
@@ -625,7 +637,9 @@ export class CustomerRepository {
         minLines: 3,
       });
 
-      expect(hasPair(report.byMode.functions, "findById", "findById")).toBe(true);
+      expect(
+        hasPair(report.byMode.functions, "UserRepository.findById", "CustomerRepository.findById"),
+      ).toBe(true);
     });
   });
 
@@ -801,7 +815,9 @@ export class CustomerRepository {
         minLines: 3,
       });
 
-      expect(hasPair(report.byMode.functions, "findById", "findById")).toBe(true);
+      expect(
+        hasPair(report.byMode.functions, "UserRepository.findById", "CustomerRepository.findById"),
+      ).toBe(true);
     });
   });
 
@@ -1013,33 +1029,20 @@ export class HelperC {
         minLines: 3,
       });
 
-      const findSim = (a: string, b: string, kindA: string, kindB: string) =>
-        report.byMode.functions.find((pair) => {
-          const sides = [pair.left, pair.right];
-          return sides.some((s) => s.symbolName === a && s.kind === kindA)
-            && sides.some((s) => s.symbolName === b && s.kind === kindB);
-        })?.similarity;
+      const functions = report.byMode.functions;
+      const instanceTwins = similarityOf(functions, "HelperB.createAlpha", "HelperC.createAlpha");
+      const staticAndInstance = [
+        similarityOf(functions, "HelperA.createAlpha", "HelperB.createAlpha"),
+        similarityOf(functions, "HelperA.createAlpha", "HelperC.createAlpha"),
+      ];
 
-      const sameKindSim = findSim("createAlpha", "createAlpha", "method", "method");
-      // The static-vs-instance pair appears once; either side may be the
-      // method-kind in the report so we just look for any pair whose
-      // similarity is strictly below the instance-vs-instance match.
-      const allCreateAlphaPairs = report.byMode.functions.filter((pair) =>
-        pair.left.symbolName === "createAlpha" && pair.right.symbolName === "createAlpha",
-      );
-
-      expect(sameKindSim).toBeDefined();
       // Two identical instance methods are a perfect tree match.
-      expect(sameKindSim!).toBeGreaterThan(0.97);
-      // The static-vs-instance pair must score visibly lower.
-      const crossModifierMax = Math.max(
-        ...allCreateAlphaPairs
-          .filter((pair) => pair.similarity < sameKindSim! - 0.001)
-          .map((pair) => pair.similarity),
-        -1,
-      );
-      expect(crossModifierMax).toBeGreaterThanOrEqual(0);
-      expect(crossModifierMax).toBeLessThan(sameKindSim! - 0.02);
+      expect(instanceTwins).toBeGreaterThan(0.97);
+      // The static method against either of them must score visibly lower.
+      for (const similarity of staticAndInstance) {
+        expect(similarity).toBeDefined();
+        expect(similarity).toBeLessThan((instanceTwins as number) - 0.02);
+      }
     });
   });
 
@@ -1154,16 +1157,14 @@ export class Storage {
         sameFileOnly: true,
       });
 
-      const pair = report.byMode.functions.find((p) =>
-        ([p.left.symbolName, p.right.symbolName].sort().join(",") === ["#load", "#save"].sort().join(",")),
-      );
+      const similarity = similarityOf(report.byMode.functions, "Storage.#load", "Storage.#save");
 
-      expect(pair).toBeDefined();
+      expect(similarity).toBeDefined();
       // The bodies differ only by a string literal, so similarity is high,
       // but it must stay below the perfect-match floor the broken wrapper
       // produced — two distinct private identifiers should never compare
       // as identical.
-      expect(pair!.similarity).toBeLessThan(0.999);
+      expect(similarity).toBeLessThan(0.999);
     });
   });
 

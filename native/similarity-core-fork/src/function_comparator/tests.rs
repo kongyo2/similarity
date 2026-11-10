@@ -39,19 +39,22 @@ fn test_extract_functions() {
     let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
     assert!(names.contains(&"add"));
     assert!(names.contains(&"multiply"));
-    assert!(names.contains(&"constructor"));
-    assert!(names.contains(&"subtract"));
+    // Members are named under their class.
+    assert!(names.contains(&"Calculator.constructor"));
+    assert!(names.contains(&"Calculator.add"));
+    assert!(names.contains(&"Calculator.subtract"));
     assert!(names.contains(&"divide"));
 
     // Check function types
-    let add_func = functions.iter().find(|f| f.name == "add" && f.class_name.is_none()).unwrap();
+    let add_func = functions.iter().find(|f| f.name == "add").unwrap();
+    assert_eq!(add_func.class_name, None);
     assert_eq!(add_func.function_type, FunctionType::Function);
     assert_eq!(add_func.parameters, vec!["a", "b"]);
 
     let multiply_func = functions.iter().find(|f| f.name == "multiply").unwrap();
     assert_eq!(multiply_func.function_type, FunctionType::Arrow);
 
-    let constructor = functions.iter().find(|f| f.name == "constructor").unwrap();
+    let constructor = functions.iter().find(|f| f.name == "Calculator.constructor").unwrap();
     assert_eq!(constructor.function_type, FunctionType::Constructor);
     assert_eq!(constructor.class_name, Some("Calculator".to_string()));
 }
@@ -782,13 +785,13 @@ const handlers = {
         ignored_flags(code),
         [
             // The directive sits above the decorator of the class.
-            flag("load", true),
-            flag("save", true),
+            flag("Legacy.load", true),
+            flag("Legacy.save", true),
             // A directive above one member is that member's alone.
-            flag("load", false),
-            flag("generated", true),
-            flag("after", false),
-            flag("parse", true),
+            flag("Current.load", false),
+            flag("Current.generated", true),
+            flag("Current.after", false),
+            flag("Generated.parse", true),
             flag("helper", true),
             flag("outer", true),
             flag("inner", true),
@@ -876,9 +879,9 @@ const table = {
                 "function recur(a: number): number { return a > 0 ? recur(a - 1) : a; }"
             ),
             ("default", SourceForm::Expression, "function (a: number) { return a; }"),
-            ("method", SourceForm::ClassMember, "method(a: number) { return a; }"),
-            ("field", SourceForm::Expression, "(a: number) => a"),
-            ("size", SourceForm::ClassMember, "get size() { return 1; }"),
+            ("Box.method", SourceForm::ClassMember, "method(a: number) { return a; }"),
+            ("Box.field", SourceForm::Expression, "(a: number) => a"),
+            ("Box.size", SourceForm::ClassMember, "get size() { return 1; }"),
             ("table.member", SourceForm::ObjectMember, "member(a: number) { return a; }"),
             (
                 "table.valued",
@@ -925,7 +928,7 @@ export abstract class Store {
 ";
     let functions = extract_functions("test.ts", code).unwrap();
     let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, vec!["visit", "remove"]);
+    assert_eq!(names, vec!["visit", "Store.remove"]);
 }
 
 #[test]
@@ -953,15 +956,131 @@ export class Relay {
 ";
     let functions = extract_functions("test.ts", code).unwrap();
     let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, vec!["parse", "normalize", "deep", "handle", "tick"]);
+    // Each is named by the path that leads to it.
+    assert_eq!(
+        names,
+        vec!["parse", "Legacy.normalize", "Legacy.Inner.deep", "Relay.handle", "Relay.tick"]
+    );
     assert_eq!(functions[0].function_type, FunctionType::Function);
-    let handle = functions.iter().find(|f| f.name == "handle").unwrap();
+    let handle = functions.iter().find(|f| f.name == "Relay.handle").unwrap();
     assert_eq!(handle.function_type, FunctionType::Method);
     assert_eq!(handle.class_name.as_deref(), Some("Relay"));
     assert!(!handle.is_arrow_expression);
-    let tick = functions.iter().find(|f| f.name == "tick").unwrap();
+    let tick = functions.iter().find(|f| f.name == "Relay.tick").unwrap();
     assert!(tick.is_static);
     assert!(tick.is_arrow_expression);
+}
+
+#[test]
+fn a_function_is_named_by_the_path_that_leads_to_it() {
+    let code = r"
+export namespace Legacy {
+    export class Repo {
+        constructor(private rows: Row[]) {}
+        find(id: string) {
+            // What a function declares for itself, no path leads to.
+            const matches = (row: Row) => row.id === id;
+            class Probe {
+                check(row: Row) { return matches(row); }
+            }
+            return this.rows.find((row) => new Probe().check(row));
+        }
+    }
+    export const handlers = {
+        onSave(row: Row) { return row.id; },
+        200: (row: Row) => row.id,
+        nested: { onClose: (row: Row) => row.id },
+    };
+    export const trim = (text: string) => text.trim();
+    export const parse = function (text: string) { return text.trim(); };
+}
+declare module 'legacy' {
+    // A string-named module scopes like a file.
+    export function ambient(text: string): string { return text; }
+}
+";
+    let functions = extract_functions("test.ts", code).unwrap();
+    let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "Legacy.Repo.constructor",
+            "Legacy.Repo.find",
+            "matches",
+            "Probe.check",
+            "Legacy.handlers.onSave",
+            "Legacy.handlers[200]",
+            "Legacy.handlers.nested.onClose",
+            "Legacy.trim",
+            "Legacy.parse",
+            "ambient",
+        ]
+    );
+    // The path is how a function is reported, not what its body calls it:
+    // a namespaced arrow still recurses through its own binding.
+    let trim = functions.iter().find(|f| f.name == "Legacy.trim").unwrap();
+    assert_eq!(trim.display_name, "trim");
+    let parse = functions.iter().find(|f| f.name == "Legacy.parse").unwrap();
+    assert_eq!(parse.display_name, "parse");
+    assert_eq!(parse.self_alias, None);
+}
+
+#[test]
+fn a_namespace_does_not_change_how_its_functions_compare() {
+    let top_level = r"
+export const countdown = (n: number): number => (n > 0 ? countdown(n - 1) : n);
+export const factorial = function recur(n: number): number {
+    return n > 1 ? n * recur(n - 1) : factorial(1);
+};
+";
+    let namespaced = format!("export namespace Legacy {{{top_level}}}\n");
+    let fragments = |code: &str| -> Vec<String> {
+        extract_functions("test.ts", code)
+            .unwrap()
+            .iter()
+            .map(|function| build_normalized_fragment(function, code).text)
+            .collect()
+    };
+    assert_eq!(fragments(top_level), fragments(&namespaced));
+}
+
+#[test]
+fn the_members_of_a_class_expression_bound_to_a_name_are_extracted() {
+    let code = r"
+export const UserStore = class {
+    load(id: string) {
+        const found = this.items.get(id);
+        if (found === undefined) {
+            throw new Error('missing ' + id);
+        }
+        return found;
+    }
+};
+// Known to the module by its binding, whatever the class calls itself.
+const Internal = (class Named extends Base {
+    static create = () => new Named();
+}) satisfies Constructor;
+export default class {
+    load(id: string) {
+        const found = this.items.get(id);
+        if (found === undefined) {
+            throw new Error('missing ' + id);
+        }
+        return found;
+    }
+}
+";
+    let functions = extract_functions("test.ts", code).unwrap();
+    let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["UserStore.load", "Internal.create", "default.load"]);
+    assert_eq!(functions[0].function_type, FunctionType::Method);
+    assert_eq!((functions[0].start_line, functions[0].end_line), (3, 9));
+
+    let options = TSEDOptions::default();
+    let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
+    let paired: Vec<(&str, &str)> =
+        pairs.iter().map(|pair| (pair.func1.name.as_str(), pair.func2.name.as_str())).collect();
+    assert_eq!(paired, vec![("UserStore.load", "default.load")]);
 }
 
 #[test]
@@ -1041,7 +1160,7 @@ export class TapRelay {
 ";
     let functions = extract_functions("test.ts", code).unwrap();
     let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, vec!["handle", "handle"]);
+    assert_eq!(names, vec!["Relay.handle", "TapRelay.handle"]);
     assert_eq!(functions[0].class_name.as_deref(), Some("Relay"));
     let options = TSEDOptions::default();
     let pairs = find_similar_functions_in_file("test.ts", code, 0.8, &options).unwrap();
@@ -1080,7 +1199,16 @@ export class Mapper {
 "#;
     let functions = extract_functions("test.ts", code).unwrap();
     let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, vec!["alpha", "[Symbol.iterator]", "0", "#hidden", "[\"dyn\" + \"amic\"]"]);
+    assert_eq!(
+        names,
+        vec![
+            "Mapper.alpha",
+            "Mapper[Symbol.iterator]",
+            "Mapper[0]",
+            "Mapper.#hidden",
+            "Mapper[\"dyn\" + \"amic\"]"
+        ]
+    );
     let display: Vec<&str> = functions.iter().map(|f| f.display_name.as_str()).collect();
     assert_eq!(
         display,

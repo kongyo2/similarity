@@ -312,8 +312,8 @@ export function amountWithLevy(base: number, levyRate: number): number {
 `,
     },
     expectPairs: [
-      ["totalWithTax", "priceWithVat"],
-      ["totalWithTax", "amountWithLevy"],
+      ["OrderPricer.totalWithTax", "priceWithVat"],
+      ["OrderPricer.totalWithTax", "amountWithLevy"],
       ["priceWithVat", "amountWithLevy"],
     ],
   },
@@ -1500,7 +1500,7 @@ export function canonicalId(input: string): string {
 }
 `,
     },
-    expectPairs: [["normalizeId", "canonicalId"]],
+    expectPairs: [["LegacyIds.normalizeId", "canonicalId"]],
   },
   {
     id: "XF-P45",
@@ -1531,7 +1531,7 @@ export class TapRelay {
 }
 `,
     },
-    expectPairs: [["handle", "handle"]],
+    expectPairs: [["ClickRelay.handle", "TapRelay.handle"]],
   },
   {
     id: "XF-P46",
@@ -1577,7 +1577,7 @@ export class ReceiptLookup {
 }
 `,
     },
-    expectPairs: [["constructor", "constructor"]],
+    expectPairs: [["InvoiceLookup.constructor", "ReceiptLookup.constructor"]],
   },
   {
     id: "XF-P47",
@@ -1634,7 +1634,7 @@ export class TapRelay {
 }
 `,
     },
-    expectPairs: [["handle", "handle"]],
+    expectPairs: [["Relay.handle", "TapRelay.handle"]],
   },
 
   // -------------------------------------------------------------------

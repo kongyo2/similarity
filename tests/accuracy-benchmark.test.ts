@@ -27,5 +27,10 @@ describe("refactoring accuracy benchmark", () => {
     // 100% accuracy: failures carry the offending pairs, so an empty-array
     // assertion names the regressed cases directly in the diff.
     expect(summary.failures).toEqual([]);
+
+    // And every label measures something: a pair labeled under a name the
+    // report does not use would count as "not reported" whatever the
+    // engine did.
+    expect(summary.unresolved).toEqual([]);
   }, 240_000);
 });

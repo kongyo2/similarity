@@ -98,11 +98,14 @@ through either of its names), the methods and function-valued properties of
 an object literal bound to a name or default-exported (`handlers.onSave`,
 nested objects included; a named function expression there recurses
 through its own name), `export default` classes and functions, class
-methods and arrow-function class fields, constructors, and declarations
-inside `namespace`/`module` blocks, which are reported under their
-qualified name (`Legacy.Options`). Bodiless declarations — overload
-signatures, `declare function`, `abstract` methods — are never reported:
-there is no code behind them.
+methods and arrow-function class fields, constructors, classes written as
+an expression bound to a name (`const Store = class { … }`), and
+declarations inside `namespace`/`module` blocks. Each is reported under
+the path that leads to it: a member under its class or object
+(`Repo.save`, `Repo.constructor`, `handlers.onSave`), a declaration in a
+namespace under the namespace (`Legacy.Options`, `Legacy.Repo.save`).
+Bodiless declarations — overload signatures, `declare function`,
+`abstract` methods — are never reported: there is no code behind them.
 
 Rewrites that change behavior keep their distinct shapes on purpose:
 swapped builtins (`.map` vs `.filter`, `Math.max` vs `Math.min`), a

@@ -10,16 +10,26 @@
  *   - forbidden pair reported     → false positive
  *   - forbidden pair not reported → true negative
  *
+ * A label must also resolve, or it measures nothing: a pair labeled under
+ * a name the report no longer uses is "not reported" whatever the engine
+ * does. Expected and forbidden pairs must have a score at some threshold;
+ * unscored pairs — declarations the mode does not compare — must have
+ * none.
+ *
  * Usage:
  *   tsx scripts/accuracy-benchmark.ts            # markdown summary
  *   tsx scripts/accuracy-benchmark.ts --json     # machine-readable output
  *   tsx scripts/accuracy-benchmark.ts --verbose  # per-pair detail rows
+ *
+ * Exits with status 1 when a pair is mislabeled or a label does not
+ * resolve.
  */
 
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 import { benchCases, type BenchCase } from "../bench/cases.js";
 import { DEFAULT_MIN_LINES, DEFAULT_THRESHOLD } from "../src/defaults.js";
 import { analyzeProject } from "../src/index.js";
@@ -36,6 +46,11 @@ interface PairOutcome {
   correct: boolean;
   /** Best observed similarity for the pair regardless of threshold. */
   observed: number | null;
+  /**
+   * Whether the label names what it means to: a pair the engine scores,
+   * or, for an unscored pair, one it does not.
+   */
+  resolved: boolean;
 }
 
 function pairKey(a: string, b: string): string {
@@ -71,17 +86,22 @@ async function runCase(benchCase: BenchCase): Promise<PairOutcome[]> {
     const reportedPairs = report.byMode[benchCase.mode];
 
     const outcomes: PairOutcome[] = [];
-    const labeled: { left: string; right: string; expected: "duplicate" | "distinct" }[] = [
-      ...(benchCase.expectPairs ?? []).map(([left, right]) => ({
-        left,
-        right,
-        expected: "duplicate" as const,
-      })),
-      ...(benchCase.forbidPairs ?? []).map(([left, right]) => ({
-        left,
-        right,
-        expected: "distinct" as const,
-      })),
+    interface Label {
+      left: string;
+      right: string;
+      expected: "duplicate" | "distinct";
+      /** Whether the engine is expected to compare the two at all. */
+      scored: boolean;
+    }
+    const labels = (
+      pairs: [string, string][] | undefined,
+      expected: Label["expected"],
+      scored: boolean,
+    ): Label[] => (pairs ?? []).map(([left, right]) => ({ left, right, expected, scored }));
+    const labeled: Label[] = [
+      ...labels(benchCase.expectPairs, "duplicate", true),
+      ...labels(benchCase.forbidPairs, "distinct", true),
+      ...labels(benchCase.unscoredPairs, "distinct", false),
     ];
 
     // A second pass at threshold 0 recovers the raw similarity for
@@ -98,7 +118,7 @@ async function runCase(benchCase: BenchCase): Promise<PairOutcome[]> {
       unfiltered = fullReport.byMode[benchCase.mode];
     }
 
-    for (const { left, right, expected } of labeled) {
+    for (const { left, right, expected, scored } of labeled) {
       const match = findPair(reportedPairs, left, right);
       const reported = match !== undefined;
       const observed = match?.similarity
@@ -113,6 +133,7 @@ async function runCase(benchCase: BenchCase): Promise<PairOutcome[]> {
         reported,
         correct: expected === "duplicate" ? reported : !reported,
         observed,
+        resolved: scored === (observed !== null),
       });
     }
 
@@ -135,6 +156,8 @@ interface Summary {
   errorRate: number;
   byMode: Record<string, { total: number; errors: number }>;
   failures: PairOutcome[];
+  /** Labels that do not resolve (see {@link PairOutcome.resolved}). */
+  unresolved: PairOutcome[];
 }
 
 function summarize(outcomes: PairOutcome[]): Summary {
@@ -167,6 +190,7 @@ function summarize(outcomes: PairOutcome[]): Summary {
     errorRate: totalPairs === 0 ? 0 : (totalPairs - correct) / totalPairs,
     byMode,
     failures: outcomes.filter((o) => !o.correct),
+    unresolved: outcomes.filter((o) => !o.resolved),
   };
 }
 
@@ -219,6 +243,24 @@ function toMarkdown(summary: Summary, outcomes: PairOutcome[], verbose: boolean)
     lines.push("", "## Failures", "", "None — every labeled pair was classified correctly.");
   }
 
+  if (summary.unresolved.length > 0) {
+    lines.push(
+      "",
+      "## Unresolved labels",
+      "",
+      "These labels measure nothing: an expected or forbidden pair the engine never scores,",
+      "or an unscored pair it does score. Check the names against the report's.",
+      "",
+      "| Case | Mode | Pair | Expected | Observed sim |",
+      "| --- | --- | --- | --- | ---: |",
+    );
+    for (const label of summary.unresolved) {
+      lines.push(
+        `| ${label.caseId} | ${label.mode} | ${label.left} ↔ ${label.right} | ${label.expected} | ${formatObserved(label.observed)} |`,
+      );
+    }
+  }
+
   if (verbose) {
     lines.push("", "## All pairs", "", "| Case | Mode | Pair | Expected | Reported | Observed sim | OK |", "| --- | --- | --- | --- | --- | ---: | --- |");
     for (const outcome of outcomes) {
@@ -239,9 +281,9 @@ export async function runBenchmark(): Promise<{ summary: Summary; outcomes: Pair
   return { summary: summarize(outcomes), outcomes };
 }
 
-const isDirectRun = process.argv[1]
-  ? path.resolve(process.argv[1]).includes("accuracy-benchmark")
-  : false;
+// Run as a script, as opposed to imported by the test suite.
+const isDirectRun =
+  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isDirectRun) {
   const json = process.argv.includes("--json");
@@ -251,5 +293,8 @@ if (isDirectRun) {
     process.stdout.write(`${JSON.stringify({ summary, outcomes }, null, 2)}\n`);
   } else {
     process.stdout.write(toMarkdown(summary, outcomes, verbose));
+  }
+  if (summary.failures.length > 0 || summary.unresolved.length > 0) {
+    process.exitCode = 1;
   }
 }

@@ -10,10 +10,17 @@ use oxc_ast::ast::{
 use oxc_span::{GetSpan, Span};
 
 use crate::ignore_directive::has_ignore_directive_above;
+use crate::module_scope::{module_qualifier, qualified_name};
 use crate::source::{slice, with_checked_program, LineIndex};
 
 #[derive(Debug, Clone)]
 pub struct FunctionDefinition {
+    /// The name the function is reported under: the path that leads to it
+    /// from the top of the file — the namespaces it is declared in, then
+    /// the class or the object literal that holds it (`Legacy.parse`,
+    /// `Repo.save`, `handlers.onSave`, `Legacy.Repo.constructor`). A
+    /// function declared inside another function is reported under its own
+    /// name alone.
     pub name: String,
     pub function_type: FunctionType,
     pub parameters: Vec<String>,
@@ -76,6 +83,7 @@ pub struct FunctionDefinition {
     pub self_alias: Option<String>,
     pub start_line: u32,
     pub end_line: u32,
+    /// For a class member, the class as it is reported (see [`Self::name`]).
     pub class_name: Option<String>,
     pub parent_function: Option<String>,
     /// Whether a `// similarity-ignore` comment excludes the function from
@@ -178,6 +186,7 @@ pub fn extract_functions_from_program(
         functions: Vec::new(),
         source_text,
         lines,
+        qualifier: String::new(),
         parent_function: None,
         ignored: false,
     };
@@ -250,6 +259,10 @@ struct ExtractionContext<'s> {
     functions: Vec<FunctionDefinition>,
     source_text: &'s str,
     lines: &'s LineIndex,
+    /// Dotted path of the `namespace`/`module` blocks being walked (`""` at
+    /// the top level and inside a function body, whose declarations no
+    /// path leads to); see [`crate::module_scope`].
+    qualifier: String,
     /// Name of the function whose body is being walked.
     parent_function: Option<String>,
     /// Whether the scope being walked belongs to a declaration under a
@@ -258,6 +271,11 @@ struct ExtractionContext<'s> {
 }
 
 impl ExtractionContext<'_> {
+    /// `name` as it is reported: under the namespaces it is declared in.
+    fn qualified(&self, name: &str) -> String {
+        qualified_name(&self.qualifier, name)
+    }
+
     /// Whether a directive sits right above the line `offset` is on.
     fn directive_above(&self, offset: u32) -> bool {
         has_ignore_directive_above(self.source_text, self.lines, self.lines.line_of(offset))
@@ -287,7 +305,7 @@ impl ExtractionContext<'_> {
                     self.function(func, name.name.to_string());
                 }
             }
-            Statement::ClassDeclaration(class) => self.class_members(class),
+            Statement::ClassDeclaration(class) => self.class_members(class, own_name(class)),
             Statement::VariableDeclaration(var_decl) => self.variable_functions(var_decl),
             // `namespace`/`module` blocks are ordinary declaration scopes for
             // the functions they contain (`namespace ts { export function
@@ -300,7 +318,9 @@ impl ExtractionContext<'_> {
                         self.function(func, name.name.to_string());
                     }
                 }
-                Some(Declaration::ClassDeclaration(class)) => self.class_members(class),
+                Some(Declaration::ClassDeclaration(class)) => {
+                    self.class_members(class, own_name(class));
+                }
                 Some(Declaration::VariableDeclaration(var_decl)) => {
                     self.variable_functions(var_decl);
                 }
@@ -319,7 +339,11 @@ impl ExtractionContext<'_> {
                         .map_or_else(|| "default".to_string(), |id| id.name.to_string());
                     self.function(func, name);
                 }
-                ExportDefaultDeclarationKind::ClassDeclaration(class) => self.class_members(class),
+                // Like a default-exported function, a class is reported
+                // under its own name when it has one.
+                ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                    self.class_members(class, own_name(class).or(Some("default")));
+                }
                 // Expression forms, looking through transparent wrappers the
                 // same way variable initializers do (`export default (() =>
                 // {…}) satisfies Handler`).
@@ -336,6 +360,8 @@ impl ExtractionContext<'_> {
     /// Walk a `namespace`/`module` body (including the nested-name form
     /// `namespace a.b.c { … }`, which oxc represents as nested declarations).
     fn module_body(&mut self, module: &TSModuleDeclaration) {
+        let qualifier = module_qualifier(&module.id, &self.qualifier);
+        let outer = std::mem::replace(&mut self.qualifier, qualifier);
         match &module.body {
             Some(TSModuleDeclarationBody::TSModuleDeclaration(inner)) => self.module_body(inner),
             Some(TSModuleDeclarationBody::TSModuleBlock(block)) => {
@@ -345,6 +371,7 @@ impl ExtractionContext<'_> {
             }
             None => {}
         }
+        self.qualifier = outer;
     }
 
     /// `const f = (x) => …` and `const f = function (x) { … }` both bind a
@@ -362,7 +389,9 @@ impl ExtractionContext<'_> {
     }
 
     /// The functions an expression bound to `name` contributes: the
-    /// function or arrow itself, or the members of an object literal.
+    /// function or arrow itself, or the members of an object literal or of
+    /// a class expression (`const Store = class { … }` declares a class as
+    /// much as `class Store { … }` does).
     ///
     /// Parentheses and TypeScript-only wrappers around the expression are
     /// transparent at runtime — `const parse = (function (line) {…});`,
@@ -371,15 +400,23 @@ impl ExtractionContext<'_> {
     /// they are looked through instead of hiding the function from the scan.
     fn bound_expression(&mut self, expression: &Expression, name: &str) {
         match expression.get_inner_expression() {
-            Expression::ArrowFunctionExpression(arrow) => self.arrow(arrow, name.to_string()),
+            Expression::ArrowFunctionExpression(arrow) => {
+                self.arrow(arrow, self.qualified(name), name.to_string());
+            }
             Expression::FunctionExpression(func) => self.function(func, name.to_string()),
-            Expression::ObjectExpression(object) => self.object_members(object, name),
+            Expression::ObjectExpression(object) => {
+                self.object_members(object, &self.qualified(name));
+            }
+            // Reported under the binding, the name the rest of the module
+            // knows the class by.
+            Expression::ClassExpression(class) => self.class_members(class, Some(name)),
             _ => {}
         }
     }
 
     /// Record a `function` (declaration, default export, or a function
-    /// expression bound to a variable) under `name`.
+    /// expression bound to a variable) that the scope it is declared in
+    /// knows as `name`.
     fn function(&mut self, func: &Function, name: String) {
         let Some(callable) = Callable::of_function(func) else {
             return;
@@ -394,6 +431,7 @@ impl ExtractionContext<'_> {
         // resolves to the function too.
         let binding_name = func.id.as_ref().map_or_else(|| name.clone(), |id| id.name.to_string());
         let self_alias = (binding_name != name && is_plain_identifier(&name)).then(|| name.clone());
+        let name = self.qualified(&name);
         self.record(
             DeclarationSite {
                 scope_name: name.clone(),
@@ -417,12 +455,14 @@ impl ExtractionContext<'_> {
         );
     }
 
-    /// Record an arrow function bound to a name (`const f = (x) => …`).
-    fn arrow(&mut self, arrow: &ArrowFunctionExpression, name: String) {
+    /// Record an arrow function bound to a name (`const f = (x) => …`):
+    /// reported as `name`, and known inside its own body as
+    /// `display_name`.
+    fn arrow(&mut self, arrow: &ArrowFunctionExpression, name: String, display_name: String) {
         self.record(
             DeclarationSite {
                 scope_name: name.clone(),
-                display_name: name.clone(),
+                display_name,
                 name,
                 function_type: FunctionType::Arrow,
                 method_kind: MethodKind::Normal,
@@ -451,17 +491,13 @@ impl ExtractionContext<'_> {
                 continue;
             };
             let key = member_name(&prop.key, prop.computed, self.source_text);
-            let name = if key.starts_with('[') {
-                format!("{qualifier}{key}")
-            } else {
-                format!("{qualifier}.{key}")
-            };
+            let name = member_path(qualifier, &key);
             let ignored = self.directive_above(prop.span.start);
             self.within_scope(ignored, |this| match prop.value.get_inner_expression() {
                 // `save(doc) {…}`, `get size() {…}` and `save: function (doc)
                 // {…}` are methods: `this` is the object, exactly as in a class.
                 Expression::FunctionExpression(func) => this.object_method(func, prop, name),
-                Expression::ArrowFunctionExpression(arrow) => this.arrow(arrow, name),
+                Expression::ArrowFunctionExpression(arrow) => this.arrow(arrow, name.clone(), name),
                 Expression::ObjectExpression(inner) => this.object_members(inner, &name),
                 _ => {}
             });
@@ -508,10 +544,15 @@ impl ExtractionContext<'_> {
         );
     }
 
-    fn class_members(&mut self, class: &Class) {
-        let class_name = class.id.as_ref().map(|id| id.name.to_string());
+    /// The methods, accessors, constructor and arrow-valued fields of a
+    /// class the scope it is declared in knows as `name`. They are reported
+    /// under the class (`Repo.save`, `Sequence[Symbol.iterator]`), like the
+    /// members of an object literal under its binding: a report that lists
+    /// four functions named `constructor` says nothing about which.
+    fn class_members(&mut self, class: &Class, name: Option<&str>) {
+        let class_name = name.map(|name| self.qualified(name));
         let qualified = |member: &str| match &class_name {
-            Some(class) => format!("{class}.{member}"),
+            Some(class) => member_path(class, member),
             None => member.to_string(),
         };
         // Decorators sit above the `class` keyword (and above `export`).
@@ -526,16 +567,17 @@ impl ExtractionContext<'_> {
                         let Some(callable) = Callable::of_function(&method.value) else {
                             continue;
                         };
-                        let name = member_name(&method.key, method.computed, this.source_text);
+                        let key = member_name(&method.key, method.computed, this.source_text);
                         // The key's source text keeps string, number and
                         // computed keys spelled exactly during comparison,
                         // and private `#name` methods apart from each other.
                         let display_name =
                             member_key_text(&method.key, method.computed, this.source_text)
-                                .unwrap_or_else(|| name.clone());
+                                .unwrap_or_else(|| key.clone());
+                        let name = qualified(&key);
                         this.record(
                             DeclarationSite {
-                                scope_name: qualified(&name),
+                                scope_name: name.clone(),
                                 name,
                                 function_type: if method.kind == MethodDefinitionKind::Constructor {
                                     FunctionType::Constructor
@@ -569,13 +611,14 @@ impl ExtractionContext<'_> {
                         else {
                             continue;
                         };
-                        let name = member_name(&prop.key, prop.computed, this.source_text);
+                        let key = member_name(&prop.key, prop.computed, this.source_text);
                         let display_name =
                             member_key_text(&prop.key, prop.computed, this.source_text)
-                                .unwrap_or_else(|| name.clone());
+                                .unwrap_or_else(|| key.clone());
+                        let name = qualified(&key);
                         this.record(
                             DeclarationSite {
-                                scope_name: qualified(&name),
+                                scope_name: name.clone(),
                                 name,
                                 function_type: FunctionType::Method,
                                 method_kind: MethodKind::Normal,
@@ -628,13 +671,34 @@ impl ExtractionContext<'_> {
             return;
         }
         let outer_parent = self.parent_function.replace(declaration.scope_name);
+        // No path leads to what a function declares for itself.
+        let outer_qualifier = std::mem::take(&mut self.qualifier);
         self.within_scope(ignored, |this| {
             for stmt in &callable.body.statements {
                 this.statement(stmt);
             }
         });
+        self.qualifier = outer_qualifier;
         self.parent_function = outer_parent;
     }
+}
+
+/// The path to the member `key` of `owner`, a class or an object bound to
+/// a name: `owner.key`, or `owner[key]` for a key the dot cannot spell — a
+/// computed key (which comes with its brackets) or a number.
+fn member_path(owner: &str, key: &str) -> String {
+    if key.starts_with('[') {
+        format!("{owner}{key}")
+    } else if key.starts_with(|first: char| first.is_ascii_digit()) {
+        format!("{owner}[{key}]")
+    } else {
+        format!("{owner}.{key}")
+    }
+}
+
+/// The name a class declares for itself, if any.
+fn own_name<'a>(class: &'a Class) -> Option<&'a str> {
+    class.id.as_ref().map(|id| id.name.as_str())
 }
 
 /// Member name for a class or object member key: identifiers as written,

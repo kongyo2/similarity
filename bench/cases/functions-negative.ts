@@ -1238,10 +1238,10 @@ export abstract class RecordStore {
 `,
     },
     expectPairs: [["visitNode", "walkNode"]],
-    forbidPairs: [
+    unscoredPairs: [
       ["visitNode", "visitNode"],
       ["readBuffer", "readBuffer"],
-      ["find", "remove"],
+      ["RecordStore.find", "RecordStore.remove"],
     ],
   },
 
@@ -1303,7 +1303,7 @@ export class SyncConfigLoader {
 }
 `,
     },
-    forbidPairs: [["load", "load"]],
+    forbidPairs: [["ConfigLoader.load", "SyncConfigLoader.load"]],
   },
   {
     id: "XF-N44",
@@ -1325,7 +1325,7 @@ export function isTupleType(type: Type): type is TupleTypeReference {
 }
 `,
     },
-    forbidPairs: [["isTupleType", "isTupleType"]],
+    forbidPairs: [["Checker.isTupleType", "isTupleType"]],
   },
 
   // -------------------------------------------------------------------
@@ -1395,6 +1395,6 @@ export class ConsoleChannel {
 }
 `,
     },
-    forbidPairs: [["warn", "error"]],
+    forbidPairs: [["ConsoleChannel.warn", "ConsoleChannel.error"]],
   },
 ];

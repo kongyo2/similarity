@@ -872,10 +872,10 @@ const table = {
                 ("declared", "FunctionDeclaration", 2, 2),
                 ("arrow", "ArrowFunctionExpression", 3, 3),
                 ("expression", "FunctionExpression", 4, 4),
-                ("method", "MethodDefinition", 6, 6),
-                ("field", "ArrowFunctionExpression", 7, 7),
-                ("size", "MethodDefinition", 8, 8),
-                ("constructor", "MethodDefinition", 9, 9),
+                ("Box.method", "MethodDefinition", 6, 6),
+                ("Box.field", "ArrowFunctionExpression", 7, 7),
+                ("Box.size", "MethodDefinition", 8, 8),
+                ("Box.constructor", "MethodDefinition", 9, 9),
                 ("table.member", "ObjectProperty", 12, 12),
                 ("table.valued", "ObjectProperty", 13, 13),
                 ("table.arrowed", "ArrowFunctionExpression", 14, 14),
@@ -918,7 +918,7 @@ const exporter = {
         // again, not further overlaps.
         assert_eq!(
             located(&overlaps),
-            [("load", (6, 8), "exporter.dump", (18, 20))],
+            [("Importer.load", (6, 8), "exporter.dump", (18, 20))],
             "{overlaps:#?}"
         );
     }
