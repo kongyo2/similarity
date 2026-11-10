@@ -77,7 +77,7 @@ jobs:
 
   # Builds the real WASM engine and runs the full vitest suite against it on
   # every Node line the toolchain runs on, including the labeled-corpus
-  # accuracy gate (364 pairs): every labeled pair must classify correctly —
+  # accuracy gate (366 pairs): every labeled pair must classify correctly —
   # any mislabel fails the suite.
   tests-and-accuracy:
     runs-on: ubuntu-latest

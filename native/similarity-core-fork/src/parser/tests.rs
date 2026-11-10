@@ -793,6 +793,77 @@ fn plain_constructor_parameters_are_not_desugared() {
     );
 }
 
+// -- destructuring assignment --------------------------------------------
+
+#[test]
+fn a_destructuring_assignment_says_what_goes_where() {
+    // The pattern on the left used to be one leaf, whatever it held: any
+    // two destructuring assignments were the same tree.
+    assert_canonically_distinct(
+        "function f(s: T) { let { a, b, c } = s; [a, b, c] = [b, c, a]; return [a, b, c]; }",
+        "function f(s: T) { let { a, b, c } = s; [c, b, a] = [b, c, a]; return [a, b, c]; }",
+    );
+    assert_canonically_distinct(
+        "function f(e: E, p: P) { let x = p.x; let y = p.y; ({ clientX: x, clientY: y } = e); return [x, y]; }",
+        "function f(e: E, p: P) { let x = p.x; let y = p.y; ({ offsetX: x, offsetY: y } = e); return [x, y]; }",
+    );
+    // The variables assigned are the function's own: renamed, a twin.
+    assert_canonically_equal(
+        "function swap(pair: P) { let lo = pair.lo; let hi = pair.hi; [lo, hi] = [hi, lo]; return [lo, hi]; }",
+        "function flip(input: P) { let min = input.lo; let max = input.hi; [min, max] = [max, min]; return [min, max]; }",
+    );
+    // `{ a }` reads the property `a` into the variable `a`; so does
+    // `{ a: b }` into `b`.
+    assert_canonically_equal(
+        "function f(o: O) { let a = 0; ({ a } = o); return a; }",
+        "function g(o: O) { let b = 0; ({ a: b } = o); return b; }",
+    );
+    assert_canonically_distinct(
+        "function f(o: O) { let a = 0; ({ a } = o); return a; }",
+        "function g(o: O) { let b = 0; ({ c: b } = o); return b; }",
+    );
+}
+
+#[test]
+fn destructuring_assignments_keep_their_holes_defaults_and_rest() {
+    let assign = |pattern: &str| {
+        format!(
+            "function f(xs: number[]) {{ let a = 0; let b = 0; {pattern} = xs; return a + b; }}"
+        )
+    };
+    let object = |pattern: &str| {
+        format!("function f(o: O) {{ let a = 0; let b = 0; ({pattern} = o); return a + b; }}")
+    };
+    for (left, right) in [
+        (assign("[a, b]"), assign("[, a, b]")),
+        (assign("[a, b]"), assign("[a = 1, b]")),
+        (assign("[a = 1, b]"), assign("[a = 2, b]")),
+        (assign("[a, b]"), assign("[a, ...b]")),
+        (object("{ a, b }"), object("{ a, b = 1 }")),
+        (object("{ a, b }"), object("{ a, ...b }")),
+        (object("{ a, b }"), object("{ a, [b]: b }")),
+        // Nested patterns and member targets are targets like any other.
+        (object("{ a, p: [b] }"), object("{ a, p: { b } }")),
+        (assign("[this.x, this.y]"), assign("[this.y, this.x]")),
+    ] {
+        assert_canonically_distinct(&left, &right);
+    }
+    // A default is spelled the way a declaration's pattern spells it.
+    assert_canonically_equal(&assign("[a = 1, b]"), &assign("[a = 1, b]"));
+}
+
+#[test]
+fn a_loop_head_that_destructures_says_what_goes_where() {
+    assert_canonically_distinct(
+        "function f(entries: [string, number][]) { let key = ''; let value = 0; for ([key, value] of entries) { use(key, value); } }",
+        "function f(entries: [string, number][]) { let key = ''; let value = 0; for ([value, key] of entries) { use(key, value); } }",
+    );
+    assert_canonically_distinct(
+        "function f(rows: Row[]) { let id = ''; let name = ''; for ({ id, name } of rows) { use(id, name); } }",
+        "function f(rows: Row[]) { let id = ''; let name = ''; for ({ id, title: name } of rows) { use(id, name); } }",
+    );
+}
+
 // -- parameters ----------------------------------------------------------
 
 #[test]

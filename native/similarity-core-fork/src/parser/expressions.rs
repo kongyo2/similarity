@@ -1,8 +1,9 @@
 //! Expressions, including the canonical expression-level rewrites.
 
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, AssignmentOperator, AssignmentTarget, BinaryOperator,
-    CallExpression, ChainElement, ComputedMemberExpression, Expression, LogicalOperator,
+    Argument, ArrayAssignmentTarget, ArrayExpressionElement, AssignmentOperator, AssignmentTarget,
+    AssignmentTargetMaybeDefault, AssignmentTargetProperty, BinaryOperator, CallExpression,
+    ChainElement, ComputedMemberExpression, Expression, LogicalOperator, ObjectAssignmentTarget,
     ObjectPropertyKind, PrivateFieldExpression, PropertyKey, SimpleAssignmentTarget, Statement,
     StaticMemberExpression, UnaryOperator, UpdateOperator,
 };
@@ -1001,17 +1002,120 @@ pub(super) fn assignment_target_to_tree_node(
         AssignmentTarget::AssignmentTargetIdentifier(ident) => {
             leaf(&cx.identifier_label(ident.span, &ident.name), "Identifier")
         }
-        AssignmentTarget::ArrayAssignmentTarget(_) => {
-            leaf("ArrayAssignmentTarget", "ArrayAssignmentTarget")
-        }
-        AssignmentTarget::ObjectAssignmentTarget(_) => {
-            leaf("ObjectAssignmentTarget", "ObjectAssignmentTarget")
+        AssignmentTarget::ArrayAssignmentTarget(array) => array_assignment_target_node(array, cx),
+        AssignmentTarget::ObjectAssignmentTarget(object) => {
+            object_assignment_target_node(object, cx)
         }
         AssignmentTarget::StaticMemberExpression(mem) => static_member_node(mem, cx),
         AssignmentTarget::ComputedMemberExpression(mem) => element_access_node(mem, cx),
         AssignmentTarget::PrivateFieldExpression(mem) => private_field_node(mem, cx),
         _ => leaf("AssignmentTarget", "AssignmentTarget"),
     })
+}
+
+/// `[a, , b = 1, ...rest]` on the left of an assignment: what each position
+/// is assigned to, like the array pattern of a declaration. The pattern
+/// used to be one leaf, so `[a, b] = pair` and `[b, a] = pair` — or any
+/// two destructuring assignments at all — were the same tree.
+pub(super) fn array_assignment_target_node(
+    array: &ArrayAssignmentTarget,
+    cx: &ConversionContext,
+) -> Rc<TreeNode> {
+    let mut node = make_node("ArrayAssignmentTarget", "ArrayAssignmentTarget");
+    for element in &array.elements {
+        match element {
+            Some(element) => {
+                if let Some(child) = assignment_target_maybe_default_node(element, cx) {
+                    node.add_child(child);
+                }
+            }
+            None => node.add_child(leaf("Elision", "Elision")),
+        }
+    }
+    if let Some(rest) = &array.rest {
+        node.add_child(assignment_rest_node(&rest.target, cx));
+    }
+    Rc::new(node)
+}
+
+/// `{ a, b: c.d, e = 1, ...rest }` on the left of an assignment: which
+/// property goes where. See [`array_assignment_target_node`].
+pub(super) fn object_assignment_target_node(
+    object: &ObjectAssignmentTarget,
+    cx: &ConversionContext,
+) -> Rc<TreeNode> {
+    let mut node = make_node("ObjectAssignmentTarget", "ObjectAssignmentTarget");
+    for property in &object.properties {
+        let property_node = match property {
+            // `{ a }` and `{ a = 1 }`: the property read is named like the
+            // variable assigned. The name is the property's; the variable
+            // takes whatever the function's renaming calls it.
+            AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(shorthand) => {
+                let mut property_node =
+                    make_node("AssignmentTargetProperty", "AssignmentTargetProperty");
+                let binding = &shorthand.binding;
+                property_node.add_child(leaf(binding.name.as_str(), "Identifier"));
+                let target = leaf(&cx.identifier_label(binding.span, &binding.name), "Identifier");
+                let default =
+                    shorthand.init.as_ref().and_then(|init| expression_to_tree_node(init, cx));
+                property_node.add_child(with_default(target, default));
+                property_node
+            }
+            AssignmentTargetProperty::AssignmentTargetPropertyProperty(pair) => {
+                let label = member_label("AssignmentTargetProperty", &pair.name, pair.computed);
+                let mut property_node = make_node(label, "AssignmentTargetProperty");
+                if let Some(key) = property_key_to_tree_node(&pair.name, cx) {
+                    property_node.add_child(key);
+                }
+                if let Some(target) = assignment_target_maybe_default_node(&pair.binding, cx) {
+                    property_node.add_child(target);
+                }
+                property_node
+            }
+        };
+        node.add_child(Rc::new(property_node));
+    }
+    if let Some(rest) = &object.rest {
+        node.add_child(assignment_rest_node(&rest.target, cx));
+    }
+    Rc::new(node)
+}
+
+/// One element of a destructuring assignment: a target, with the default
+/// it takes when the value is `undefined`. Defaults are spelled the way
+/// they are inside the pattern of a declaration.
+fn assignment_target_maybe_default_node(
+    target: &AssignmentTargetMaybeDefault,
+    cx: &ConversionContext,
+) -> Option<Rc<TreeNode>> {
+    match target {
+        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(defaulted) => {
+            let binding = assignment_target_to_tree_node(&defaulted.binding, cx)?;
+            Some(with_default(binding, expression_to_tree_node(&defaulted.init, cx)))
+        }
+        _ => target
+            .as_assignment_target()
+            .and_then(|target| assignment_target_to_tree_node(target, cx)),
+    }
+}
+
+/// `target`, or `target = default` as an `AssignmentPattern`.
+fn with_default(target: Rc<TreeNode>, default: Option<Rc<TreeNode>>) -> Rc<TreeNode> {
+    let Some(default) = default else {
+        return target;
+    };
+    let mut node = make_node("AssignmentPattern", "AssignmentPattern");
+    node.add_child(target);
+    node.add_child(default);
+    Rc::new(node)
+}
+
+fn assignment_rest_node(target: &AssignmentTarget, cx: &ConversionContext) -> Rc<TreeNode> {
+    let mut node = make_node("RestElement", "RestElement");
+    if let Some(target) = assignment_target_to_tree_node(target, cx) {
+        node.add_child(target);
+    }
+    Rc::new(node)
 }
 
 pub(super) fn simple_assignment_target_to_tree_node(

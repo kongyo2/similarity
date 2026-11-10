@@ -1,16 +1,16 @@
 /**
  * Corpus for the syntax the engine used to drop or flatten: JSX, call and
  * construct signatures, overloads, accessors, members keyed by a number or
- * a symbol, rest and default parameters, function-typed parameters, and
- * classes written as expressions.
+ * a symbol, rest and default parameters, function-typed parameters,
+ * destructuring assignments, and classes written as expressions.
  *
  * Each of these was invisible to the comparison in some way, and
  * invisible in both declarations of a pair: two components rendering
  * unrelated markup were the same tree, two interfaces that are all
  * signature were two empty shapes, an overloaded member was its last
- * signature, a class bound to a `const` was no class. The positives pin
- * the other side — the same declarations still pair up now that the
- * syntax counts.
+ * signature, the left side of `({ x, y } = point)` was one leaf, a class
+ * bound to a `const` was no class. The positives pin the other side — the
+ * same declarations still pair up now that the syntax counts.
  *
  * Evaluated with the CLI defaults from the README invocation
  * (threshold 0.8, minLines 3) in the mode each case targets.
@@ -277,6 +277,67 @@ export function resolveUrl(root: string, ...parts: string[]): string {
     },
     expectPairs: [["joinPath", "resolveUrl"]],
   },
+  // -------------------------------------------------------------------
+  // functions — a destructuring assignment says what goes where
+  // -------------------------------------------------------------------
+  {
+    id: "XF-N51",
+    mode: "functions",
+    category: "destructuring-assignment",
+    description: "Destructuring assignments that read different properties of the event",
+    files: {
+      "a.ts": `
+export function readClientPosition(event: PointerEvent, last: Point): Point {
+  let x = last.x;
+  let y = last.y;
+  if (event.isPrimary) {
+    ({ clientX: x, clientY: y } = event);
+  }
+  return { x, y };
+}
+
+export function readPressure(event: PointerEvent, last: Point): Point {
+  let x = last.x;
+  let y = last.y;
+  if (event.isPrimary) {
+    ({ pressure: x, tangentialPressure: y } = event);
+  }
+  return { x, y };
+}
+`,
+    },
+    forbidPairs: [["readClientPosition", "readPressure"]],
+  },
+  {
+    id: "XF-P61",
+    mode: "functions",
+    category: "destructuring-assignment",
+    description: "Renamed twins that swap through a destructuring assignment",
+    files: {
+      "a.ts": `
+export function orderBounds(range: Range): Range {
+  let lo = range.start;
+  let hi = range.end;
+  if (lo > hi) {
+    [lo, hi] = [hi, lo];
+  }
+  return { start: lo, end: hi };
+}
+`,
+      "b.ts": `
+export function sortEnds(span: Range): Range {
+  let first = span.start;
+  let last = span.end;
+  if (first > last) {
+    [first, last] = [last, first];
+  }
+  return { start: first, end: last };
+}
+`,
+    },
+    expectPairs: [["orderBounds", "sortEnds"]],
+  },
+
   // -------------------------------------------------------------------
   // functions — a class expression bound to a name has methods too
   // -------------------------------------------------------------------

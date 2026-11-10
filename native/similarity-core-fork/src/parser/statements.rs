@@ -10,9 +10,9 @@ use std::rc::Rc;
 
 use super::classes::class_element_to_tree_node;
 use super::expressions::{
-    assignment_target_to_tree_node, element_access_node, expression_to_tree_node,
-    private_field_node, statement_value_expression_to_tree_node, static_member_node,
-    test_expression_to_tree_node,
+    array_assignment_target_node, assignment_target_to_tree_node, element_access_node,
+    expression_to_tree_node, object_assignment_target_node, private_field_node,
+    statement_value_expression_to_tree_node, static_member_node, test_expression_to_tree_node,
 };
 use super::lowering::{
     assignment_leaf_statement, canonical_if_nodes, canonical_return_nodes,
@@ -457,11 +457,9 @@ pub(super) fn for_statement_left_to_tree_node(
         ForStatementLeft::StaticMemberExpression(mem) => static_member_node(mem, cx),
         ForStatementLeft::ComputedMemberExpression(mem) => element_access_node(mem, cx),
         ForStatementLeft::PrivateFieldExpression(mem) => private_field_node(mem, cx),
-        ForStatementLeft::ArrayAssignmentTarget(_) => {
-            leaf("ArrayAssignmentTarget", "ArrayAssignmentTarget")
-        }
-        ForStatementLeft::ObjectAssignmentTarget(_) => {
-            leaf("ObjectAssignmentTarget", "ObjectAssignmentTarget")
+        ForStatementLeft::ArrayAssignmentTarget(array) => array_assignment_target_node(array, cx),
+        ForStatementLeft::ObjectAssignmentTarget(object) => {
+            object_assignment_target_node(object, cx)
         }
         _ => leaf("ForStatementLeft", "ForStatementLeft"),
     })
